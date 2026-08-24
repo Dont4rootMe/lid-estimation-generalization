@@ -35,8 +35,8 @@ upstreams:
       description: The generated curve has one degree of freedom (theta), but lid.npy is written as dim=20.
       stored_value: 20
       expected_value: 1
-      canonical_archive_state: The official paper archive has lid.npy=1 and preserves the obsolete value as lid-OLD_WRONG.npy.
-      mitigation: For the canonical archive, require lid.npy=1 and ignore the explicitly named sidecar as a target. For locally generated data only, apply configs/datasets/registry/generated_fallback.yaml, validate stored lid.npy=20, and override it to 1 in memory. Never patch the original imported files or archive.
+      canonical_archive_state: The official paper archive stores lid.npy=20 for train and val, lid.npy=1 for test, and preserves test/lid-OLD_WRONG.npy=20 as a sidecar.
+      mitigation: For the canonical archive, validate the raw split contract train=20, val=20, test=1, then expose effective LID 1 in memory. For locally generated data, apply configs/datasets/registry/generated_fallback.yaml, validate train=20, val=20, test=20, then expose effective LID 1 in memory. Never patch the original imported files, generated artifacts, or archive.
     - id: adddim0-undefined-areas
       path: generators/utils/padded_and_downscaled.py
       symbol: add_random_numbers_to_borders

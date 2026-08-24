@@ -45,9 +45,13 @@ created itself if extraction fails.
 ## Confirmed generator/parity defects
 
 1. `spaghetti_pca` constructs a one-dimensional curve but writes `lid=dim`
-   (default 20). The exact archive retains an `lid-OLD_WRONG.npy` marker and a
-   corrected `lid.npy`. Registry validation requires stored value 1 for
-   canonical data and uses a declarative override only for generated fallback.
+   (default 20). In the exact archive, canonical `e8_spaghetti_pca/lid.npy`
+   contains 20 in `train` and `val`, but 1 in `test`; an
+   `lid-OLD_WRONG.npy` marker is also retained. The YAML registry validates the
+   raw value independently in every split (`20/20/1`) before exposing the
+   theoretical effective LID 1 in memory for all three splits. The generated
+   fallback has its own split policy (`20/20/20 -> 1`). Neither path modifies
+   an archive or generated source artifact.
 2. `PaddedDatasetGenerator(additional_dimension=0)` reaches
    `add_random_numbers_to_borders` where `areas_to_modify` is undefined.
 3. Several e1/e5 generators set `copy_val_to_test=True`; generated validation

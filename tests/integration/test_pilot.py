@@ -57,31 +57,39 @@ class _RecordingLogger:
 def _write_fixture_dataset(root: Path, registry_path: Path) -> None:
     rows: list[dict[str, Any]] = []
     for dataset_index, name in enumerate(PILOT_DATASETS, start=2):
-        rows.append(
-            {
-                "name": name,
-                "representation": "dataset",
-                "available_representations": ["dataset"],
-                "required_artifacts": ["dataset", "lid"],
-                "expected_samples": {"train": 12, "val": 6, "test": 6},
-                "expected_shapes": {"dataset": [1, 2, 2]},
-                "expected_lid": dataset_index,
-                "official": False,
-            }
-        )
+        effective_lid = 1 if name == "e8_spaghetti_pca" else dataset_index
+        row: dict[str, Any] = {
+            "name": name,
+            "representation": "dataset",
+            "available_representations": ["dataset"],
+            "required_artifacts": ["dataset", "lid"],
+            "expected_samples": {"train": 12, "val": 6, "test": 6},
+            "expected_shapes": {"dataset": [1, 2, 2]},
+            "expected_lid": effective_lid,
+            "official": False,
+        }
+        if name == "e8_spaghetti_pca":
+            row["stored_lid_by_split"] = {"train": 20, "val": 20, "test": 1}
+            row["lid_override"] = 1
+        rows.append(row)
         for split, n_samples in (("train", 12), ("val", 6), ("test", 6)):
             split_dir = root / name / split
             split_dir.mkdir(parents=True)
             # Feature mean identifies the fixture to the fake model without ever
             # passing a LID target through the trainer or selector interface.
             features = np.full(
-                (n_samples, 1, 2, 2), float(dataset_index), dtype=np.float32
+                (n_samples, 1, 2, 2), float(effective_lid), dtype=np.float32
             )
             features[:, 0, 0, 0] += np.linspace(0.0, 0.01, n_samples)
             np.save(split_dir / "dataset.npy", features, allow_pickle=False)
+            stored_lid = (
+                {"train": 20, "val": 20, "test": 1}[split]
+                if name == "e8_spaghetti_pca"
+                else effective_lid
+            )
             np.save(
                 split_dir / "lid.npy",
-                np.full(n_samples, dataset_index, dtype=np.float32),
+                np.full(n_samples, stored_lid, dtype=np.float32),
                 allow_pickle=False,
             )
     registry_path.parent.mkdir(parents=True, exist_ok=True)
@@ -216,6 +224,27 @@ def test_pilot_trains_three_models_and_seals_all_metrics(
     assert summary["selection_uses_lid_targets"] is False
     assert set(summary["macro_validation"]) >= {"mean_mae", "mean_rmse"}
     assert set(summary["macro_test"]) >= {"mean_mae", "mean_rmse"}
+
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    spaghetti_overrides = manifest["inputs"]["datasets"]["e8_spaghetti_pca"][
+        "applied_overrides"
+    ]
+    assert spaghetti_overrides == {
+        split: {
+            "lid": {
+                "kind": "constant_after_stored_value_validation",
+                "stored": float(stored_lid),
+                "effective": 1.0,
+            }
+        }
+        for split, stored_lid in {"train": 20, "val": 20, "test": 1}.items()
+    }
+    for split, stored_lid in {"train": 20, "val": 20, "test": 1}.items():
+        raw_lid = np.load(
+            Path(config.data.root) / "e8_spaghetti_pca" / split / "lid.npy",
+            allow_pickle=False,
+        )
+        np.testing.assert_array_equal(raw_lid, np.full(raw_lid.shape, stored_lid))
 
     registry = yaml.safe_load(
         (run_dir / "artifact_registry.yaml").read_text(encoding="utf-8")

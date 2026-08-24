@@ -10,6 +10,7 @@ from datasets.registry import (
     DatasetSpec,
     DatasetValidationError,
     OFFICIAL_README_DATASETS,
+    RegistryValidationError,
     Representation,
     load_registry,
     load_split,
@@ -133,6 +134,72 @@ def test_generated_spaghetti_override_validates_stored_target_before_correction(
         load_split(tmp_path, spec, "test")
 
 
+def test_split_aware_lid_policy_validates_each_raw_split_before_correction(
+    tmp_path: Path,
+) -> None:
+    raw_lid_by_split = {"train": 20, "val": 20, "test": 1}
+    spec = DatasetSpec(
+        name="spaghetti",
+        required_artifacts=("dataset", "lid"),
+        expected_samples={split: 3 for split in raw_lid_by_split},
+        stored_lid_by_split=raw_lid_by_split,
+        lid_override=1,
+        expected_lid=1,
+    )
+    for split, raw_lid in raw_lid_by_split.items():
+        split_dir = tmp_path / spec.name / split
+        split_dir.mkdir(parents=True)
+        np.save(split_dir / "dataset.npy", np.ones((3, 2), dtype=np.float32))
+        np.save(split_dir / "lid.npy", np.full(3, raw_lid, dtype=np.int64))
+
+    for split, raw_lid in raw_lid_by_split.items():
+        loaded = load_split(tmp_path, spec, split)
+        np.testing.assert_array_equal(loaded.lid, np.ones(3, dtype=np.int64))
+        assert loaded.applied_overrides["lid"] == {
+            "kind": "constant_after_stored_value_validation",
+            "stored": float(raw_lid),
+            "effective": 1.0,
+        }
+        np.testing.assert_array_equal(
+            np.load(
+                tmp_path / spec.name / split / "lid.npy",
+                allow_pickle=False,
+            ),
+            np.full(3, raw_lid, dtype=np.int64),
+        )
+
+    np.save(
+        tmp_path / spec.name / "val" / "lid.npy",
+        np.ones(3, dtype=np.int64),
+    )
+    with pytest.raises(
+        DatasetValidationError,
+        match=r"stored lid for spaghetti/val.*20\.0.*refusing",
+    ):
+        load_split(tmp_path, spec, "val")
+
+
+def test_split_aware_lid_policy_requires_complete_unambiguous_split_coverage() -> None:
+    with pytest.raises(RegistryValidationError, match="must cover every declared split"):
+        DatasetSpec(
+            name="spaghetti",
+            required_artifacts=("dataset", "lid"),
+            stored_lid_by_split={"train": 20, "val": 20},
+            lid_override=1,
+            expected_lid=1,
+        )
+
+    with pytest.raises(RegistryValidationError, match="cannot set both"):
+        DatasetSpec(
+            name="spaghetti",
+            required_artifacts=("dataset", "lid"),
+            stored_lid=20,
+            stored_lid_by_split={"train": 20, "val": 20, "test": 1},
+            lid_override=1,
+            expected_lid=1,
+        )
+
+
 def test_registry_covers_every_folder_in_pinned_readme() -> None:
     registry = load_registry(
         REPOSITORY_ROOT
@@ -150,7 +217,12 @@ def test_registry_covers_every_folder_in_pinned_readme() -> None:
     spaghetti = registry["e8_spaghetti_pca"]
     assert spaghetti.expected_lid == 1
     assert spaghetti.stored_lid is None
-    assert spaghetti.lid_override is None
+    assert dict(spaghetti.stored_lid_by_split) == {
+        "train": 20,
+        "val": 20,
+        "test": 1,
+    }
+    assert spaghetti.lid_override == 1
     assert spaghetti.ignored_files == ("lid-OLD_WRONG.npy",)
     assert registry["e6_exp_pca"].ignored_files == ("lid-OLD_WRONG.npy",)
     assert registry["e7_crescent_moon_radius3.0"].ignored_files == (
@@ -184,6 +256,8 @@ def test_canonical_spaghetti_and_generated_overlay_are_distinct(tmp_path: Path) 
         required_artifacts=("dataset", "lid"),
         ignored_files=canonical.ignored_files,
         expected_lid=canonical.expected_lid,
+        stored_lid_by_split={"test": canonical.stored_lid_by_split["test"]},
+        lid_override=canonical.lid_override,
     )
     split_dir = tmp_path / canonical.name / "test"
     split_dir.mkdir(parents=True)
@@ -193,7 +267,11 @@ def test_canonical_spaghetti_and_generated_overlay_are_distinct(tmp_path: Path) 
 
     loaded = load_split(tmp_path, canonical, "test")
     np.testing.assert_array_equal(loaded.lid, [1, 1])
-    assert loaded.applied_overrides == {}
+    assert loaded.applied_overrides["lid"] == {
+        "kind": "constant_after_stored_value_validation",
+        "stored": 1.0,
+        "effective": 1.0,
+    }
 
     generated_registry = apply_registry_overlay(
         registry,
@@ -204,7 +282,12 @@ def test_canonical_spaghetti_and_generated_overlay_are_distinct(tmp_path: Path) 
         / "generated_fallback.yaml",
     )
     generated = generated_registry["e8_spaghetti_pca"]
-    assert generated.stored_lid == 20
+    assert generated.stored_lid is None
+    assert dict(generated.stored_lid_by_split) == {
+        "train": 20,
+        "val": 20,
+        "test": 20,
+    }
     assert generated.lid_override == generated.expected_lid == 1
 
 

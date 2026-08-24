@@ -158,6 +158,7 @@ class DatasetSpec:
     expected_shapes: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
     expected_lid: float | None = None
     stored_lid: float | None = None
+    stored_lid_by_split: Mapping[str, float] = field(default_factory=dict)
     lid_override: float | None = None
     allowed_lid_values: tuple[float, ...] = ()
     transformation: TransformationPair | None = None
@@ -268,6 +269,29 @@ class DatasetSpec:
         _constant_is_valid(self.expected_lid, "expected_lid")
         _constant_is_valid(self.stored_lid, "stored_lid")
         _constant_is_valid(self.lid_override, "lid_override")
+        stored_lid_by_split = {
+            str(key): float(value)
+            for key, value in self.stored_lid_by_split.items()
+        }
+        invalid_stored_splits = set(stored_lid_by_split) - set(splits)
+        if invalid_stored_splits:
+            raise RegistryValidationError(
+                f"dataset {self.name!r} gives stored LID values for undeclared "
+                f"splits: {sorted(invalid_stored_splits)}"
+            )
+        if stored_lid_by_split and set(stored_lid_by_split) != set(splits):
+            missing_stored_splits = set(splits) - set(stored_lid_by_split)
+            raise RegistryValidationError(
+                f"dataset {self.name!r} split-aware stored LID policy must cover "
+                f"every declared split; missing={sorted(missing_stored_splits)}"
+            )
+        for split_name, value in stored_lid_by_split.items():
+            _constant_is_valid(value, f"stored_lid_by_split[{split_name!r}]")
+        if self.stored_lid is not None and stored_lid_by_split:
+            raise RegistryValidationError(
+                f"dataset {self.name!r} cannot set both stored_lid and "
+                "stored_lid_by_split"
+            )
         allowed_lids = tuple(float(value) for value in self.allowed_lid_values)
         if any(not math.isfinite(value) or value <= 0 for value in allowed_lids):
             raise RegistryValidationError(
@@ -279,10 +303,10 @@ class DatasetSpec:
                 "allowed_lid_values"
             )
         if self.lid_override is not None:
-            if self.stored_lid is None:
+            if self.stored_lid is None and not stored_lid_by_split:
                 raise RegistryValidationError(
-                    f"dataset {self.name!r} must validate stored_lid before applying "
-                    "a lid_override"
+                    f"dataset {self.name!r} must validate stored_lid or "
+                    "stored_lid_by_split before applying a lid_override"
                 )
             if self.expected_lid is None or not math.isclose(
                 float(self.expected_lid), float(self.lid_override)
@@ -293,6 +317,7 @@ class DatasetSpec:
         if (
             self.expected_lid is not None
             or self.stored_lid is not None
+            or stored_lid_by_split
             or allowed_lids
         ) and "lid" not in required:
             raise RegistryValidationError(
@@ -315,6 +340,11 @@ class DatasetSpec:
         object.__setattr__(
             self, "expected_shapes", MappingProxyType(expected_shapes)
         )
+        object.__setattr__(
+            self,
+            "stored_lid_by_split",
+            MappingProxyType(stored_lid_by_split),
+        )
         object.__setattr__(self, "allowed_lid_values", allowed_lids)
 
     @classmethod
@@ -332,6 +362,7 @@ class DatasetSpec:
             "expected_shapes",
             "expected_lid",
             "stored_lid",
+            "stored_lid_by_split",
             "lid_override",
             "allowed_lid_values",
             "transformation",
@@ -379,6 +410,7 @@ class DatasetSpec:
                     if value.get("stored_lid") is None
                     else float(value["stored_lid"])
                 ),
+                stored_lid_by_split=value.get("stored_lid_by_split", {}),
                 lid_override=(
                     None
                     if value.get("lid_override") is None
@@ -606,6 +638,7 @@ def apply_registry_overlay(
         "name",
         "expected_lid",
         "stored_lid",
+        "stored_lid_by_split",
         "lid_override",
         "notes",
     }
@@ -633,6 +666,16 @@ def apply_registry_overlay(
                 updates[field_name] = (
                     None if row[field_name] is None else float(row[field_name])
                 )
+        if "stored_lid_by_split" in row:
+            raw_split_values = row["stored_lid_by_split"]
+            if not isinstance(raw_split_values, Mapping):
+                raise RegistryValidationError(
+                    "dataset overlay stored_lid_by_split must be a YAML mapping"
+                )
+            updates["stored_lid_by_split"] = {
+                str(split): float(raw_lid)
+                for split, raw_lid in raw_split_values.items()
+            }
         if "notes" in row:
             updates["notes"] = str(row["notes"])
         specs[name] = replace(specs[name], **updates)
@@ -918,14 +961,16 @@ def load_split(
             raise DatasetValidationError(f"cannot load {path}: {exc}") from exc
 
     lid = arrays.get("lid")
-    if spec.stored_lid is not None:
-        if lid is None or not _is_real_numeric(lid) or not _all_close_to(
-            lid, spec.stored_lid
-        ):
-            raise DatasetValidationError(
-                f"stored lid for {spec.name}/{split} does not match registry value "
-                f"{spec.stored_lid}; refusing to apply any override"
-            )
+    stored_lid = spec.stored_lid_by_split.get(split, spec.stored_lid)
+    if stored_lid is not None and (
+        lid is None
+        or not _is_real_numeric(lid)
+        or not _all_close_to(lid, stored_lid)
+    ):
+        raise DatasetValidationError(
+            f"stored lid for {spec.name}/{split} does not match registry value "
+            f"{stored_lid}; refusing to apply any override"
+        )
 
     applied_overrides: dict[str, Mapping[str, float | str]] = {}
     if spec.lid_override is not None:
@@ -933,7 +978,7 @@ def load_split(
         arrays["lid"] = np.full(lid.shape, spec.lid_override, dtype=lid.dtype)
         applied_overrides["lid"] = {
             "kind": "constant_after_stored_value_validation",
-            "stored": float(spec.stored_lid),  # type: ignore[arg-type]
+            "stored": float(stored_lid),  # type: ignore[arg-type]
             "effective": float(spec.lid_override),
         }
 

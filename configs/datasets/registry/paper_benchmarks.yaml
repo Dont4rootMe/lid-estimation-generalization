@@ -596,8 +596,13 @@ datasets:
     - 28
     coefficients:
     - 30
+  stored_lid_by_split:
+    train: 20
+    val: 20
+    test: 1
+  lid_override: 1
   expected_lid: 1
-  notes: The canonical paper archive has corrected lid.npy=1 and preserves the old value in lid-OLD_WRONG.npy. The sidecar remains covered by the tree manifest but is never loaded as a target.
+  notes: 'The canonical paper archive stores lid.npy=20 for train/val and lid.npy=1 for test. Validate each raw split exactly, then expose theoretical LID 1 in memory for every split. Never modify the archive; lid-OLD_WRONG.npy remains covered by the tree manifest and is never loaded as a target.'
 - name: e8_sphere4_pca
   section: '3.2'
   representation: dataset

@@ -30,8 +30,12 @@ metrics + immutable run manifest
 `datasets.registry` читает только публичный upstream layout (`train/`, `val/`,
 `test/`, файлы `dataset.npy`, `lid.npy`, `coefficients.npy`, `labels.npy`).
 Loader проверяет формы, числовые dtype, finite values, длины sidecars и known-LID
-policy. Registry описывает representation и научный анализ; модель не знает
-имён upstream-папок.
+policy. Для canonical Spaghetti split-aware YAML policy сначала fail-closed
+проверяет raw `lid.npy` как `train=20`, `val=20`, `test=1`, затем публикует
+effective LID 1 для всех split. Каждая применённая in-memory correction
+записывается по split в pilot input record и sealed manifest; исходные `.npy`
+не меняются. Registry описывает representation и научный анализ; модель не
+знает имён upstream-папок.
 
 ### Preprocessing
 

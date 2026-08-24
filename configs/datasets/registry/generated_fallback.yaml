@@ -5,8 +5,10 @@ source_kind: locally_generated_from_pinned_upstream
 upstream_revision: 2dcb8e41015f53413ff1ddd049bb006c81a5df52
 overrides:
 - name: e8_spaghetti_pca
-  stored_lid: 20
+  stored_lid_by_split:
+    train: 20
+    val: 20
+    test: 20
   lid_override: 1
   expected_lid: 1
-  notes: 'Generated-source fallback only: validate lid.npy=20, then expose theoretical LID 1 in memory. Do not modify the generated artifact or upstream source.'
-
+  notes: 'Generated-source fallback only: validate lid.npy=20 independently in every split, then expose theoretical LID 1 in memory. Do not modify the generated artifact or upstream source.'

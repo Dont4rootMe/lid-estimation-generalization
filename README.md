@@ -189,7 +189,10 @@ Registry находится в
 `configs/datasets/registry/paper_benchmarks.yaml`. Он проверяет все 28 каталогов,
 split sizes, shapes, finite numeric arrays, known LID и transformation deltas.
 Known upstream defects (включая старый Spaghetti target) обрабатываются явно,
-не скрытыми правками данных.
+не скрытыми правками данных. В частности, canonical Spaghetti проверяется по
+raw split-контракту `train=20`, `val=20`, `test=1`, после чего effective LID 1
+выставляется только в памяти для всех split; per-split correction сохраняется
+в input provenance/manifest.
 
 Подробности: `docs/ARCHITECTURE.md`, `docs/EXPERIMENT_PROTOCOL.md`,
 `docs/MODEL_MATRIX.md`, `docs/LEARNED_BUNDLES.md`,

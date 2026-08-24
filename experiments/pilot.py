@@ -480,6 +480,20 @@ def _records_sha256(records: Mapping[str, Any]) -> str:
     return sha256_bytes(canonical_json(identity).encode("utf-8"))
 
 
+def _applied_override_records(
+    splits: Mapping[str, LoadedSplit],
+) -> dict[str, dict[str, dict[str, float | str]]]:
+    """Return the in-memory corrections applied after raw-value validation."""
+
+    return {
+        split_name: {
+            artifact: dict(sorted(details.items()))
+            for artifact, details in sorted(split.applied_overrides.items())
+        }
+        for split_name, split in splits.items()
+    }
+
+
 def _load_inputs(
     *, root: Path, config: Mapping[str, Any]
 ) -> tuple[DatasetRegistry, Path, Path, dict[str, Mapping[str, LoadedSplit]], dict[str, Any]]:
@@ -519,6 +533,7 @@ def _load_inputs(
             "training_dataset_sha256": source_files[training_key]["sha256"],
             "source_files_sha256": _records_sha256(source_files),
             "source_files": source_files,
+            "applied_overrides": _applied_override_records(splits),
         }
         loaded[name] = splits
     input_record = {
