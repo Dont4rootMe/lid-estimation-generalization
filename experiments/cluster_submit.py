@@ -35,6 +35,7 @@ PREFLIGHT_CHECK = True
 N_WORKERS = 1
 N_GPUS = 1
 INSTANCE_TYPE = "a100.1gpu"
+CUBLAS_WORKSPACE_CONFIG = ":4096:8"
 APPROVED_FAMILIES = ("diffusion", "rectified_flow")
 
 _SCHEDULER_FIELDS = frozenset(
@@ -156,6 +157,11 @@ def _validate_environment(value: Mapping[str, Any]) -> dict[str, str | int]:
     for key, expected in required_public.items():
         if result.get(key) != expected:
             raise ClusterConfigError(f"environment.{key} must be {expected!r}")
+    if result.get("CUBLAS_WORKSPACE_CONFIG") != CUBLAS_WORKSPACE_CONFIG:
+        raise ClusterConfigError(
+            "environment.CUBLAS_WORKSPACE_CONFIG must be "
+            f"{CUBLAS_WORKSPACE_CONFIG!r}"
+        )
     if result.get("MLS_JOB_TOTAL_GPU") != N_GPUS:
         raise ClusterConfigError(f"environment.MLS_JOB_TOTAL_GPU must be {N_GPUS}")
     if result.get("MLS_JOB_REGION_NAME") != REGION:
@@ -528,6 +534,7 @@ if __name__ == "__main__":
 
 __all__ = [
     "APPROVED_FAMILIES",
+    "CUBLAS_WORKSPACE_CONFIG",
     "ClusterConfig",
     "ClusterConfigError",
     "ClusterSubmissionError",

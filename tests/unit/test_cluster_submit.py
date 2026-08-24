@@ -10,6 +10,7 @@ import pytest
 
 from experiments.cluster_submit import (
     APPROVED_FAMILIES,
+    CUBLAS_WORKSPACE_CONFIG,
     ClusterConfig,
     ClusterConfigError,
     ClusterSubmissionError,
@@ -47,6 +48,10 @@ def test_planned_jobs_pin_all_scheduler_fair_use_metadata() -> None:
         assert payload["n_workers"] == 1
         assert payload["instance_type"] == INSTANCE_TYPE
         assert payload["flags"] == {}
+        assert (
+            payload["env_variables"]["CUBLAS_WORKSPACE_CONFIG"]
+            == CUBLAS_WORKSPACE_CONFIG
+        )
 
 
 def test_payload_has_no_serialized_secret_or_family_scheduler_metadata() -> None:
@@ -108,6 +113,22 @@ def test_secret_field_in_scheduler_environment_is_rejected() -> None:
     payload = build_job_payload(_config(), "diffusion")
     payload["env_variables"]["COMET_API_KEY"] = "must-not-be-here"
     with pytest.raises(ClusterConfigError, match="secret variable"):
+        validate_job_payload(payload)
+
+
+@pytest.mark.parametrize("value", [None, "", ":16:8", ":4096:2"])
+def test_deterministic_cublas_workspace_config_is_mandatory(
+    value: str | None,
+) -> None:
+    payload = build_job_payload(_config(), "diffusion")
+    if value is None:
+        del payload["env_variables"]["CUBLAS_WORKSPACE_CONFIG"]
+    else:
+        payload["env_variables"]["CUBLAS_WORKSPACE_CONFIG"] = value
+    with pytest.raises(
+        ClusterConfigError,
+        match=r"environment\.CUBLAS_WORKSPACE_CONFIG must be ':4096:8'",
+    ):
         validate_job_payload(payload)
 
 

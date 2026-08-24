@@ -291,6 +291,120 @@ def test_scale_selection_precedes_any_label_metric(
     )
 
 
+def test_rectified_flow_selects_in_lambda_but_reports_original_t(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _fixture_config(tmp_path, family="rectified_flow")
+    model_times = np.asarray(config.pilot_model.scales, dtype=np.float64)
+    expected_lambda = (1.0 - model_times) / model_times
+    observed_coordinates: list[np.ndarray] = []
+    observed_preferences: list[str] = []
+    original_select = pilot_module.select_stable_scale
+    logger = _RecordingLogger()
+
+    def recording_select(coordinates, curves, **kwargs):
+        observed_coordinates.append(np.asarray(coordinates).copy())
+        observed_preferences.append(kwargs["prefer"])
+        return original_select(coordinates, curves, **kwargs)
+
+    monkeypatch.setattr(pilot_module, "select_stable_scale", recording_select)
+    run_dir = run_pilot(
+        config,
+        root=tmp_path,
+        output_root=tmp_path / "runs",
+        train_fn=_fake_train,
+        predict_fn=_fake_predict,
+        log_callback=logger,
+    )
+
+    assert len(observed_coordinates) == len(PILOT_DATASETS)
+    assert observed_preferences == ["smaller"] * len(PILOT_DATASETS)
+    for coordinate in observed_coordinates:
+        np.testing.assert_allclose(coordinate, expected_lambda)
+    for name in PILOT_DATASETS:
+        summary = json.loads(
+            (run_dir / "datasets" / name / "summary.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        selection = summary["scale_selection"]
+        index = selection["selected_index"]
+        assert selection["selected_t"] == pytest.approx(model_times[index])
+        assert selection["selected_scale"] == pytest.approx(model_times[index])
+        assert selection["model_scale"] == {
+            "name": "t",
+            "selected_value": pytest.approx(model_times[index]),
+            "prefer": "larger",
+        }
+        coordinate = selection["selection_coordinate"]
+        assert coordinate["name"] == "lambda"
+        assert coordinate["formula"] == "(1 - t) / t"
+        assert coordinate["prefer"] == "smaller"
+        np.testing.assert_allclose(coordinate["values"], expected_lambda)
+        assert coordinate["selected_value"] == pytest.approx(
+            expected_lambda[index]
+        )
+        assert selection["model_scale_prefer"] == "larger"
+        assert selection["selection_coordinate_prefer"] == "smaller"
+        assert selection["prefer"] == "smaller"
+    completions = [
+        payload
+        for event, payload in logger.events
+        if event.endswith(".completed") and event != "experiment.completed"
+    ]
+    assert len(completions) == len(PILOT_DATASETS)
+    assert all(
+        payload["selection_coordinate"]["name"] == "lambda"
+        for payload in completions
+    )
+
+
+@pytest.mark.parametrize(
+    ("bad_call", "bad_split"),
+    [(1, "validation"), (10, "test")],
+)
+def test_pilot_refuses_non_finite_prediction_curves_before_metrics_or_sealing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bad_call: int,
+    bad_split: str,
+) -> None:
+    config = _fixture_config(tmp_path)
+    prediction_calls = 0
+    metric_calls = 0
+    original_metric = pilot_module.known_lid_metrics
+
+    def non_finite_predict(*args, **kwargs):
+        nonlocal prediction_calls
+        prediction_calls += 1
+        prediction = _fake_predict(*args, **kwargs)
+        if prediction_calls == bad_call:
+            prediction = prediction.copy()
+            prediction[0] = np.nan
+        return prediction
+
+    def recording_metric(*args, **kwargs):
+        nonlocal metric_calls
+        metric_calls += 1
+        return original_metric(*args, **kwargs)
+
+    monkeypatch.setattr(pilot_module, "known_lid_metrics", recording_metric)
+    with pytest.raises(
+        FloatingPointError,
+        match=rf"{bad_split} prediction curve contains 1 non-finite",
+    ):
+        run_pilot(
+            config,
+            root=tmp_path,
+            output_root=tmp_path / "runs",
+            train_fn=_fake_train,
+            predict_fn=non_finite_predict,
+        )
+
+    assert metric_calls == 0
+    assert not list((tmp_path / "runs").rglob("manifest.json"))
+
+
 def test_manifest_detects_raw_prediction_tampering(tmp_path: Path) -> None:
     config = _fixture_config(tmp_path)
     run_dir = run_pilot(

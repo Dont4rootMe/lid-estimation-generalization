@@ -597,6 +597,82 @@ def _prediction_curve(
     return np.ascontiguousarray(np.column_stack(columns), dtype=np.float64)
 
 
+def _require_all_finite(value: npt.ArrayLike, *, label: str) -> None:
+    """Fail before metrics/artifact sealing when an inference result is invalid."""
+
+    array = np.asarray(value)
+    finite = np.isfinite(array)
+    if finite.all():
+        return
+    first = tuple(int(index) for index in np.argwhere(~finite)[0])
+    count = int(array.size - np.count_nonzero(finite))
+    raise FloatingPointError(
+        f"{label} contains {count} non-finite value(s); first index={first}"
+    )
+
+
+def _selection_coordinate(
+    scales: FloatArray, *, family: str
+) -> tuple[FloatArray, str, str, str]:
+    """Return the coordinate in which plateau stability is measured.
+
+    Rectified-flow networks are evaluated at time ``t``, while the Gaussian
+    channel scale in the endpoint identity is ``lambda = (1 - t) / t``.  The
+    selector must therefore differentiate the validation curve with respect to
+    log-lambda, not log-t.  Diffusion already uses its native noise scale.
+    """
+
+    if family == "rectified_flow":
+        coordinate = (1.0 - scales) / scales
+        return (
+            np.ascontiguousarray(coordinate, dtype=np.float64),
+            "lambda",
+            "(1 - t) / t",
+            "t",
+        )
+    return scales.copy(), "sigma", "sigma", "sigma"
+
+
+def _reported_selection_diagnostics(
+    diagnostics: Mapping[str, Any],
+    *,
+    scales: FloatArray,
+    coordinates: FloatArray,
+    selected_index: int,
+    coordinate_name: str,
+    coordinate_formula: str,
+    model_scale_name: str,
+    coordinate_prefer: str,
+    model_scale_prefer: str,
+) -> dict[str, Any]:
+    """Make the selector coordinate and original model parameter unambiguous."""
+
+    result = dict(diagnostics)
+    selected_coordinate = float(coordinates[selected_index])
+    selected_model_scale = float(scales[selected_index])
+    # ``select_stable_scale`` calls its input a scale.  Preserve that value in
+    # the explicit coordinate record, then expose the actual network parameter
+    # under the long-standing ``selected_scale`` field.
+    result["selection_coordinate"] = {
+        "name": coordinate_name,
+        "formula": coordinate_formula,
+        "values": [float(value) for value in coordinates],
+        "selected_value": selected_coordinate,
+        "prefer": coordinate_prefer,
+    }
+    result["model_scale"] = {
+        "name": model_scale_name,
+        "selected_value": selected_model_scale,
+        "prefer": model_scale_prefer,
+    }
+    result["selection_coordinate_prefer"] = coordinate_prefer
+    result["model_scale_prefer"] = model_scale_prefer
+    result["selected_scale"] = selected_model_scale
+    if model_scale_name == "t":
+        result["selected_t"] = selected_model_scale
+    return result
+
+
 def _training_result_record(result: Any) -> dict[str, Any]:
     fields = {
         "family": getattr(result, "family", None),
@@ -742,13 +818,37 @@ def _run_dataset(
         model=model,
         evaluation=evaluation,
     )
+    _require_all_finite(validation_curve, label="validation prediction curve")
     selection = evaluation["selection"]
-    selected_index, selection_diagnostics = select_stable_scale(
-        scales,
+    (
+        selection_coordinates,
+        coordinate_name,
+        coordinate_formula,
+        model_scale_name,
+    ) = _selection_coordinate(scales, family=family)
+    model_scale_prefer = str(model["selection_prefer"])
+    coordinate_prefer = model_scale_prefer
+    if family == "rectified_flow":
+        coordinate_prefer = (
+            "smaller" if model_scale_prefer == "larger" else "larger"
+        )
+    selected_index, raw_selection_diagnostics = select_stable_scale(
+        selection_coordinates,
         validation_curve,
         window=int(selection["window"]),
         min_valid_fraction=float(selection["min_valid_fraction"]),
-        prefer=str(model["selection_prefer"]),  # type: ignore[arg-type]
+        prefer=coordinate_prefer,  # type: ignore[arg-type]
+    )
+    selection_diagnostics = _reported_selection_diagnostics(
+        raw_selection_diagnostics,
+        scales=scales,
+        coordinates=selection_coordinates,
+        selected_index=selected_index,
+        coordinate_name=coordinate_name,
+        coordinate_formula=coordinate_formula,
+        model_scale_name=model_scale_name,
+        coordinate_prefer=coordinate_prefer,
+        model_scale_prefer=model_scale_prefer,
     )
     # Test inference happens only after label-free selection has completed.
     test_curve = _prediction_curve(
@@ -760,8 +860,13 @@ def _run_dataset(
         model=model,
         evaluation=evaluation,
     )
+    _require_all_finite(test_curve, label="test prediction curve")
     validation_prediction = validation_curve[:, selected_index]
     test_prediction = test_curve[:, selected_index]
+    _require_all_finite(
+        validation_prediction, label="selected validation prediction"
+    )
+    _require_all_finite(test_prediction, label="selected test prediction")
     validation_metrics = known_lid_metrics(validation_prediction, validation_target)
     test_metrics = known_lid_metrics(test_prediction, test_target)
 
@@ -834,6 +939,8 @@ def _run_dataset(
         family=family,
         dataset=name,
         selected_scale=float(scales[selected_index]),
+        selection_coordinate=selection_diagnostics["selection_coordinate"],
+        model_scale=selection_diagnostics["model_scale"],
         validation=validation_metrics,
         test=test_metrics,
     )
