@@ -1,0 +1,46 @@
+schema_version: 1
+
+scheduler:
+  job_desc: "echimbulatov | ent-block-diffusion-eval #ID0137 #rnd"
+  queue_name: shared
+  base_image: cr.ai.cloud.ru/2754eb6e-ae19-4123-87ce-06ec3cc96500/job-latentdiffusion:flash-clear
+  n_workers: 1
+  n_gpus: 1
+  instance_type: a100.1gpu
+  type: pytorch2
+  preflight_check: true
+  region: A100-MT
+  priority_class: shared-medium
+
+execution:
+  repo_root: /home/jovyan/echimbulatov/fork_afedorov/constant_repos/lid-estimation-generalization
+  python: /home/jovyan/.mlspace/envs/block-diff/bin/python
+  module: experiments.global_campaign
+  entrypoint: /home/jovyan/echimbulatov/fork_afedorov/constant_repos/lid-estimation-generalization/experiments/global_job.py
+  data_root: /home/jovyan/echimbulatov/fork_afedorov/constant_repos/lid-estimation-generalization/data/lid_benchmarks_exact/benchmarks
+  output_dir: /home/jovyan/echimbulatov/fork_afedorov/constant_repos/lid-estimation-generalization/artifacts/global
+  campaign: all_suites_all_models
+  seed: 0
+  comet_config_file: /home/jovyan/.comet.config
+
+environment:
+  PROJECT_ROOT: /home/jovyan/echimbulatov/fork_afedorov/constant_repos/lid-estimation-generalization
+  PYTHONPATH: /home/jovyan/echimbulatov/fork_afedorov/constant_repos/lid-estimation-generalization
+  CUBLAS_WORKSPACE_CONFIG: ":4096:8"
+  MLS_JOB_TOTAL_GPU: 1
+  MLS_JOB_REGION_NAME: A100-MT
+  COMET_PROJECT_NAME: lid-generalization
+  COMET_WORKSPACE: dont4rootme
+  COMET_CONFIG: /home/jovyan/.comet.config
+  COMET_MODE: online
+  COMET_LOGGING_CONSOLE: "true"
+  PYTHONNOUSERSITE: 1
+  PIP_USER: "no"
+  PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION: python
+  LD_LIBRARY_PATH: /usr/local/nvidia/lib64:/usr/local/nvidia/lib:/usr/lib/x86_64-linux-gnu:/opt/hpcx/ompi/lib:/opt/hpcx/ucx/lib:/opt/hpcx/ucc/lib:/opt/hpcx/sharp/lib:/opt/hpcx/nccl_rdma_sharp_plugin/lib:/opt/hpcx/hcoll/lib:/usr/local/cuda-12.6/lib64
+  NCCL_IB_HCA: mlx5_0:1,mlx5_1:1,mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1,mlx5_10:1,mlx5_11:1
+  TORCH_NCCL_AVOID_RECORD_STREAMS: "1"
+  NCCL_DEBUG: INFO
+  OMPI_MCA_coll_hcoll_enable: "0"
+  OMPI_MCA_btl: ^openib,smcuda
+  OMPI_MCA_pml: ucx

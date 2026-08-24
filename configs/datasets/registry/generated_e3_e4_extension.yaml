@@ -1,0 +1,55 @@
+schema_version: 1
+benchmark_id: lid-benchmarks-generated-e3-e4-extension-at-2dcb8e4
+description: >-
+  Generated-only E3/E4 extension backed by generator classes present at the
+  pinned upstream revision but omitted from upstream prepare_all, README, and
+  the canonical paper archive. These entries are never exact-archive data.
+upstream_registry: lid_benchmarks/DATA.yaml
+official_readme_folders: []
+datasets:
+  - name: e3_gaussian_pca
+    section: generated extension e3
+    official: false
+    representation: dataset
+    available_representations:
+      - dataset
+      - coefficients
+    required_artifacts:
+      - dataset
+      - lid
+      - coefficients
+    expected_samples:
+      train: 100000
+      val: 1000
+      test: 1000
+    expected_shapes:
+      dataset: [1, 28, 28]
+      coefficients: [30]
+    expected_lid: 20
+    notes: >-
+      Generated explicitly with GaussianPCADatasetGenerator(dim=20). This
+      dataset is absent from the canonical exact archive.
+
+  - name: e4_sphere_pca_radius1
+    section: generated extension e4
+    official: false
+    representation: dataset
+    available_representations:
+      - dataset
+      - coefficients
+    required_artifacts:
+      - dataset
+      - lid
+      - coefficients
+    expected_samples:
+      train: 100000
+      val: 1000
+      test: 1000
+    expected_shapes:
+      dataset: [1, 28, 28]
+      coefficients: [30]
+    expected_lid: 19
+    notes: >-
+      Generated explicitly with SpherePCADatasetGenerator(dim=20, radius=1).
+      The manifold is S^19. This dataset is absent from the canonical exact
+      archive.

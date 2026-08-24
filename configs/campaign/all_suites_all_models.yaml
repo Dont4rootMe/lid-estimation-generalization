@@ -1,0 +1,59 @@
+campaign_id: lid-global-e1-e8-canonical-plus-generated-e3-e4-all-trainable-models-v1
+inventory:
+  canonical: configs/global_suite/canonical_exact.yaml
+  generated_e3_e4: configs/global_suite/generated_e3_e4.yaml
+  require_suite_ids: [e1, e2, e3, e4, e5, e6, e7, e8]
+  include_all_representations: true
+
+models:
+  - id: diffusion
+    experiment_name: lid-generalization-global-e1-e8-canonical-plus-generated-e3-e4-diffusion-train-selected-scale-seed-${seed}
+  - id: rectified_flow
+    experiment_name: lid-generalization-global-e1-e8-canonical-plus-generated-e3-e4-rectified-flow-matching-train-selected-time-seed-${seed}
+  - id: scale_conditioned_nf
+    experiment_name: lid-generalization-global-e1-e8-canonical-plus-generated-e3-e4-scale-conditioned-normalizing-flow-train-selected-scale-seed-${seed}
+  - id: schrodinger_bridge
+    experiment_name: lid-generalization-global-e1-e8-canonical-plus-generated-e3-e4-brownian-schrodinger-bridge-train-selected-time-seed-${seed}
+  - id: direct_rectified_flow
+    experiment_name: lid-generalization-global-e1-e8-canonical-plus-generated-e3-e4-fm-rectified-direct-velocity-train-selected-lambda-seed-${seed}
+  - id: posterior_rectified_flow
+    experiment_name: lid-generalization-global-e1-e8-canonical-plus-generated-e3-e4-fm-rectified-posterior-mean-train-selected-lambda-seed-${seed}
+  - id: direct_log_noise_affine_flow
+    experiment_name: lid-generalization-global-e1-e8-canonical-plus-generated-e3-e4-fm-log-noise-direct-velocity-train-selected-lambda-seed-${seed}
+  - id: posterior_log_noise_affine_flow
+    experiment_name: lid-generalization-global-e1-e8-canonical-plus-generated-e3-e4-fm-log-noise-posterior-mean-train-selected-lambda-seed-${seed}
+  - id: direct_vp_trigonometric_flow
+    experiment_name: lid-generalization-global-e1-e8-canonical-plus-generated-e3-e4-fm-vp-trigonometric-direct-velocity-train-selected-lambda-seed-${seed}
+  - id: posterior_vp_trigonometric_flow
+    experiment_name: lid-generalization-global-e1-e8-canonical-plus-generated-e3-e4-fm-vp-trigonometric-posterior-mean-train-selected-lambda-seed-${seed}
+
+selection:
+  known_lid_protocol: held_out_source_train_supervised_mae_v1
+  unknown_lid_protocol: held_out_source_train_reference_stability_v1
+  index_algorithm: splitmix64_rank_v1
+  fraction: 0.2
+  minimum_selection: 2
+  maximum_selection: 1000
+  minimum_fit: 8
+  criterion: mae
+  stability_window: 1
+  stability_min_valid_fraction: 1.0
+  tie_tolerance: 1.0e-12
+
+evaluation:
+  batch_size: 128
+  frozen_candidate_count: 1
+  save_retrospective_validation_curves: false
+  save_retrospective_test_curves: false
+
+resume:
+  schema_version: 1
+  cell_attempt_policy: stable_identity_directory
+  training_progress_filename: training_progress.pt
+  invalid_existing_policy: fail
+  source_tree_check_before_every_cell: true
+  lock_filename: campaign.lock
+
+fm_diagnostics:
+  policy: known_lid_only
+  unknown_lid_status: not_applicable_no_lid_targets

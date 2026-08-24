@@ -118,6 +118,68 @@ Standalone pilot сохраняет отдельный checkpoint для каж�
 меньшему `sigma` для diffusion и к endpoint `t -> 1` для rectified flow.
 Validation и test targets не участвуют в выборе.
 
+## Один scheduler job для глобальной кампании
+
+Полный Hydra campaign запускает **10 trainable configs × 39 cells = 390
+обучений** одним процессом на одной A100. Из 39 cells 35 принадлежат exact
+canonical archive (E1, E2, E5–E8), а четыре — явно отделённому generated
+extension E3/E4. В десять моделей входят diffusion, legacy rectified FM,
+scale-conditioned NF, Brownian Schrödinger bridge и шесть прямых/posterior
+affine-FM вариантов. Calibrated NF/CNF исключены: для них нет trainer contract;
+population oracle тоже исключён, потому что он не является обучаемой моделью.
+
+Перед submit generated extension нужно один раз материализовать и строго
+проверить (команды idempotent и никогда не дообучают PCA):
+
+```bash
+uv run python -m datasets.generated_e3_e4 \
+  --pca data/lid_benchmarks_exact/benchmarks/pca.joblib \
+  --output data/generated_benchmarks
+
+uv run python -m datasets.generated_e3_e4 \
+  --pca data/lid_benchmarks_exact/benchmarks/pca.joblib \
+  --output data/generated_benchmarks --validate-only
+```
+
+Runner до Comet/GPU заново проверяет exact ZIP и распакованное дерево,
+generated manifest/seal/PCA/upstream revision, а затем хэширует входы всех 39
+cells. Внутри job модели и suites идут строго последовательно. Каждая cell имеет
+стабильный identity-каталог, атомарный final publish и epoch-progress checkpoint;
+повтор команды переиспользует валидные cells и продолжает оборванную cell, но
+падает на повреждённом или изменившемся evidence. Это один scheduler job, но
+ровно 10 отдельных, model-specific Comet experiments с durable local
+spool/replay для временных сетевых сбоев.
+
+Оценка чистого compute — примерно 50–90 GPU-hours; для планирования очереди,
+валидации и диагностик разумный консервативный бюджет 100–140 часов. Scheduler
+не задаёт walltime/retry, поэтому resumability является частью обязательного
+контракта, а не оптимизацией.
+
+```bash
+# По умолчанию только secret-free план ровно одного Job
+python -m experiments.global_cluster_submit \
+  --config configs/cluster/shared_a100_global.yaml
+
+# Единственная команда, которая разрешает реальную отправку
+python -m experiments.global_cluster_submit \
+  --config configs/cluster/shared_a100_global.yaml --submit
+```
+
+Global launcher сохраняет те же fair-use параметры, что и pilot:
+`queue_name=shared`, `priority_class=shared-medium`, `region=A100-MT`,
+`instance_type=a100.1gpu` и literal scheduler description
+`echimbulatov | ent-block-diffusion-eval #ID0137 #rnd`. Model и dataset
+identity отсутствуют в scheduler metadata. Единственная безопасная source-команда
+выбирает Hydra group `campaign=all_suites_all_models`; отдельные описательные
+Comet experiment names принадлежат campaign config, а не scheduler payload.
+Credential по-прежнему читает только Comet SDK из mode-0600
+`/home/jovyan/.comet.config`; dry run и payload не содержат API key.
+После полного прохода `aggregate.json` и `unified_results.csv` пересчитываются
+из sealed pointwise arrays. CSV содержит model/suite/dataset/representation,
+split/readout, train-selected coordinate и known-LID, E1 stability, E5 paired
+delta metrics; его SHA закреплён в final manifest и upload intent доставляется
+во все десять Comet experiments.
+
 ## Структура
 
 ```text

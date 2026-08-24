@@ -10,6 +10,7 @@ import pytest
 torch = pytest.importorskip("torch")
 from torch import nn
 
+import models.training as training_module
 from models.neural_fields import (
     NeuralFieldConfig,
     ScaleConditionedNeuralField,
@@ -183,6 +184,174 @@ def test_same_seed_reproduces_history_and_weights(tmp_path: Path) -> None:
     assert first.history == second.history
     for name, value in first.model.state_dict().items():
         torch.testing.assert_close(value, second.model.state_dict()[name])
+
+
+def test_train_model_resumes_from_atomic_validated_epoch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(training_module, "TRAINING_PROGRESS_INTERVAL_EPOCHS", 1)
+    rng = np.random.default_rng(31)
+    train = rng.normal(size=(24, 3)).astype(np.float32)
+    validation = rng.normal(size=(12, 3)).astype(np.float32)
+    config = replace(_tiny_config(seed=113), epochs=4)
+    uninterrupted = train_model(
+        "diffusion",
+        train,
+        validation,
+        config,
+        tmp_path / "uninterrupted.ckpt",
+    )
+
+    progress = tmp_path / "resumed" / "training-progress.pt"
+    checkpoint = tmp_path / "resumed" / "model.ckpt"
+    original_save = training_module._atomic_torch_save
+    interrupted = False
+
+    def save_then_interrupt(path: Path, payload: dict[str, object]) -> None:
+        nonlocal interrupted
+        original_save(path, payload)
+        if not interrupted:
+            interrupted = True
+            raise RuntimeError("simulated scheduler interruption")
+
+    monkeypatch.setattr(training_module, "_atomic_torch_save", save_then_interrupt)
+    with pytest.raises(RuntimeError, match="scheduler interruption"):
+        train_model(
+            "diffusion",
+            train,
+            validation,
+            config,
+            checkpoint,
+            progress_checkpoint_path=progress,
+        )
+    assert progress.is_file()
+    assert not checkpoint.exists()
+
+    monkeypatch.setattr(training_module, "_atomic_torch_save", original_save)
+    resumed = train_model(
+        "diffusion",
+        train,
+        validation,
+        config,
+        checkpoint,
+        progress_checkpoint_path=progress,
+    )
+    assert not progress.exists()
+    assert resumed.history == uninterrupted.history
+    assert resumed.best_epoch == uninterrupted.best_epoch
+    assert resumed.best_validation_loss == uninterrupted.best_validation_loss
+    for name, value in uninterrupted.model.state_dict().items():
+        torch.testing.assert_close(value, resumed.model.state_dict()[name])
+
+
+def test_train_model_rejects_tampered_progress_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(training_module, "TRAINING_PROGRESS_INTERVAL_EPOCHS", 1)
+    rng = np.random.default_rng(32)
+    train = rng.normal(size=(16, 2)).astype(np.float32)
+    validation = rng.normal(size=(8, 2)).astype(np.float32)
+    config = replace(_tiny_config(seed=117), epochs=2)
+    progress = tmp_path / "progress.pt"
+    original_save = training_module._atomic_torch_save
+
+    def save_then_interrupt(path: Path, payload: dict[str, object]) -> None:
+        original_save(path, payload)
+        raise RuntimeError("simulated scheduler interruption")
+
+    monkeypatch.setattr(training_module, "_atomic_torch_save", save_then_interrupt)
+    with pytest.raises(RuntimeError, match="scheduler interruption"):
+        train_model(
+            "rectified_flow",
+            train,
+            validation,
+            config,
+            tmp_path / "model.ckpt",
+            progress_checkpoint_path=progress,
+        )
+    payload = torch.load(progress, map_location="cpu", weights_only=True)
+    payload["training_config"]["seed"] = 999
+    torch.save(payload, progress)
+    monkeypatch.setattr(training_module, "_atomic_torch_save", original_save)
+    with pytest.raises(ValueError, match="config mismatch"):
+        train_model(
+            "rectified_flow",
+            train,
+            validation,
+            config,
+            tmp_path / "model.ckpt",
+            progress_checkpoint_path=progress,
+        )
+
+
+def test_training_progress_rejects_different_validation_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(training_module, "TRAINING_PROGRESS_INTERVAL_EPOCHS", 1)
+    rng = np.random.default_rng(33)
+    train = rng.normal(size=(16, 2)).astype(np.float32)
+    validation = rng.normal(size=(8, 2)).astype(np.float32)
+    config = replace(_tiny_config(seed=119), epochs=3)
+    progress = tmp_path / "progress.pt"
+    original_save = training_module._atomic_torch_save
+
+    def save_then_interrupt(path: Path, payload: dict[str, object]) -> None:
+        original_save(path, payload)
+        raise RuntimeError("simulated scheduler interruption")
+
+    monkeypatch.setattr(training_module, "_atomic_torch_save", save_then_interrupt)
+    with pytest.raises(RuntimeError, match="scheduler interruption"):
+        train_model(
+            "diffusion",
+            train,
+            validation,
+            config,
+            tmp_path / "model.ckpt",
+            progress_checkpoint_path=progress,
+        )
+    monkeypatch.setattr(training_module, "_atomic_torch_save", original_save)
+    with pytest.raises(ValueError, match="data identity mismatch"):
+        train_model(
+            "diffusion",
+            train,
+            np.full_like(validation, 17.0),
+            config,
+            tmp_path / "model.ckpt",
+            progress_checkpoint_path=progress,
+        )
+
+
+def test_training_progress_path_must_differ_from_final_checkpoint(
+    tmp_path: Path,
+) -> None:
+    rng = np.random.default_rng(34)
+    train = rng.normal(size=(16, 2)).astype(np.float32)
+    validation = rng.normal(size=(8, 2)).astype(np.float32)
+    shared_path = tmp_path / "shared.pt"
+
+    with pytest.raises(ValueError, match="must differ"):
+        train_model(
+            "diffusion",
+            train,
+            validation,
+            _tiny_config(seed=121),
+            shared_path,
+            progress_checkpoint_path=shared_path,
+        )
+    assert not shared_path.exists()
+
+
+def test_cpu_state_dict_is_a_frozen_snapshot() -> None:
+    model = nn.Linear(2, 2)
+    snapshot = training_module._cpu_state_dict(model)
+    expected = {name: value.clone() for name, value in snapshot.items()}
+
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.add_(7.0)
+
+    for name, value in snapshot.items():
+        torch.testing.assert_close(value, expected[name])
 
 
 def test_scale_conditioned_nf_trains_loads_and_predicts_exact_fixed_likelihood(

@@ -17,6 +17,7 @@ data/benchmarks.zip
 data/lid_benchmarks_exact/
 data/downloads/
 data/generated_benchmarks/
+data/.*.generation.lock
 artifacts/
 output/
 

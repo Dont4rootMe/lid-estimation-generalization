@@ -25,6 +25,7 @@ import random
 import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
+from itertools import pairwise
 from pathlib import Path
 from typing import Any, Literal
 
@@ -89,6 +90,8 @@ Family = Literal[
 LogCallback = Callable[[Mapping[str, float | int | bool | str]], None]
 CHECKPOINT_SCHEMA_VERSION = 2
 LEGACY_CHECKPOINT_SCHEMA_VERSION = 1
+TRAINING_PROGRESS_SCHEMA_VERSION = 1
+TRAINING_PROGRESS_INTERVAL_EPOCHS = 20
 TrainableModel = ScaleConditionedNeuralField | ScaleConditionedRealNVP
 
 
@@ -903,9 +906,25 @@ def _checkpoint_sha256(path: Path) -> str:
 
 def _cpu_state_dict(model: nn.Module) -> dict[str, Tensor]:
     return {
-        name: value.detach().cpu().contiguous()
+        name: value.detach().cpu().clone().contiguous()
         for name, value in model.state_dict().items()
     }
+
+
+def _tensor_identity_sha256(value: Tensor) -> str:
+    """Hash the exact finite float32 tensor consumed by the trainer."""
+
+    array = np.ascontiguousarray(value.detach().cpu().numpy().astype("<f4", copy=False))
+    digest = hashlib.sha256()
+    header = json.dumps(
+        {"dtype": array.dtype.str, "shape": list(array.shape)},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest.update(len(header).to_bytes(8, "big"))
+    digest.update(header)
+    digest.update(memoryview(array).cast("B"))
+    return digest.hexdigest()
 
 
 def _save_checkpoint(
@@ -957,6 +976,255 @@ def _save_checkpoint(
     return _checkpoint_sha256(path)
 
 
+def _atomic_torch_save(path: Path, payload: Mapping[str, Any]) -> None:
+    """Durably replace one trusted local torch payload.
+
+    Global campaigns can run for several days.  A scheduler interruption must
+    therefore leave either the previous complete epoch snapshot or the new
+    one, never a partially written file.
+    """
+
+    path = path.expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent, delete=False
+        ) as stream:
+            temporary_path = Path(stream.name)
+        torch.save(dict(payload), temporary_path)
+        with temporary_path.open("rb") as stream:
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _training_progress_payload(
+    *,
+    family: Family,
+    model: TrainableModel,
+    optimizer: torch.optim.Optimizer,
+    config: TrainingConfig,
+    epoch: int,
+    history: tuple[EpochMetrics, ...],
+    best_epoch: int,
+    best_validation_loss: float,
+    best_state: Mapping[str, Tensor],
+    stale_validations: int,
+    normalization_mean: Tensor,
+    normalization_scale: float,
+    preprocessing: Mapping[str, str | float | int],
+    preprocessing_sha256: str,
+    data_identity: Mapping[str, Any],
+    shuffle_generator: torch.Generator,
+    objective_generator: torch.Generator,
+    device: torch.device,
+) -> dict[str, Any]:
+    return {
+        "schema_version": TRAINING_PROGRESS_SCHEMA_VERSION,
+        "family": family,
+        "model_contract": _model_contract(family, config),
+        "architecture": model.config.to_dict(),
+        "training_config": config.to_dict(),
+        "epoch": epoch,
+        "model_state": _cpu_state_dict(model),
+        "optimizer_state": optimizer.state_dict(),
+        "history": [metric.to_dict() for metric in history],
+        "best_epoch": best_epoch,
+        "best_validation_loss": best_validation_loss,
+        "best_state": {
+            name: value.detach().cpu().clone().contiguous()
+            for name, value in best_state.items()
+        },
+        "stale_validations": stale_validations,
+        "normalization": {
+            "mean": normalization_mean.detach().cpu().contiguous(),
+            "scale": normalization_scale,
+            "preprocessing": dict(preprocessing),
+            "sha256": preprocessing_sha256,
+        },
+        "data_identity": dict(data_identity),
+        "rng": {
+            "shuffle_generator": shuffle_generator.get_state().cpu(),
+            "objective_generator": objective_generator.get_state().cpu(),
+            "torch": torch.get_rng_state().cpu(),
+            "cuda": [state.cpu() for state in torch.cuda.get_rng_state_all()]
+            if device.type == "cuda"
+            else [],
+            "device_type": device.type,
+        },
+    }
+
+
+def _load_training_progress(
+    path: Path,
+    *,
+    family: Family,
+    model: TrainableModel,
+    optimizer: torch.optim.Optimizer,
+    config: TrainingConfig,
+    normalization_mean: Tensor,
+    normalization_scale: float,
+    preprocessing: Mapping[str, str | float | int],
+    preprocessing_sha256: str,
+    data_identity: Mapping[str, Any],
+    shuffle_generator: torch.Generator,
+    objective_generator: torch.Generator,
+    device: torch.device,
+) -> tuple[
+    int,
+    list[EpochMetrics],
+    int,
+    float,
+    dict[str, Tensor],
+    int,
+]:
+    """Strictly restore the last validated epoch of an interrupted cell."""
+
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    required = {
+        "schema_version",
+        "family",
+        "model_contract",
+        "architecture",
+        "training_config",
+        "epoch",
+        "model_state",
+        "optimizer_state",
+        "history",
+        "best_epoch",
+        "best_validation_loss",
+        "best_state",
+        "stale_validations",
+        "normalization",
+        "data_identity",
+        "rng",
+    }
+    if not isinstance(payload, dict) or set(payload) != required:
+        raise ValueError("training progress schema mismatch")
+    if payload["schema_version"] != TRAINING_PROGRESS_SCHEMA_VERSION:
+        raise ValueError("unsupported training progress schema_version")
+    if _canonical_family(payload["family"]) != family:
+        raise ValueError("training progress family mismatch")
+    if payload["training_config"] != config.to_dict():
+        raise ValueError("training progress config mismatch")
+    if payload["model_contract"] != _model_contract(family, config):
+        raise ValueError("training progress model contract mismatch")
+    if payload["architecture"] != model.config.to_dict():
+        raise ValueError("training progress architecture mismatch")
+    if payload["data_identity"] != dict(data_identity):
+        raise ValueError("training progress data identity mismatch")
+
+    normalization = payload["normalization"]
+    if not isinstance(normalization, dict) or set(normalization) != {
+        "mean",
+        "scale",
+        "preprocessing",
+        "sha256",
+    }:
+        raise ValueError("training progress normalization schema mismatch")
+    stored_mean = torch.as_tensor(normalization["mean"]).detach().cpu().float()
+    if not torch.equal(stored_mean, normalization_mean.detach().cpu().float()):
+        raise ValueError("training progress normalization mean mismatch")
+    if float(normalization["scale"]) != normalization_scale:
+        raise ValueError("training progress normalization scale mismatch")
+    if (
+        normalization["preprocessing"] != dict(preprocessing)
+        or normalization["sha256"] != preprocessing_sha256
+    ):
+        raise ValueError("training progress preprocessing identity mismatch")
+
+    epoch = payload["epoch"]
+    if (
+        isinstance(epoch, bool)
+        or not isinstance(epoch, int)
+        or not 1 <= epoch <= config.epochs
+    ):
+        raise ValueError("training progress epoch is invalid")
+    history_raw = payload["history"]
+    if not isinstance(history_raw, list) or not history_raw:
+        raise ValueError("training progress history is invalid")
+    history: list[EpochMetrics] = []
+    history_fields = {"epoch", "train_loss", "validation_loss", "learning_rate"}
+    for item in history_raw:
+        if not isinstance(item, dict) or set(item) != history_fields:
+            raise ValueError("training progress history entry schema mismatch")
+        metric = EpochMetrics(**item)
+        if not all(
+            math.isfinite(float(value))
+            for value in (
+                metric.train_loss,
+                metric.validation_loss,
+                metric.learning_rate,
+            )
+        ):
+            raise ValueError("training progress history contains non-finite values")
+        history.append(metric)
+    if history[-1].epoch != epoch or any(
+        left.epoch >= right.epoch for left, right in pairwise(history)
+    ):
+        raise ValueError("training progress history epochs are inconsistent")
+
+    best_epoch = payload["best_epoch"]
+    best_validation_loss = float(payload["best_validation_loss"])
+    stale_validations = payload["stale_validations"]
+    if (
+        isinstance(best_epoch, bool)
+        or not isinstance(best_epoch, int)
+        or best_epoch not in {metric.epoch for metric in history}
+        or not math.isfinite(best_validation_loss)
+        or isinstance(stale_validations, bool)
+        or not isinstance(stale_validations, int)
+        or stale_validations < 0
+    ):
+        raise ValueError("training progress best-state metadata is invalid")
+    best_state = payload["best_state"]
+    if not isinstance(best_state, dict) or not best_state:
+        raise ValueError("training progress best_state is invalid")
+
+    rng = payload["rng"]
+    if not isinstance(rng, dict) or set(rng) != {
+        "shuffle_generator",
+        "objective_generator",
+        "torch",
+        "cuda",
+        "device_type",
+    }:
+        raise ValueError("training progress RNG schema mismatch")
+    if rng["device_type"] != device.type:
+        raise ValueError("training progress device type mismatch")
+    cuda_states = rng["cuda"]
+    if not isinstance(cuda_states, list):
+        raise TypeError("training progress CUDA RNG states are invalid")
+    if device.type == "cuda" and len(cuda_states) != torch.cuda.device_count():
+        raise ValueError("training progress CUDA device count mismatch")
+    if device.type != "cuda" and cuda_states:
+        raise ValueError("CPU training progress cannot carry CUDA RNG states")
+
+    model.load_state_dict(payload["model_state"], strict=True)
+    optimizer.load_state_dict(payload["optimizer_state"])
+    shuffle_generator.set_state(torch.as_tensor(rng["shuffle_generator"]).cpu())
+    objective_generator.set_state(torch.as_tensor(rng["objective_generator"]).cpu())
+    torch.set_rng_state(torch.as_tensor(rng["torch"]).cpu())
+    if device.type == "cuda":
+        torch.cuda.set_rng_state_all(
+            [torch.as_tensor(state).cpu() for state in cuda_states]
+        )
+    return (
+        epoch + 1,
+        history,
+        int(best_epoch),
+        best_validation_loss,
+        {
+            str(name): torch.as_tensor(value).detach().cpu().clone().contiguous()
+            for name, value in best_state.items()
+        },
+        int(stale_validations),
+    )
+
+
 def train_model(
     family: str,
     train: Any,
@@ -964,8 +1232,18 @@ def train_model(
     config: TrainingConfig | Mapping[str, Any],
     checkpoint_path: str | Path,
     log_callback: LogCallback | None = None,
+    *,
+    progress_checkpoint_path: str | Path | None = None,
 ) -> TrainingResult:
-    """Train one family on one dataset and atomically write its best checkpoint."""
+    """Train one family and atomically write its best checkpoint.
+
+    When ``progress_checkpoint_path`` is supplied, validated epochs are
+    snapshotted at the declared progress interval, at the final epoch, and
+    when early stopping fires.  Each snapshot includes optimizer and generator
+    state.  A subsequent invocation resumes from that exact epoch and removes
+    the progress file only after the final portable best-model checkpoint is
+    safely installed.
+    """
 
     canonical_family = _canonical_family(family)
     resolved_config = _coerce_config(config)
@@ -993,6 +1271,25 @@ def train_model(
     validation_cpu = _flat_finite_data(validation, name="validation")
     if train_cpu.shape[1] != validation_cpu.shape[1]:
         raise ValueError("train and validation ambient dimensions do not match")
+    data_identity = {
+        "schema_version": 1,
+        "train_sha256": _tensor_identity_sha256(train_cpu),
+        "validation_sha256": _tensor_identity_sha256(validation_cpu),
+    }
+    checkpoint = Path(checkpoint_path).expanduser().resolve()
+    progress_path = (
+        None
+        if progress_checkpoint_path is None
+        else Path(progress_checkpoint_path).expanduser().resolve()
+    )
+    if progress_path is not None:
+        paths_match = checkpoint == progress_path
+        if checkpoint.exists() and progress_path.exists():
+            paths_match = paths_match or os.path.samefile(checkpoint, progress_path)
+        if paths_match:
+            raise ValueError(
+                "training progress path must differ from final checkpoint path"
+            )
     mean, scale, preprocessing, preprocessing_sha256 = _normalization(
         train_cpu,
         enabled=resolved_config.normalize,
@@ -1062,7 +1359,36 @@ def train_model(
         best_epoch = 0
         best_state: dict[str, Tensor] | None = None
         stale_validations = 0
-        for epoch in range(1, resolved_config.epochs + 1):
+        start_epoch = 1
+        if progress_path is not None and progress_path.exists():
+            (
+                start_epoch,
+                history_list,
+                best_epoch,
+                best_validation_loss,
+                best_state,
+                stale_validations,
+            ) = _load_training_progress(
+                progress_path,
+                family=canonical_family,
+                model=model,
+                optimizer=optimizer,
+                config=resolved_config,
+                normalization_mean=mean,
+                normalization_scale=scale,
+                preprocessing=preprocessing,
+                preprocessing_sha256=preprocessing_sha256,
+                data_identity=data_identity,
+                shuffle_generator=shuffle_generator,
+                objective_generator=objective_generator,
+                device=device,
+            )
+            if (
+                resolved_config.early_stopping_patience is not None
+                and stale_validations >= resolved_config.early_stopping_patience
+            ):
+                start_epoch = resolved_config.epochs + 1
+        for epoch in range(start_epoch, resolved_config.epochs + 1):
             model.train()
             permutation = torch.randperm(
                 train_tensor.shape[0], generator=shuffle_generator
@@ -1132,6 +1458,38 @@ def train_model(
                 stale_validations = 0
             else:
                 stale_validations += 1
+            if progress_path is not None:
+                patience_reached = (
+                    resolved_config.early_stopping_patience is not None
+                    and stale_validations >= resolved_config.early_stopping_patience
+                )
+                if (
+                    epoch % TRAINING_PROGRESS_INTERVAL_EPOCHS == 0
+                    or epoch == resolved_config.epochs
+                    or patience_reached
+                ):
+                    assert best_state is not None
+                    progress_payload = _training_progress_payload(
+                        family=canonical_family,
+                        model=model,
+                        optimizer=optimizer,
+                        config=resolved_config,
+                        epoch=epoch,
+                        history=tuple(history_list),
+                        best_epoch=best_epoch,
+                        best_validation_loss=best_validation_loss,
+                        best_state=best_state,
+                        stale_validations=stale_validations,
+                        normalization_mean=mean,
+                        normalization_scale=scale,
+                        preprocessing=preprocessing,
+                        preprocessing_sha256=preprocessing_sha256,
+                        data_identity=data_identity,
+                        shuffle_generator=shuffle_generator,
+                        objective_generator=objective_generator,
+                        device=device,
+                    )
+                    _atomic_torch_save(progress_path, progress_payload)
             if log_callback is not None:
                 log_callback(
                     {
@@ -1150,7 +1508,6 @@ def train_model(
         model.load_state_dict(best_state, strict=True)
         model.eval()
         history = tuple(history_list)
-        checkpoint = Path(checkpoint_path).expanduser().resolve()
         checkpoint_sha256 = _save_checkpoint(
             checkpoint,
             family=canonical_family,
@@ -1164,6 +1521,8 @@ def train_model(
             preprocessing=preprocessing,
             preprocessing_sha256=preprocessing_sha256,
         )
+        if progress_path is not None:
+            progress_path.unlink(missing_ok=True)
         return TrainingResult(
             family=canonical_family,
             model=model,

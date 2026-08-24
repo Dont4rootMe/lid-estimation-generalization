@@ -1,0 +1,9 @@
+source: lid_benchmarks
+source_kind: generated_at_pinned_revision
+root: data/generated_benchmarks
+registry: configs/datasets/registry/generated_e3_e4_extension.yaml
+registry_overlay: configs/datasets/registry/generated_e3_e4_policy.yaml
+representations: all
+names:
+  - e3_gaussian_pca
+  - e4_sphere_pca_radius1

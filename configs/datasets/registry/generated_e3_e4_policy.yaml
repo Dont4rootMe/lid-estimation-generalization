@@ -1,0 +1,16 @@
+schema_version: 1
+overlay_id: lid-benchmarks-generated-e3-e4-policy-at-2dcb8e4
+base_benchmark_id: lid-benchmarks-generated-e3-e4-extension-at-2dcb8e4
+source_kind: locally_generated_explicit_extension_from_pinned_upstream
+upstream_revision: 2dcb8e41015f53413ff1ddd049bb006c81a5df52
+overrides:
+  - name: e3_gaussian_pca
+    expected_lid: 20
+    notes: >-
+      Generated-source E3 extension only; never aggregate under the canonical
+      exact-archive identity.
+  - name: e4_sphere_pca_radius1
+    expected_lid: 19
+    notes: >-
+      Generated-source E4 extension only; never aggregate under the canonical
+      exact-archive identity.

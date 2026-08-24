@@ -40,6 +40,7 @@ lid-estimation = "experiments.cli:main"
 lid-pilot = "experiments.pilot:main"
 lid-cluster-submit = "experiments.cluster_submit:main"
 lid-benchmarks-generate = "datasets.upstream_generator:main"
+lid-benchmarks-generate-e3-e4 = "datasets.generated_e3_e4:main"
 lid-benchmarks-data = "datasets.archive:main"
 
 [tool.hatch.build.targets.wheel]

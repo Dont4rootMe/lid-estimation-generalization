@@ -1,0 +1,306 @@
+schema_version: 1
+inventory_id: lid-benchmarks-canonical-exact-all-representations-v1
+source:
+  kind: exact_archive
+  exact_archive: true
+  dataset_config: configs/datasets/lid_benchmarks.yaml
+  data_root: data/lid_benchmarks_exact/benchmarks
+  registry: configs/datasets/registry/paper_benchmarks.yaml
+  registry_overlay: null
+  upstream_revision: 2dcb8e41015f53413ff1ddd049bb006c81a5df52
+  archive_sha256: ce0d153a1a78a3a752b29ec2e60167134b6b20c3249db2fe92f9fc1b8b8a9181
+  provenance_label: canonical-exact-paper-archive
+suite_order: [e1, e2, e3, e4, e5, e6, e7, e8]
+expected:
+  suite_count: 8
+  available_suite_count: 6
+  dataset_count: 28
+  cell_count: 35
+  known_lid_dataset_count: 8
+  known_lid_cell_count: 15
+  target_free_dataset_count: 20
+  target_free_cell_count: 20
+suites:
+  - id: e1
+    availability: canonical_exact
+    expected:
+      dataset_count: 14
+      cell_count: 15
+      known_lid_dataset_count: 1
+      known_lid_cell_count: 2
+      target_free_dataset_count: 13
+      target_free_cell_count: 13
+    datasets:
+      - name: e1_sampled_fmnist_step1
+        representations: [dataset]
+        target_policy: sample_size
+        selection_protocol: target_free_train_stability
+        comparison_group: e1-fmnist-sample-size
+        reference_dataset: e1_sampled_fmnist_step1
+        expected_lid_delta: 0.0
+      - name: e1_sampled_fmnist_step2
+        representations: [dataset]
+        target_policy: sample_size
+        selection_protocol: target_free_train_stability
+        comparison_group: e1-fmnist-sample-size
+        reference_dataset: e1_sampled_fmnist_step1
+        expected_lid_delta: 0.0
+      - name: e1_sampled_fmnist_step3
+        representations: [dataset]
+        target_policy: sample_size
+        selection_protocol: target_free_train_stability
+        comparison_group: e1-fmnist-sample-size
+        reference_dataset: e1_sampled_fmnist_step1
+        expected_lid_delta: 0.0
+      - name: e1_sampled_fmnist_step4
+        representations: [dataset]
+        target_policy: sample_size
+        selection_protocol: target_free_train_stability
+        comparison_group: e1-fmnist-sample-size
+        reference_dataset: e1_sampled_fmnist_step1
+        expected_lid_delta: 0.0
+      - name: e1_sampled_fmnist_step5
+        representations: [dataset]
+        target_policy: sample_size
+        selection_protocol: target_free_train_stability
+        comparison_group: e1-fmnist-sample-size
+        reference_dataset: e1_sampled_fmnist_step1
+        expected_lid_delta: 0.0
+      - name: e1_sampled_fmnist_step6
+        representations: [dataset]
+        target_policy: sample_size
+        selection_protocol: target_free_train_stability
+        comparison_group: e1-fmnist-sample-size
+        reference_dataset: e1_sampled_fmnist_step1
+        expected_lid_delta: 0.0
+      - name: e1_sampled_fmnist_step7
+        representations: [dataset]
+        target_policy: sample_size
+        selection_protocol: target_free_train_stability
+        comparison_group: e1-fmnist-sample-size
+        reference_dataset: e1_sampled_fmnist_step1
+        expected_lid_delta: 0.0
+      - name: e1_sampled_fmnist_step8
+        representations: [dataset]
+        target_policy: sample_size
+        selection_protocol: target_free_train_stability
+        comparison_group: e1-fmnist-sample-size
+        reference_dataset: e1_sampled_fmnist_step1
+        expected_lid_delta: 0.0
+      - name: e1_sampled_fmnist_step9
+        representations: [dataset]
+        target_policy: sample_size
+        selection_protocol: target_free_train_stability
+        comparison_group: e1-fmnist-sample-size
+        reference_dataset: e1_sampled_fmnist_step1
+        expected_lid_delta: 0.0
+      - name: e1_sampled_fmnist_step10
+        representations: [dataset]
+        target_policy: sample_size
+        selection_protocol: target_free_train_stability
+        comparison_group: e1-fmnist-sample-size
+        reference_dataset: e1_sampled_fmnist_step1
+        expected_lid_delta: 0.0
+      - name: e1_sampled_fmnist_step11
+        representations: [dataset]
+        target_policy: sample_size
+        selection_protocol: target_free_train_stability
+        comparison_group: e1-fmnist-sample-size
+        reference_dataset: e1_sampled_fmnist_step1
+        expected_lid_delta: 0.0
+      - name: e1_sampled_fmnist_step12
+        representations: [dataset]
+        target_policy: sample_size
+        selection_protocol: target_free_train_stability
+        comparison_group: e1-fmnist-sample-size
+        reference_dataset: e1_sampled_fmnist_step1
+        expected_lid_delta: 0.0
+      - name: e1_sampled_fmnist_step13
+        representations: [dataset]
+        target_policy: sample_size
+        selection_protocol: target_free_train_stability
+        comparison_group: e1-fmnist-sample-size
+        reference_dataset: e1_sampled_fmnist_step1
+        expected_lid_delta: 0.0
+      - name: e1_spiral_pca
+        representations: [dataset, coefficients]
+        target_policy: known_lid
+        selection_protocol: supervised_train_mae
+        comparison_group: geometry-known-lid
+        reference_dataset: null
+        expected_lid_delta: null
+
+  - id: e2
+    availability: canonical_exact
+    expected:
+      dataset_count: 2
+      cell_count: 3
+      known_lid_dataset_count: 2
+      known_lid_cell_count: 3
+      target_free_dataset_count: 0
+      target_free_cell_count: 0
+    datasets:
+      - name: e2_arrows
+        representations: [dataset]
+        target_policy: known_lid
+        selection_protocol: supervised_train_mae
+        comparison_group: real-like-known-lid
+        reference_dataset: null
+        expected_lid_delta: null
+      - name: e2_uniform_pca
+        representations: [dataset, coefficients]
+        target_policy: known_lid
+        selection_protocol: supervised_train_mae
+        comparison_group: geometry-known-lid
+        reference_dataset: null
+        expected_lid_delta: null
+
+  - id: e3
+    availability: absent_from_source
+    expected:
+      dataset_count: 0
+      cell_count: 0
+      known_lid_dataset_count: 0
+      known_lid_cell_count: 0
+      target_free_dataset_count: 0
+      target_free_cell_count: 0
+    datasets: []
+
+  - id: e4
+    availability: absent_from_source
+    expected:
+      dataset_count: 0
+      cell_count: 0
+      known_lid_dataset_count: 0
+      known_lid_cell_count: 0
+      target_free_dataset_count: 0
+      target_free_cell_count: 0
+    datasets: []
+
+  - id: e5
+    availability: canonical_exact
+    expected:
+      dataset_count: 7
+      cell_count: 7
+      known_lid_dataset_count: 0
+      known_lid_cell_count: 0
+      target_free_dataset_count: 7
+      target_free_cell_count: 7
+    datasets:
+      - name: e5_downscaled_fmnist
+        representations: [dataset]
+        target_policy: paired_delta
+        selection_protocol: target_free_train_stability
+        comparison_group: e5-fmnist-transformations
+        reference_dataset: e5_downscaled_fmnist
+        expected_lid_delta: 0.0
+      - name: e5_padded_fmnist_adddim0
+        representations: [dataset]
+        target_policy: paired_delta
+        selection_protocol: target_free_train_stability
+        comparison_group: e5-fmnist-transformations
+        reference_dataset: e5_downscaled_fmnist
+        expected_lid_delta: 0.0
+      - name: e5_padded_fmnist_adddim4
+        representations: [dataset]
+        target_policy: paired_delta
+        selection_protocol: target_free_train_stability
+        comparison_group: e5-fmnist-transformations
+        reference_dataset: e5_downscaled_fmnist
+        expected_lid_delta: 4.0
+      - name: e5_padded_fmnist_adddim8
+        representations: [dataset]
+        target_policy: paired_delta
+        selection_protocol: target_free_train_stability
+        comparison_group: e5-fmnist-transformations
+        reference_dataset: e5_downscaled_fmnist
+        expected_lid_delta: 8.0
+      - name: e5_stretched_power0.25
+        representations: [dataset]
+        target_policy: paired_delta
+        selection_protocol: target_free_train_stability
+        comparison_group: e5-fmnist-transformations
+        reference_dataset: e5_downscaled_fmnist
+        expected_lid_delta: 0.0
+      - name: e5_stretched_power4
+        representations: [dataset]
+        target_policy: paired_delta
+        selection_protocol: target_free_train_stability
+        comparison_group: e5-fmnist-transformations
+        reference_dataset: e5_downscaled_fmnist
+        expected_lid_delta: 0.0
+      - name: e5_upscaled_fmnist
+        representations: [dataset]
+        target_policy: paired_delta
+        selection_protocol: target_free_train_stability
+        comparison_group: e5-fmnist-transformations
+        reference_dataset: e5_downscaled_fmnist
+        expected_lid_delta: 0.0
+
+  - id: e6
+    availability: canonical_exact
+    expected:
+      dataset_count: 1
+      cell_count: 2
+      known_lid_dataset_count: 1
+      known_lid_cell_count: 2
+      target_free_dataset_count: 0
+      target_free_cell_count: 0
+    datasets:
+      - name: e6_exp_pca
+        representations: [dataset, coefficients]
+        target_policy: known_lid
+        selection_protocol: supervised_train_mae
+        comparison_group: geometry-known-lid
+        reference_dataset: null
+        expected_lid_delta: null
+
+  - id: e7
+    availability: canonical_exact
+    expected:
+      dataset_count: 1
+      cell_count: 2
+      known_lid_dataset_count: 1
+      known_lid_cell_count: 2
+      target_free_dataset_count: 0
+      target_free_cell_count: 0
+    datasets:
+      - name: e7_crescent_moon_radius3.0
+        representations: [dataset, coefficients]
+        target_policy: known_lid
+        selection_protocol: supervised_train_mae
+        comparison_group: geometry-known-lid
+        reference_dataset: null
+        expected_lid_delta: null
+
+  - id: e8
+    availability: canonical_exact
+    expected:
+      dataset_count: 3
+      cell_count: 6
+      known_lid_dataset_count: 3
+      known_lid_cell_count: 6
+      target_free_dataset_count: 0
+      target_free_cell_count: 0
+    datasets:
+      - name: e8_gaussian4_pca
+        representations: [dataset, coefficients]
+        target_policy: known_lid
+        selection_protocol: supervised_train_mae
+        comparison_group: geometry-known-lid
+        reference_dataset: null
+        expected_lid_delta: null
+      - name: e8_spaghetti_pca
+        representations: [dataset, coefficients]
+        target_policy: known_lid
+        selection_protocol: supervised_train_mae
+        comparison_group: geometry-known-lid
+        reference_dataset: null
+        expected_lid_delta: null
+      - name: e8_sphere4_pca
+        representations: [dataset, coefficients]
+        target_policy: known_lid
+        selection_protocol: supervised_train_mae
+        comparison_group: geometry-known-lid
+        reference_dataset: null
+        expected_lid_delta: null

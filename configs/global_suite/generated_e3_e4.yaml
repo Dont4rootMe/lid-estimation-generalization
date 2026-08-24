@@ -1,0 +1,58 @@
+schema_version: 1
+inventory_id: lid-benchmarks-generated-e3-e4-all-representations-v1
+source:
+  kind: generated_at_pinned_revision
+  exact_archive: false
+  dataset_config: configs/datasets/lid_benchmarks_generated_e3_e4.yaml
+  data_root: data/generated_benchmarks
+  registry: configs/datasets/registry/generated_e3_e4_extension.yaml
+  registry_overlay: configs/datasets/registry/generated_e3_e4_policy.yaml
+  upstream_revision: 2dcb8e41015f53413ff1ddd049bb006c81a5df52
+  archive_sha256: null
+  provenance_label: generated-extension-not-canonical-exact
+suite_order: [e3, e4]
+expected:
+  suite_count: 2
+  available_suite_count: 2
+  dataset_count: 2
+  cell_count: 4
+  known_lid_dataset_count: 2
+  known_lid_cell_count: 4
+  target_free_dataset_count: 0
+  target_free_cell_count: 0
+suites:
+  - id: e3
+    availability: generated_extension
+    expected:
+      dataset_count: 1
+      cell_count: 2
+      known_lid_dataset_count: 1
+      known_lid_cell_count: 2
+      target_free_dataset_count: 0
+      target_free_cell_count: 0
+    datasets:
+      - name: e3_gaussian_pca
+        representations: [dataset, coefficients]
+        target_policy: known_lid
+        selection_protocol: supervised_train_mae
+        comparison_group: generated-geometry-known-lid
+        reference_dataset: null
+        expected_lid_delta: null
+
+  - id: e4
+    availability: generated_extension
+    expected:
+      dataset_count: 1
+      cell_count: 2
+      known_lid_dataset_count: 1
+      known_lid_cell_count: 2
+      target_free_dataset_count: 0
+      target_free_cell_count: 0
+    datasets:
+      - name: e4_sphere_pca_radius1
+        representations: [dataset, coefficients]
+        target_policy: known_lid
+        selection_protocol: supervised_train_mae
+        comparison_group: generated-geometry-known-lid
+        reference_dataset: null
+        expected_lid_delta: null

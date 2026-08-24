@@ -1,0 +1,31 @@
+defaults:
+  - campaign: all_suites_all_models
+  - _self_
+
+schema_version: 1
+project: lid-generalization
+seed: 0
+output_root: artifacts/global
+
+data:
+  canonical_archive: data/benchmarks.zip
+  canonical_extracted_root: data/lid_benchmarks_exact
+  root: data/lid_benchmarks_exact/benchmarks
+  generated_root: data/generated_benchmarks
+  canonical_pca: data/lid_benchmarks_exact/benchmarks/pca.joblib
+  generated_manifest: data/generated_benchmarks/generated_e3_e4_manifest.json
+  registry: configs/datasets/registry/paper_benchmarks.yaml
+  mmap_mode: r
+
+logging:
+  backend: comet
+  project: ${project}
+  workspace: dont4rootme
+
+hydra:
+  job:
+    name: ${campaign.campaign_id}
+    chdir: false
+  run:
+    dir: artifacts/hydra/global/${now:%Y-%m-%d}/${now:%H-%M-%S-%f}
+  output_subdir: .hydra
