@@ -1,0 +1,12 @@
+schema_version: 1
+overlay_id: lid-benchmarks-generated-at-2dcb8e4
+base_benchmark_id: lid-benchmarks-iclr-2026
+source_kind: locally_generated_from_pinned_upstream
+upstream_revision: 2dcb8e41015f53413ff1ddd049bb006c81a5df52
+overrides:
+- name: e8_spaghetti_pca
+  stored_lid: 20
+  lid_override: 1
+  expected_lid: 1
+  notes: 'Generated-source fallback only: validate lid.npy=20, then expose theoretical LID 1 in memory. Do not modify the generated artifact or upstream source.'
+

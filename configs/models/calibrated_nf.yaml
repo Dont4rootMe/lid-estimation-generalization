@@ -1,0 +1,15 @@
+backend: learned_field_bundle
+evidence_level: learned_model
+name: calibrated-singular-nf-reference
+family: calibrated_singular_normalizing_flow
+seed: 0
+readouts:
+  - nf_calibrated_native
+bundle_root: artifacts/field_bundles
+artifact_registry: null
+artifact_registry_sha256: null
+trace:
+  backend: exact
+  probes: 0
+  seed: ${models.seed}
+min_finite_fraction: 1.0

@@ -1,0 +1,24 @@
+.DS_Store
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Experiment inputs/outputs are immutable external artifacts.  Keep only
+# registries and run declarations in Git.
+data/base_datasets/
+data/benchmarks/
+data/benchmarks.zip
+data/lid_benchmarks_exact/
+data/downloads/
+data/generated_benchmarks/
+artifacts/
+output/
+
+# Private manuscript sources. Keep the draft out of the reviewer-facing repo.
+/paper/

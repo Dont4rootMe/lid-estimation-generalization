@@ -1,0 +1,8 @@
+limits:
+  # Learned bundles contain the validation/test field values. One training row
+  # is retained only to preserve the common dataset-cell identity contract.
+  reference: 1
+  validation: 0
+  test: 0
+  reference_chunk: 1
+  query_chunk: 128

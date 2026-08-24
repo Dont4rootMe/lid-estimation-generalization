@@ -1,0 +1,26 @@
+# @package _global_
+defaults:
+  - override /datasets: lid_benchmarks
+  - override /runtime: paper_oracle
+
+experiment:
+  name: paper-oracle-diagnostic
+  scale_unit: median_validation_nn
+  scale_multipliers: [0.75, 1.0, 1.4, 2.0, 2.8, 4.0, 5.6]
+  readouts:
+    - diffusion_flipd_full
+    - fm_affine_response
+    - fm_affine_full
+    - fm_rectified_response
+    - fm_rectified_full
+    - sb_forward_response
+    - sb_forward_full
+    - sb_current_full
+    - nf_scale_conditioned_fixed
+    - nf_calibrated_native
+    - cnf_calibrated_native
+  selection:
+    window: 1
+    min_valid_fraction: 0.8
+    min_effective_sample_size: 2.0
+    prefer: larger

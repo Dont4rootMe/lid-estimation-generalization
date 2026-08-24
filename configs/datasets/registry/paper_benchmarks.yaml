@@ -1,0 +1,622 @@
+schema_version: 1
+benchmark_id: lid-benchmarks-iclr-2026
+description: Official benchmark folders listed in the pinned LID-Benchmarks README, plus the generated 16x16 control needed for paired transformation checks.
+upstream_registry: lid_benchmarks/DATA.yaml
+official_readme_folders:
+- e1_sampled_fmnist_step1
+- e1_sampled_fmnist_step2
+- e1_sampled_fmnist_step3
+- e1_sampled_fmnist_step4
+- e1_sampled_fmnist_step5
+- e1_sampled_fmnist_step6
+- e1_sampled_fmnist_step7
+- e1_sampled_fmnist_step8
+- e1_sampled_fmnist_step9
+- e1_sampled_fmnist_step10
+- e1_sampled_fmnist_step11
+- e1_sampled_fmnist_step12
+- e1_sampled_fmnist_step13
+- e1_spiral_pca
+- e2_arrows
+- e2_uniform_pca
+- e5_padded_fmnist_adddim0
+- e5_padded_fmnist_adddim4
+- e5_padded_fmnist_adddim8
+- e5_stretched_power0.25
+- e5_stretched_power4
+- e5_upscaled_fmnist
+- e6_exp_pca
+- e7_crescent_moon_radius3.0
+- e8_gaussian4_pca
+- e8_spaghetti_pca
+- e8_sphere4_pca
+datasets:
+- name: e1_sampled_fmnist_step1
+  section: '3.7'
+  required_artifacts:
+  - dataset
+  - labels
+  expected_samples:
+    train: 50000
+    val: 5000
+    test: 5000
+  expected_shapes:
+    dataset:
+    - 1
+    - 28
+    - 28
+- name: e1_sampled_fmnist_step2
+  section: '3.7'
+  required_artifacts:
+  - dataset
+  - labels
+  expected_samples:
+    train: 25000
+    val: 5000
+    test: 5000
+  expected_shapes:
+    dataset:
+    - 1
+    - 28
+    - 28
+  transformation:
+    family: sample_size
+    reference: e1_sampled_fmnist_step1
+    parameter: sampling_step
+    value: 2
+    expected_lid_delta: 0.0
+    paired_samples: false
+- name: e1_sampled_fmnist_step3
+  section: '3.7'
+  required_artifacts:
+  - dataset
+  - labels
+  expected_samples:
+    train: 12500
+    val: 5000
+    test: 5000
+  expected_shapes:
+    dataset:
+    - 1
+    - 28
+    - 28
+  transformation:
+    family: sample_size
+    reference: e1_sampled_fmnist_step1
+    parameter: sampling_step
+    value: 3
+    expected_lid_delta: 0.0
+    paired_samples: false
+- name: e1_sampled_fmnist_step4
+  section: '3.7'
+  required_artifacts:
+  - dataset
+  - labels
+  expected_samples:
+    train: 6250
+    val: 5000
+    test: 5000
+  expected_shapes:
+    dataset:
+    - 1
+    - 28
+    - 28
+  transformation:
+    family: sample_size
+    reference: e1_sampled_fmnist_step1
+    parameter: sampling_step
+    value: 4
+    expected_lid_delta: 0.0
+    paired_samples: false
+- name: e1_sampled_fmnist_step5
+  section: '3.7'
+  required_artifacts:
+  - dataset
+  - labels
+  expected_samples:
+    train: 3125
+    val: 5000
+    test: 5000
+  expected_shapes:
+    dataset:
+    - 1
+    - 28
+    - 28
+  transformation:
+    family: sample_size
+    reference: e1_sampled_fmnist_step1
+    parameter: sampling_step
+    value: 5
+    expected_lid_delta: 0.0
+    paired_samples: false
+- name: e1_sampled_fmnist_step6
+  section: '3.7'
+  required_artifacts:
+  - dataset
+  - labels
+  expected_samples:
+    train: 1562
+    val: 5000
+    test: 5000
+  expected_shapes:
+    dataset:
+    - 1
+    - 28
+    - 28
+  transformation:
+    family: sample_size
+    reference: e1_sampled_fmnist_step1
+    parameter: sampling_step
+    value: 6
+    expected_lid_delta: 0.0
+    paired_samples: false
+- name: e1_sampled_fmnist_step7
+  section: '3.7'
+  required_artifacts:
+  - dataset
+  - labels
+  expected_samples:
+    train: 781
+    val: 5000
+    test: 5000
+  expected_shapes:
+    dataset:
+    - 1
+    - 28
+    - 28
+  transformation:
+    family: sample_size
+    reference: e1_sampled_fmnist_step1
+    parameter: sampling_step
+    value: 7
+    expected_lid_delta: 0.0
+    paired_samples: false
+- name: e1_sampled_fmnist_step8
+  section: '3.7'
+  required_artifacts:
+  - dataset
+  - labels
+  expected_samples:
+    train: 390
+    val: 5000
+    test: 5000
+  expected_shapes:
+    dataset:
+    - 1
+    - 28
+    - 28
+  transformation:
+    family: sample_size
+    reference: e1_sampled_fmnist_step1
+    parameter: sampling_step
+    value: 8
+    expected_lid_delta: 0.0
+    paired_samples: false
+- name: e1_sampled_fmnist_step9
+  section: '3.7'
+  required_artifacts:
+  - dataset
+  - labels
+  expected_samples:
+    train: 195
+    val: 5000
+    test: 5000
+  expected_shapes:
+    dataset:
+    - 1
+    - 28
+    - 28
+  transformation:
+    family: sample_size
+    reference: e1_sampled_fmnist_step1
+    parameter: sampling_step
+    value: 9
+    expected_lid_delta: 0.0
+    paired_samples: false
+- name: e1_sampled_fmnist_step10
+  section: '3.7'
+  required_artifacts:
+  - dataset
+  - labels
+  expected_samples:
+    train: 97
+    val: 5000
+    test: 5000
+  expected_shapes:
+    dataset:
+    - 1
+    - 28
+    - 28
+  transformation:
+    family: sample_size
+    reference: e1_sampled_fmnist_step1
+    parameter: sampling_step
+    value: 10
+    expected_lid_delta: 0.0
+    paired_samples: false
+- name: e1_sampled_fmnist_step11
+  section: '3.7'
+  required_artifacts:
+  - dataset
+  - labels
+  expected_samples:
+    train: 48
+    val: 5000
+    test: 5000
+  expected_shapes:
+    dataset:
+    - 1
+    - 28
+    - 28
+  transformation:
+    family: sample_size
+    reference: e1_sampled_fmnist_step1
+    parameter: sampling_step
+    value: 11
+    expected_lid_delta: 0.0
+    paired_samples: false
+- name: e1_sampled_fmnist_step12
+  section: '3.7'
+  required_artifacts:
+  - dataset
+  - labels
+  expected_samples:
+    train: 24
+    val: 5000
+    test: 5000
+  expected_shapes:
+    dataset:
+    - 1
+    - 28
+    - 28
+  transformation:
+    family: sample_size
+    reference: e1_sampled_fmnist_step1
+    parameter: sampling_step
+    value: 12
+    expected_lid_delta: 0.0
+    paired_samples: false
+- name: e1_sampled_fmnist_step13
+  section: '3.7'
+  required_artifacts:
+  - dataset
+  - labels
+  expected_samples:
+    train: 12
+    val: 5000
+    test: 5000
+  expected_shapes:
+    dataset:
+    - 1
+    - 28
+    - 28
+  transformation:
+    family: sample_size
+    reference: e1_sampled_fmnist_step1
+    parameter: sampling_step
+    value: 13
+    expected_lid_delta: 0.0
+    paired_samples: false
+- name: e1_spiral_pca
+  section: '3.5'
+  representation: dataset
+  available_representations:
+  - dataset
+  - coefficients
+  required_artifacts:
+  - dataset
+  - lid
+  - coefficients
+  expected_samples:
+    train: 100000
+    val: 1000
+    test: 1000
+  expected_shapes:
+    dataset:
+    - 1
+    - 28
+    - 28
+    coefficients:
+    - 30
+  expected_lid: 1
+- name: e2_arrows
+  section: '3.9'
+  required_artifacts:
+  - dataset
+  - lid
+  expected_samples:
+    train: 100000
+    val: 10000
+    test: 10000
+  expected_shapes:
+    dataset:
+    - 32
+    - 32
+    - 3
+  allowed_lid_values:
+  - 6
+  - 12
+  - 18
+  - 24
+- name: e2_uniform_pca
+  section: '3.3'
+  representation: dataset
+  available_representations:
+  - dataset
+  - coefficients
+  required_artifacts:
+  - dataset
+  - lid
+  - coefficients
+  expected_samples:
+    train: 100000
+    val: 1000
+    test: 1000
+  expected_shapes:
+    dataset:
+    - 1
+    - 28
+    - 28
+    coefficients:
+    - 30
+  expected_lid: 20
+- name: e5_downscaled_fmnist
+  section: 3.8 control
+  official: false
+  required_artifacts:
+  - dataset
+  - labels
+  expected_samples:
+    train: 50000
+    val: 5000
+    test: 5000
+  expected_shapes:
+    dataset:
+    - 1
+    - 16
+    - 16
+  notes: Generated by upstream but omitted from its README download table; required to validate transformation deltas against the 16x16 source.
+- name: e5_padded_fmnist_adddim0
+  section: 3.8 ADI control
+  required_artifacts:
+  - dataset
+  - labels
+  expected_samples:
+    train: 50000
+    val: 5000
+    test: 5000
+  expected_shapes:
+    dataset:
+    - 1
+    - 32
+    - 32
+  transformation:
+    family: ADI
+    reference: e5_downscaled_fmnist
+    parameter: additional_dimensions
+    value: 0
+    expected_lid_delta: 0.0
+    paired_samples: true
+  notes: Load the official artifact. The upstream helper has an undefined areas_to_modify local when called directly with n=0.
+- name: e5_padded_fmnist_adddim4
+  section: 3.8 ADI
+  required_artifacts:
+  - dataset
+  - labels
+  expected_samples:
+    train: 50000
+    val: 5000
+    test: 5000
+  expected_shapes:
+    dataset:
+    - 1
+    - 32
+    - 32
+  transformation:
+    family: ADI
+    reference: e5_downscaled_fmnist
+    parameter: additional_dimensions
+    value: 4
+    expected_lid_delta: 4.0
+    paired_samples: true
+- name: e5_padded_fmnist_adddim8
+  section: 3.8 ADI
+  required_artifacts:
+  - dataset
+  - labels
+  expected_samples:
+    train: 50000
+    val: 5000
+    test: 5000
+  expected_shapes:
+    dataset:
+    - 1
+    - 32
+    - 32
+  transformation:
+    family: ADI
+    reference: e5_downscaled_fmnist
+    parameter: additional_dimensions
+    value: 8
+    expected_lid_delta: 8.0
+    paired_samples: true
+- name: e5_stretched_power0.25
+  section: 3.8 ME
+  required_artifacts:
+  - dataset
+  - labels
+  expected_samples:
+    train: 50000
+    val: 5000
+    test: 5000
+  expected_shapes:
+    dataset:
+    - 1
+    - 16
+    - 16
+  transformation:
+    family: ME
+    reference: e5_downscaled_fmnist
+    parameter: power
+    value: 0.25
+    expected_lid_delta: 0.0
+    paired_samples: true
+- name: e5_stretched_power4
+  section: 3.8 ME
+  required_artifacts:
+  - dataset
+  - labels
+  expected_samples:
+    train: 50000
+    val: 5000
+    test: 5000
+  expected_shapes:
+    dataset:
+    - 1
+    - 16
+    - 16
+  transformation:
+    family: ME
+    reference: e5_downscaled_fmnist
+    parameter: power
+    value: 4
+    expected_lid_delta: 0.0
+    paired_samples: true
+- name: e5_upscaled_fmnist
+  section: 3.8 ASE
+  required_artifacts:
+  - dataset
+  - labels
+  expected_samples:
+    train: 50000
+    val: 5000
+    test: 5000
+  expected_shapes:
+    dataset:
+    - 1
+    - 32
+    - 32
+  transformation:
+    family: ASE
+    reference: e5_downscaled_fmnist
+    parameter: output_size
+    value: 32
+    expected_lid_delta: 0.0
+    paired_samples: true
+- name: e6_exp_pca
+  section: '3.5'
+  representation: dataset
+  available_representations:
+  - dataset
+  - coefficients
+  required_artifacts:
+  - dataset
+  - lid
+  - coefficients
+  ignored_files:
+  - lid-OLD_WRONG.npy
+  expected_samples:
+    train: 100000
+    val: 1000
+    test: 1000
+  expected_shapes:
+    dataset:
+    - 1
+    - 28
+    - 28
+    coefficients:
+    - 30
+  expected_lid: 2
+- name: e7_crescent_moon_radius3.0
+  section: '3.4'
+  representation: dataset
+  available_representations:
+  - dataset
+  - coefficients
+  required_artifacts:
+  - dataset
+  - lid
+  - coefficients
+  ignored_files:
+  - lid-OLD_WRONG.npy
+  expected_samples:
+    train: 100000
+    val: 1000
+    test: 1000
+  expected_shapes:
+    dataset:
+    - 1
+    - 28
+    - 28
+    coefficients:
+    - 30
+  expected_lid: 3
+- name: e8_gaussian4_pca
+  section: '3.1'
+  representation: dataset
+  available_representations:
+  - dataset
+  - coefficients
+  required_artifacts:
+  - dataset
+  - lid
+  - coefficients
+  expected_samples:
+    train: 100000
+    val: 1000
+    test: 1000
+  expected_shapes:
+    dataset:
+    - 1
+    - 28
+    - 28
+    coefficients:
+    - 30
+  expected_lid: 5
+- name: e8_spaghetti_pca
+  section: '3.2'
+  representation: dataset
+  available_representations:
+  - dataset
+  - coefficients
+  required_artifacts:
+  - dataset
+  - lid
+  - coefficients
+  ignored_files:
+  - lid-OLD_WRONG.npy
+  expected_samples:
+    train: 100000
+    val: 1000
+    test: 1000
+  expected_shapes:
+    dataset:
+    - 1
+    - 28
+    - 28
+    coefficients:
+    - 30
+  expected_lid: 1
+  notes: The canonical paper archive has corrected lid.npy=1 and preserves the old value in lid-OLD_WRONG.npy. The sidecar remains covered by the tree manifest but is never loaded as a target.
+- name: e8_sphere4_pca
+  section: '3.2'
+  representation: dataset
+  available_representations:
+  - dataset
+  - coefficients
+  required_artifacts:
+  - dataset
+  - lid
+  - coefficients
+  expected_samples:
+    train: 100000
+    val: 1000
+    test: 1000
+  expected_shapes:
+    dataset:
+    - 1
+    - 28
+    - 28
+    coefficients:
+    - 30
+  expected_lid: 5

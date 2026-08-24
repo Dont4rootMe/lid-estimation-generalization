@@ -1,0 +1,8 @@
+source: synthetic_flat
+seed: 20260823
+ambient_dim: 8
+intrinsic_dim: 3
+n_train: 2048
+n_validation: 96
+n_test: 96
+

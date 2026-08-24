@@ -1,0 +1,36 @@
+source: lid_benchmarks
+source_kind: exact_archive
+archive: data/benchmarks.zip
+extracted_root: data/lid_benchmarks_exact
+root: data/lid_benchmarks_exact/benchmarks
+registry: configs/datasets/registry/paper_benchmarks.yaml
+representations: all
+names:
+  - e1_sampled_fmnist_step1
+  - e1_sampled_fmnist_step2
+  - e1_sampled_fmnist_step3
+  - e1_sampled_fmnist_step4
+  - e1_sampled_fmnist_step5
+  - e1_sampled_fmnist_step6
+  - e1_sampled_fmnist_step7
+  - e1_sampled_fmnist_step8
+  - e1_sampled_fmnist_step9
+  - e1_sampled_fmnist_step10
+  - e1_sampled_fmnist_step11
+  - e1_sampled_fmnist_step12
+  - e1_sampled_fmnist_step13
+  - e1_spiral_pca
+  - e2_arrows
+  - e2_uniform_pca
+  - e5_downscaled_fmnist
+  - e5_padded_fmnist_adddim0
+  - e5_padded_fmnist_adddim4
+  - e5_padded_fmnist_adddim8
+  - e5_stretched_power0.25
+  - e5_stretched_power4
+  - e5_upscaled_fmnist
+  - e6_exp_pca
+  - e7_crescent_moon_radius3.0
+  - e8_gaussian4_pca
+  - e8_spaghetti_pca
+  - e8_sphere4_pca

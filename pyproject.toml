@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lid-estimation"
+version = "0.1.0"
+description = "Reproducible experiments for local intrinsic dimension estimation"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "hydra-core>=1.3.2,<1.4",
+  "numpy>=1.26,<3",
+]
+
+[project.optional-dependencies]
+train = [
+  "comet-ml>=3.57,<4",
+  "torch>=2.6,<2.8",
+]
+upstream = [
+  "joblib>=1.5,<2",
+  "matplotlib>=3.9,<4",
+  "pillow>=11,<12",
+  "requests>=2.32,<3",
+  "scikit-learn>=1.6,<2",
+  "torch>=2.7,<2.8",
+  "torchvision>=0.22,<0.23",
+  "tqdm>=4.67,<5",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3,<9",
+  "pytest-cov>=6,<7",
+]
+
+[project.scripts]
+lid-estimation = "experiments.cli:main"
+lid-pilot = "experiments.pilot:main"
+lid-cluster-submit = "experiments.cluster_submit:main"
+lid-benchmarks-generate = "datasets.upstream_generator:main"
+lid-benchmarks-data = "datasets.archive:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["models", "experiments", "datasets", "utils"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"configs" = "experiments/configs"
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+testpaths = ["tests"]

@@ -1,0 +1,16 @@
+backend: learned_field_bundle
+evidence_level: learned_model
+name: affine-fm-reference
+family: affine_flow_matching
+seed: 0
+readouts:
+  - fm_affine_response
+  - fm_affine_full
+bundle_root: artifacts/field_bundles
+artifact_registry: null
+artifact_registry_sha256: null
+trace:
+  backend: exact
+  probes: 0
+  seed: ${models.seed}
+min_finite_fraction: 1.0

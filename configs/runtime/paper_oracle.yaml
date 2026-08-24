@@ -1,0 +1,8 @@
+# Diagnostic caps keep the exact empirical channel tractable. This exercises
+# every dataset/readout contract; it is not a trained-model result.
+limits:
+  reference: 4096
+  validation: 128
+  test: 128
+  reference_chunk: 512
+  query_chunk: 16

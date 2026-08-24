@@ -1,0 +1,6 @@
+source: lid_benchmarks
+source_kind: generated_at_pinned_revision
+root: data/generated_benchmarks
+registry: configs/datasets/registry/paper_benchmarks.yaml
+registry_overlay: configs/datasets/registry/generated_fallback.yaml
+representations: all

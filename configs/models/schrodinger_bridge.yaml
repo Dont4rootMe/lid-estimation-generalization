@@ -1,0 +1,17 @@
+backend: learned_field_bundle
+evidence_level: learned_model
+name: brownian-sb-reference
+family: brownian_schrodinger_bridge
+seed: 0
+readouts:
+  - sb_forward_response
+  - sb_forward_full
+  - sb_current_full
+bundle_root: artifacts/field_bundles
+artifact_registry: null
+artifact_registry_sha256: null
+trace:
+  backend: exact
+  probes: 0
+  seed: ${models.seed}
+min_finite_fraction: 1.0

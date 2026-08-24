@@ -1,0 +1,22 @@
+schema_version: 1
+repository: https://github.com/DominikFilipiak/LID-Benchmarks.git
+revision: 2dcb8e41015f53413ff1ddd049bb006c81a5df52
+integration_mode: vendored_top_level_for_local_extension
+license_status: no_license_file_at_pinned_revision
+runtime_boundary:
+  adapter: datasets.upstream_generator
+  execution: subprocess_with_cwd_lid_benchmarks
+  environment: upstream_uv_lock_frozen
+  import_policy: never_add_upstream_to_parent_sys_path
+source_files:
+  .gitignore: 00d14bf405ef2fa8e62b5f1676b45453974cc8fc21d358495f958f6c0049e4b9
+  .python-version: 49a506dd32096b010d75205acf3430c9ae6c40351888129499e5a5e487126c93
+  README.md: 83c3c79f688851faada97a95a759a3c749e7607333c5abf3e5b2c6e1811dbc08
+  generate_datasets.py: b759fe75267816ea7ebc4d13ca1366c60eccfde7df6e601f2492cdade9a13ff3
+  generators/__init__.py: 15daec444ecdb733042302b995834d9a29d0a6c93306756f5dfcc940ab219da5
+  generators/benchmarks.py: 32ff5a1e120576ab5dec93ee0103de2a887527c386a8cd69f5f5f8c4e67e94c3
+  generators/utils/arrows.py: b84341fcea9e125a41fe6f9112e9c23a721ba22c68f736865340e12270f87cd4
+  generators/utils/padded_and_downscaled.py: b574e331a9fca1059d321cb53afcb54e709e549f2480013d9c93a2e4fc946281
+  generators/utils/pca.py: bb6e978fd3b58e8d57d0acffcf352d3ed2833f2ab29fb9774a0b8da74fc07657
+  pyproject.toml: 095a84e29393645a87b8bc98852528d7599a09ab85aaaec8f0267b4b4c715a38
+  uv.lock: 934d647e8b48a5bc938c0005bda3b9be82639cd9df7845811a11b424e166ef65

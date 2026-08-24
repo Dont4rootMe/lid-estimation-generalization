@@ -1,0 +1,41 @@
+defaults:
+  - pilot_model: diffusion
+  - _self_
+
+schema_version: 1
+project: ent-block-diffusion-eval
+experiment_name: ent-block-diffusion-eval
+seed: 137
+output_root: artifacts/pilot
+
+data:
+  root: data/lid_benchmarks_exact/benchmarks
+  registry: configs/datasets/registry/paper_benchmarks.yaml
+  representation: dataset
+  mmap_mode: r
+  names:
+    - e8_gaussian4_pca
+    - e8_spaghetti_pca
+    - e8_sphere4_pca
+
+evaluation:
+  batch_size: 128
+  divergence_backend: hutchinson
+  trace_probes: 16
+  trace_seed: ${seed}
+  selection:
+    window: 1
+    min_valid_fraction: 0.8
+
+logging:
+  backend: comet
+  project: ent-block-diffusion-eval
+  experiment_name: ent-block-diffusion-eval
+
+hydra:
+  job:
+    name: ent-block-diffusion-eval
+    chdir: false
+  run:
+    dir: artifacts/hydra/pilot/${pilot_model.family}/${now:%Y-%m-%d}/${now:%H-%M-%S-%f}
+  output_subdir: .hydra

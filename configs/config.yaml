@@ -1,0 +1,18 @@
+defaults:
+  - datasets: synthetic_flat
+  - preprocessing: identity
+  - models: oracle
+  - runtime: local
+  - experiment: oracle_smoke
+  - _self_
+
+hydra:
+  job:
+    name: lid_estimation
+    chdir: false
+  run:
+    dir: artifacts/hydra/${experiment.name}/${now:%Y-%m-%d}/${now:%H-%M-%S-%f}
+  sweep:
+    dir: artifacts/hydra_multirun/${experiment.name}/${now:%Y-%m-%d}/${now:%H-%M-%S-%f}
+    subdir: ${hydra.job.num}
+  output_subdir: .hydra

@@ -1,0 +1,6 @@
+limits:
+  reference: 2048
+  validation: 96
+  test: 96
+  reference_chunk: 512
+  query_chunk: 32

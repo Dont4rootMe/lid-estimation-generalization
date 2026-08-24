@@ -1,0 +1,40 @@
+name: diffusion
+family: diffusion
+readout: full
+selection_prefer: smaller
+
+training:
+  seed: ${seed}
+  device: cuda
+  epochs: 200
+  batch_size: 512
+  learning_rate: 0.0002
+  weight_decay: 0.000001
+  hidden_dim: 1024
+  depth: 6
+  time_embedding_dim: 128
+  validation_interval: 1
+  early_stopping_patience: 20
+  gradient_clip_norm: 1.0
+  num_workers: 4
+  deterministic: true
+  sigma_min: 0.01
+  sigma_max: 1.0
+  time_min: 0.001
+  time_max: 0.999
+  fourier_features: 32
+  max_condition_frequency: 100.0
+  dropout: 0.0
+  normalize: true
+  normalization_epsilon: 1.0e-8
+
+scales:
+  - 0.01
+  - 0.0178
+  - 0.0316
+  - 0.0562
+  - 0.1
+  - 0.1778
+  - 0.3162
+  - 0.5623
+  - 1.0

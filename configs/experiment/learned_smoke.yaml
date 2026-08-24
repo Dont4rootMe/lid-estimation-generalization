@@ -1,0 +1,11 @@
+# @package _global_
+experiment:
+  name: learned-smoke-${models.name}-seed-${models.seed}
+  scale_unit: absolute
+  scale_multipliers: [0.1, 0.2, 0.4]
+  readouts: ${models.readouts}
+  selection:
+    window: 1
+    min_valid_fraction: 1.0
+    min_effective_sample_size: 0.0
+    prefer: larger

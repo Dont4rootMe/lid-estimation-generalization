@@ -1,0 +1,44 @@
+schema_version: 1
+upstreams:
+  lid_benchmarks:
+    name: LID-Benchmarks
+    repository: https://github.com/DominikFilipiak/LID-Benchmarks.git
+    checkout: lid_benchmarks
+    revision: 2dcb8e41015f53413ff1ddd049bb006c81a5df52
+    revision_policy: original_files_pinned_by_UPSTREAM_yaml_additions_allowed
+    license_status: No license file is present at the pinned revision. The source is imported at top level for local extension; obtain author permission before redistribution.
+    paper: Why We Need New Benchmarks for Local Intrinsic Dimension Estimation (ICLR 2026)
+    paper_url: https://openreview.net/forum?id=ZEf03Uunvk
+    official_archive_url: https://drive.google.com/file/d/1mGzGUVa37AjUREHx_vFoPzl1OCLjPJ1Q/view?usp=share_link
+    official_archive_direct_url: "https://drive.usercontent.google.com/download?id=1mGzGUVa37AjUREHx_vFoPzl1OCLjPJ1Q&export=download&confirm=t"
+    official_archive_filename: benchmarks.zip
+    official_archive_password: LocalIntrinsicDimensionBenchmarks
+    official_archive_integrity:
+      format: ZIP64
+      encryption: ZipCrypto
+      size_bytes: 4685463657
+      sha256: ce0d153a1a78a3a752b29ec2e60167134b6b20c3249db2fe92f9fc1b8b8a9181
+      md5: 56c01262cfb109f98df477b0bd51ac63
+      file_count: 193
+      directory_entry_count: 113
+      uncompressed_size_bytes: 6918816685
+      crc32_verified: true
+      crc32_verification:
+        verifier: 7-Zip 26.02
+        result: Everything is Ok
+        verified_file_count: 193
+        verified_on: 2026-08-23
+    known_defects:
+    - id: spaghetti-lid-target
+      path: generators/utils/pca.py
+      symbol: spaghetti_pca
+      description: The generated curve has one degree of freedom (theta), but lid.npy is written as dim=20.
+      stored_value: 20
+      expected_value: 1
+      canonical_archive_state: The official paper archive has lid.npy=1 and preserves the obsolete value as lid-OLD_WRONG.npy.
+      mitigation: For the canonical archive, require lid.npy=1 and ignore the explicitly named sidecar as a target. For locally generated data only, apply configs/datasets/registry/generated_fallback.yaml, validate stored lid.npy=20, and override it to 1 in memory. Never patch the original imported files or archive.
+    - id: adddim0-undefined-areas
+      path: generators/utils/padded_and_downscaled.py
+      symbol: add_random_numbers_to_borders
+      description: When called directly with n=0, areas_to_modify is undefined before the final loop. The benchmark generator currently avoids that call for adddim0.
+      mitigation: Treat the official adddim0 artifact as immutable input, validate its manifest, and do not regenerate or patch it silently.

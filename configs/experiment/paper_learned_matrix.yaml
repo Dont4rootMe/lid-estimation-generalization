@@ -1,0 +1,17 @@
+# @package _global_
+defaults:
+  - override /datasets: lid_benchmarks
+  - override /runtime: paper_learned
+
+experiment:
+  name: paper-learned-${models.name}-seed-${models.seed}
+  scale_unit: absolute
+  # Physical scales must match the exported field bundles. Override this grid
+  # when a training config uses a different declared data normalization.
+  scale_multipliers: [0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64]
+  readouts: ${models.readouts}
+  selection:
+    window: 1
+    min_valid_fraction: 1.0
+    min_effective_sample_size: 0.0
+    prefer: larger
