@@ -373,9 +373,15 @@ def _resolved_pilot_model(variant_id: str, seed: int) -> dict[str, Any]:
                 ("command-line", approved_config_dir.as_uri()),
                 ("schema", "structured://"),
             )
+            approved_module_cli_search_path = (
+                ("hydra", "pkg://hydra.conf"),
+                ("command-line", approved_config_dir.as_uri()),
+                ("schema", "structured://"),
+            )
             approved_layouts = {
                 approved_library_search_path: "main",
                 approved_cli_search_path: "command-line",
+                approved_module_cli_search_path: "command-line",
             }
             if actual_search_path not in approved_layouts:
                 raise GlobalCampaignError(

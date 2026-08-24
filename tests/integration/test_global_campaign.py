@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -32,7 +33,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_SHA = "4" * 64
 
 
-def test_real_hydra_entrypoint_can_resolve_every_nested_pilot_model(
+def test_imported_hydra_entrypoint_can_resolve_every_nested_pilot_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     observed: dict[str, Any] = {}
@@ -65,6 +66,34 @@ def test_real_hydra_entrypoint_can_resolve_every_nested_pilot_model(
         global_campaign.APPROVED_MODEL_VARIANTS
     )
     assert not GlobalHydra.instance().is_initialized()
+
+
+def test_python_module_entrypoint_resolves_nested_models_before_source_preflight(
+    tmp_path: Path,
+) -> None:
+    missing_archive = tmp_path / "missing-benchmarks.zip"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "experiments.global_campaign",
+            "logging.backend=none",
+            f"data.canonical_archive={missing_archive}",
+            f"output_root={tmp_path / 'output'}",
+            f"hydra.run.dir={tmp_path / 'hydra'}",
+        ],
+        cwd=PROJECT_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    combined_output = completed.stdout + completed.stderr
+    assert "cannot compose approved pilot model" not in combined_output
+    assert (
+        "canonical archive/extracted tree failed exact verification" in combined_output
+    )
 
 
 def test_nested_pilot_compose_rejects_an_unapproved_active_hydra_path(
