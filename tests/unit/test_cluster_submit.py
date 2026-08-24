@@ -10,7 +10,6 @@ from pathlib import Path
 import pytest
 
 from experiments.cluster_submit import (
-    APPROVED_FAMILIES,
     CUBLAS_WORKSPACE_CONFIG,
     INSTANCE_TYPE,
     JOB_DESC,
@@ -28,6 +27,7 @@ from experiments.cluster_submit import (
 
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "configs" / "cluster" / "shared_a100.yaml"
+FM_CONFIG = ROOT / "configs" / "cluster" / "shared_a100_fm.yaml"
 EXPERIMENT_NAMES = {
     "diffusion": (
         "lid-generalization-e8-suite-diffusion-train-mae-scale-selection-seed-0"
@@ -45,15 +45,68 @@ EXPERIMENT_NAMES = {
         "train-mae-time-selection-seed-0"
     ),
 }
+FM_EXPERIMENT_NAMES = {
+    "direct_rectified_flow": (
+        "lid-generalization-e8-suite-fm-rectified-direct-velocity-all-readouts-"
+        "debug-train-mae-lambda-selection-seed-0"
+    ),
+    "posterior_rectified_flow": (
+        "lid-generalization-e8-suite-fm-rectified-posterior-mean-all-readouts-"
+        "debug-train-mae-lambda-selection-seed-0"
+    ),
+    "direct_log_noise_affine_flow": (
+        "lid-generalization-e8-suite-fm-log-noise-direct-velocity-all-readouts-"
+        "debug-train-mae-lambda-selection-seed-0"
+    ),
+    "posterior_log_noise_affine_flow": (
+        "lid-generalization-e8-suite-fm-log-noise-posterior-mean-all-readouts-"
+        "debug-train-mae-lambda-selection-seed-0"
+    ),
+    "direct_vp_trigonometric_flow": (
+        "lid-generalization-e8-suite-fm-vp-trigonometric-direct-velocity-"
+        "all-readouts-debug-train-mae-lambda-selection-seed-0"
+    ),
+    "posterior_vp_trigonometric_flow": (
+        "lid-generalization-e8-suite-fm-vp-trigonometric-posterior-mean-"
+        "all-readouts-debug-train-mae-lambda-selection-seed-0"
+    ),
+}
 
 
 def _config() -> ClusterConfig:
     return load_cluster_config(CONFIG)
 
 
+def _fm_config() -> ClusterConfig:
+    return load_cluster_config(FM_CONFIG)
+
+
+def test_fm_campaign_plans_exactly_six_declared_factorial_jobs() -> None:
+    jobs = plan_jobs(_fm_config())
+    assert tuple(job.family for job in jobs) == tuple(FM_EXPERIMENT_NAMES)
+    assert {job.family: job.experiment_name for job in jobs} == FM_EXPERIMENT_NAMES
+    assert len(jobs) == 6
+    for job in jobs:
+        payload = job.payload
+        assert payload["job_desc"] == JOB_DESC
+        assert payload["queue_name"] == "shared"
+        assert payload["priority_class"] == "shared-medium"
+        assert payload["instance_type"] == "a100.1gpu"
+        assert "COMET_API_KEY" not in payload["env_variables"]
+        assert f"pilot_model={job.family}" in payload["script"]
+        assert f"logging.experiment_name={job.experiment_name}" in payload["script"]
+
+
+def test_cluster_config_scope_rejects_approved_but_undeclared_family() -> None:
+    with pytest.raises(ClusterConfigError, match="not declared"):
+        build_job_payload(_config(), "direct_rectified_flow")
+    with pytest.raises(ClusterConfigError, match="not declared"):
+        plan_jobs(_fm_config(), "diffusion")
+
+
 def test_planned_jobs_pin_all_scheduler_fair_use_metadata() -> None:
     jobs = plan_jobs(_config())
-    assert tuple(job.family for job in jobs) == APPROVED_FAMILIES
+    assert tuple(job.family for job in jobs) == tuple(_config().execution["families"])
     assert {job.family: job.experiment_name for job in jobs} == EXPERIMENT_NAMES
     assert len(jobs) == 4
     for job in jobs:

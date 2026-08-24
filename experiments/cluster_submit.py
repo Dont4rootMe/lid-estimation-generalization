@@ -44,6 +44,12 @@ APPROVED_FAMILIES = (
     "rectified_flow",
     "scale_conditioned_nf",
     "schrodinger_bridge",
+    "direct_rectified_flow",
+    "posterior_rectified_flow",
+    "direct_log_noise_affine_flow",
+    "posterior_log_noise_affine_flow",
+    "direct_vp_trigonometric_flow",
+    "posterior_vp_trigonometric_flow",
 )
 REPO_ROOT = (
     "/home/jovyan/echimbulatov/fork_afedorov/constant_repos/"
@@ -91,6 +97,18 @@ _FORBIDDEN_METADATA_TOKENS = (
     "rectified_flow",
     "rectified-flow-matching",
     "affine_fm",
+    "posterior_rectified_flow",
+    "posterior-rectified-flow",
+    "direct_rectified_flow",
+    "direct-rectified-flow",
+    "direct_log_noise_affine_flow",
+    "direct-log-noise-affine-flow",
+    "posterior_log_noise_affine_flow",
+    "posterior-log-noise-affine-flow",
+    "direct_vp_trigonometric_flow",
+    "direct-vp-trigonometric-flow",
+    "posterior_vp_trigonometric_flow",
+    "posterior-vp-trigonometric-flow",
     "gaussian_diffusion",
     "scale_conditioned_nf",
     "scale-conditioned-normalizing-flow",
@@ -273,9 +291,17 @@ def _validate_execution(value: Mapping[str, Any]) -> dict[str, Any]:
     if seed != 0 or isinstance(seed, bool):
         raise ClusterConfigError("execution.seed must be exactly 0")
     families = value.get("families")
-    if not isinstance(families, list) or tuple(families) != APPROVED_FAMILIES:
+    if not isinstance(families, list) or not families:
+        raise ClusterConfigError("execution.families must be a non-empty list")
+    if any(not isinstance(family, str) for family in families):
+        raise ClusterConfigError("execution.families must contain only strings")
+    if len(families) != len(set(families)):
+        raise ClusterConfigError("execution.families must not contain duplicates")
+    unknown_families = set(families) - set(APPROVED_FAMILIES)
+    if unknown_families:
         raise ClusterConfigError(
-            f"execution.families must be exactly {list(APPROVED_FAMILIES)!r}"
+            "execution.families contains unapproved pilot families: "
+            f"{sorted(unknown_families)!r}"
         )
     return result
 
@@ -339,6 +365,10 @@ def _job_script(config: ClusterConfig, family: str) -> str:
 def build_job_payload(config: ClusterConfig, family: str) -> dict[str, Any]:
     if family not in APPROVED_FAMILIES:
         raise ClusterConfigError(f"unapproved pilot family: {family!r}")
+    if family not in config.execution["families"]:
+        raise ClusterConfigError(
+            f"pilot family {family!r} is not declared by execution.families"
+        )
     scheduler = config.scheduler
     payload: dict[str, Any] = {
         "job_desc": scheduler["job_desc"],
@@ -479,11 +509,16 @@ def validate_job_payload(payload: Mapping[str, Any]) -> None:
         raise ClusterConfigError("job script must not handle Comet environment values")
 
 
-def _selected_families(family: str | None) -> tuple[str, ...]:
+def _selected_families(config: ClusterConfig, family: str | None) -> tuple[str, ...]:
+    declared = tuple(str(value) for value in config.execution["families"])
     if family is None:
-        return APPROVED_FAMILIES
+        return declared
     if family not in APPROVED_FAMILIES:
         raise ClusterConfigError(f"unapproved pilot family: {family!r}")
+    if family not in declared:
+        raise ClusterConfigError(
+            f"pilot family {family!r} is not declared by execution.families"
+        )
     return (family,)
 
 
@@ -496,7 +531,7 @@ def plan_jobs(
             experiment_name=_experiment_name_for_family(selected),
             payload=build_job_payload(config, selected),
         )
-        for selected in _selected_families(family)
+        for selected in _selected_families(config, family)
     )
 
 
@@ -612,7 +647,7 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     config = load_cluster_config(args.config)
-    selected_families = _selected_families(args.family)
+    selected_families = _selected_families(config, args.family)
     if args.submit:
         job_names = submit_jobs(config, args.family)
         print(

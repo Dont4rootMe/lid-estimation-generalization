@@ -1,9 +1,11 @@
 """Deterministic training and inference for all trainable pilot families.
 
-Four objectives are implemented:
+Five objectives are implemented:
 
 * variance-exploding diffusion with an ``x0`` denoiser parameterization;
 * linear rectified-flow matching from Gaussian noise to the data.
+* Hydra-declared independent affine flow matching with either a direct
+  velocity or posterior-mean target;
 * an explicit generalized Brownian bridge with a terminal denoiser;
 * exact-likelihood scale-conditioned RealNVP on Gaussian-smoothed data.
 
@@ -31,11 +33,29 @@ import numpy.typing as npt
 import torch
 from torch import Tensor, nn
 
+from models.affine_flow import (
+    AffineFlowSpec,
+    affine_flow_contract,
+    affine_interpolant_and_target,
+    affine_schedule_state,
+    canonical_parameterization,
+    flow_matching_loss_weights,
+    posterior_divergence_to_channel_score_divergence,
+    posterior_divergence_to_marginal_score_divergence,
+    posterior_divergence_to_velocity_divergence,
+    posterior_to_channel_score,
+    posterior_to_marginal_score,
+    posterior_to_velocity,
+    sample_noise_ratio,
+    schedule_condition,
+    velocity_to_posterior,
+)
 from models.neural_fields import (
     NeuralFieldConfig,
     ScaleConditionedNeuralField,
     exact_divergence,
     hutchinson_divergence,
+    rademacher_probes_like,
 )
 from models.normalizing_flow import (
     NF_DENSITY_CONTRACT,
@@ -62,6 +82,7 @@ from models.schrodinger_bridge import (
 Family = Literal[
     "gaussian_diffusion",
     "rectified_flow",
+    "independent_affine_flow",
     "brownian_schrodinger_bridge",
     "scale_conditioned_normalizing_flow",
 ]
@@ -120,6 +141,14 @@ class TrainingConfig:
     bridge_terminal_time: float | None = None
     bridge_tau_min: float | None = None
     bridge_tau_max: float | None = None
+    flow_variant_id: str | None = None
+    flow_schedule: str | None = None
+    flow_parameterization: str | None = None
+    flow_conditioning: str | None = None
+    flow_scale_sampling: str | None = None
+    flow_loss_weighting: str | None = None
+    flow_noise_ratio_min: float | None = None
+    flow_noise_ratio_max: float | None = None
 
     def __post_init__(self) -> None:
         integer_positive = {
@@ -228,6 +257,23 @@ class TrainingConfig:
                 maximum=float(self.bridge_tau_max),
                 spec=spec,
             )
+        affine_values = (
+            self.flow_variant_id,
+            self.flow_schedule,
+            self.flow_parameterization,
+            self.flow_conditioning,
+            self.flow_scale_sampling,
+            self.flow_loss_weighting,
+            self.flow_noise_ratio_min,
+            self.flow_noise_ratio_max,
+        )
+        if any(value is not None for value in affine_values):
+            if any(value is None for value in affine_values):
+                raise ValueError(
+                    "independent affine-flow settings must be provided as one "
+                    "complete block"
+                )
+            _affine_spec_from_training_config(self)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -270,6 +316,92 @@ def _bridge_spec_from_training_config(config: TrainingConfig) -> BrownianBridgeS
         conditioning=str(fields["conditioning"]),
         diffusivity=float(fields["diffusivity"]),
         terminal_time=float(fields["terminal_time"]),
+    )
+
+
+def _affine_spec_from_training_config(config: TrainingConfig) -> AffineFlowSpec:
+    """Require the complete immutable Hydra-declared affine-FM identity."""
+
+    fields = {
+        "variant_id": config.flow_variant_id,
+        "schedule": config.flow_schedule,
+        "parameterization": config.flow_parameterization,
+        "conditioning": config.flow_conditioning,
+        "scale_sampling": config.flow_scale_sampling,
+        "loss_weighting": config.flow_loss_weighting,
+        "noise_ratio_min": config.flow_noise_ratio_min,
+        "noise_ratio_max": config.flow_noise_ratio_max,
+    }
+    missing = [name for name, value in fields.items() if value is None]
+    if missing:
+        raise ValueError(
+            "independent_affine_flow requires explicit Hydra settings: "
+            f"{sorted(missing)}"
+        )
+    inactive = {
+        "sigma_min": config.sigma_min,
+        "sigma_max": config.sigma_max,
+        "time_min": config.time_min,
+        "time_max": config.time_max,
+        "num_coupling_layers": config.num_coupling_layers,
+        "conditioner_depth": config.conditioner_depth,
+        "log_scale_limit": config.log_scale_limit,
+        "epsilon_min": config.epsilon_min,
+        "epsilon_max": config.epsilon_max,
+        "bridge_construction": config.bridge_construction,
+        "bridge_reference_process": config.bridge_reference_process,
+        "bridge_initial_marginal": config.bridge_initial_marginal,
+        "bridge_terminal_marginal": config.bridge_terminal_marginal,
+        "bridge_factor_f": config.bridge_factor_f,
+        "bridge_factor_g": config.bridge_factor_g,
+        "bridge_conditioning": config.bridge_conditioning,
+        "bridge_diffusivity": config.bridge_diffusivity,
+        "bridge_terminal_time": config.bridge_terminal_time,
+        "bridge_tau_min": config.bridge_tau_min,
+        "bridge_tau_max": config.bridge_tau_max,
+    }
+    present_inactive = [name for name, value in inactive.items() if value is not None]
+    if present_inactive:
+        raise ValueError(
+            "independent_affine_flow forbids inactive family settings: "
+            f"{sorted(present_inactive)}"
+        )
+    return AffineFlowSpec.from_mapping(fields)
+
+
+def _has_affine_settings(config: TrainingConfig) -> bool:
+    return any(
+        value is not None
+        for value in (
+            config.flow_variant_id,
+            config.flow_schedule,
+            config.flow_parameterization,
+            config.flow_conditioning,
+            config.flow_scale_sampling,
+            config.flow_loss_weighting,
+            config.flow_noise_ratio_min,
+            config.flow_noise_ratio_max,
+        )
+    )
+
+
+def _affine_field_architecture_from_training_config(
+    config: TrainingConfig, *, ambient_dim: int
+) -> NeuralFieldConfig:
+    """Recompute the exact affine neural-field architecture from Hydra."""
+
+    _affine_spec_from_training_config(config)
+    if config.depth is None:
+        raise ValueError("independent_affine_flow requires explicit neural-field depth")
+    return NeuralFieldConfig(
+        ambient_dim=ambient_dim,
+        hidden_dim=config.hidden_dim,
+        depth=config.depth,
+        condition_dim=config.time_embedding_dim,
+        fourier_features=config.fourier_features,
+        max_condition_frequency=config.max_condition_frequency,
+        dropout=config.dropout,
+        condition_transform="linear",
     )
 
 
@@ -344,6 +476,8 @@ def _model_contract(family: Family, config: TrainingConfig) -> dict[str, Any]:
             tau_min=float(config.bridge_tau_min),
             tau_max=float(config.bridge_tau_max),
         )
+    if family == "independent_affine_flow":
+        return affine_flow_contract(_affine_spec_from_training_config(config))
     return {"schema_version": 1, "family": family}
 
 
@@ -366,6 +500,50 @@ class FieldPrediction:
     divergence: npt.NDArray[np.float64]
     evaluation_point: npt.NDArray[np.float64]
     condition: float
+
+
+@dataclass(frozen=True)
+class AffineFieldPrediction:
+    """All equivalent Gaussian affine-FM primitives at one noise ratio.
+
+    Divergence is taken with respect to the model input ``y``.  The
+    ``channel_score`` instead lives in normalized channel coordinates
+    ``r=y/alpha``; the distinction is explicit to prevent an ``alpha`` factor
+    from being lost in FM-to-score diagnostics.
+    """
+
+    model_output: npt.NDArray[np.float64]
+    model_output_divergence: npt.NDArray[np.float64]
+    velocity: npt.NDArray[np.float64]
+    velocity_divergence: npt.NDArray[np.float64]
+    velocity_divergence_from_posterior: npt.NDArray[np.float64]
+    posterior_mean: npt.NDArray[np.float64]
+    posterior_divergence: npt.NDArray[np.float64]
+    marginal_score: npt.NDArray[np.float64]
+    marginal_score_divergence: npt.NDArray[np.float64]
+    channel_score: npt.NDArray[np.float64]
+    channel_score_divergence: npt.NDArray[np.float64]
+    evaluation_point: npt.NDArray[np.float64]
+    channel_point: npt.NDArray[np.float64]
+    variant_id: str
+    schedule: str
+    parameterization: str
+    noise_ratio: float
+    native_time: float
+    alpha: float
+    beta: float
+    alpha_derivative: float
+    beta_derivative: float
+    alpha_log_derivative: float
+    log_noise_ratio_derivative: float
+    model_condition: float
+    divergence_backend: str
+    trace_probe_kind: str
+    trace_seed: int | None
+    trace_probes: int
+    shared_posterior_velocity_probes: bool
+    primary_trace_field: str
+    velocity_divergence_source: str
 
 
 @dataclass(frozen=True)
@@ -406,6 +584,7 @@ def _canonical_family(family: str) -> Family:
         "diffusion": "gaussian_diffusion",
         "gaussian_diffusion": "gaussian_diffusion",
         "rectified_flow": "rectified_flow",
+        "independent_affine_flow": "independent_affine_flow",
         "schrodinger_bridge": "brownian_schrodinger_bridge",
         "brownian_schrodinger_bridge": "brownian_schrodinger_bridge",
         "scale_conditioned_nf": "scale_conditioned_normalizing_flow",
@@ -416,7 +595,8 @@ def _canonical_family(family: str) -> Family:
     except KeyError as exc:
         raise ValueError(
             "family must be diffusion, gaussian_diffusion, rectified_flow, "
-            "schrodinger_bridge, brownian_schrodinger_bridge, "
+            "independent_affine_flow, schrodinger_bridge, "
+            "brownian_schrodinger_bridge, "
             "scale_conditioned_nf, or scale_conditioned_normalizing_flow"
         ) from exc
 
@@ -590,6 +770,41 @@ def rectified_flow_matching_loss(
     return (velocity - target_velocity).square().flatten(1).mean()
 
 
+def independent_affine_flow_matching_loss(
+    model: nn.Module,
+    data: Tensor,
+    *,
+    spec: AffineFlowSpec,
+    generator: torch.Generator,
+) -> Tensor:
+    """Independent Gaussian affine-FM objective under an explicit contract.
+
+    The sampled physical scale is always ``lambda=beta/alpha``.  The schedule
+    controls the interpolant and (for ``direct_velocity``) the derivative
+    target; the parameterization controls whether the network regresses that
+    target or the stable posterior mean ``E[X|Y]``.
+    """
+
+    noise_ratio = sample_noise_ratio(
+        data.shape[0], spec=spec, data=data, generator=generator
+    )
+    state = affine_schedule_state(noise_ratio, spec.schedule)
+    noise = torch.randn(
+        data.shape, device=data.device, dtype=data.dtype, generator=generator
+    )
+    interpolated, target = affine_interpolant_and_target(
+        data,
+        noise,
+        state,
+        parameterization=spec.parameterization,
+    )
+    condition = schedule_condition(state, spec.conditioning)
+    prediction = model(interpolated, condition)
+    per_example = (prediction - target).square().flatten(1).mean(dim=1)
+    weights = flow_matching_loss_weights(state, spec)
+    return torch.mean(weights * per_example)
+
+
 def _objective(
     family: Family,
     model: nn.Module,
@@ -617,6 +832,13 @@ def _objective(
             batch,
             time_min=config.time_min,
             time_max=config.time_max,
+            generator=generator,
+        )
+    if family == "independent_affine_flow":
+        return independent_affine_flow_matching_loss(
+            model,
+            batch,
+            spec=_affine_spec_from_training_config(config),
             generator=generator,
         )
     if family == "scale_conditioned_normalizing_flow":
@@ -747,6 +969,12 @@ def train_model(
 
     canonical_family = _canonical_family(family)
     resolved_config = _coerce_config(config)
+    if canonical_family == "independent_affine_flow":
+        _affine_spec_from_training_config(resolved_config)
+    elif _has_affine_settings(resolved_config):
+        raise ValueError(
+            f"{canonical_family} cannot carry inactive independent affine-flow settings"
+        )
     if canonical_family == "brownian_schrodinger_bridge":
         bridge_spec = _bridge_spec_from_training_config(resolved_config)
         if (
@@ -789,27 +1017,34 @@ def train_model(
             )
             model: TrainableModel = ScaleConditionedRealNVP(nf_architecture).to(device)
         else:
-            if resolved_config.depth is None:
+            if canonical_family == "independent_affine_flow":
+                field_architecture = _affine_field_architecture_from_training_config(
+                    resolved_config, ambient_dim=train_cpu.shape[1]
+                )
+            elif resolved_config.depth is None:
                 raise ValueError(
                     f"{canonical_family} requires explicit neural-field depth"
                 )
-            field_architecture = NeuralFieldConfig(
-                ambient_dim=train_cpu.shape[1],
-                hidden_dim=resolved_config.hidden_dim,
-                depth=resolved_config.depth,
-                condition_dim=resolved_config.time_embedding_dim,
-                fourier_features=resolved_config.fourier_features,
-                max_condition_frequency=resolved_config.max_condition_frequency,
-                dropout=resolved_config.dropout,
-                condition_transform=(
-                    "log"
-                    if canonical_family
-                    in {"gaussian_diffusion", "brownian_schrodinger_bridge"}
-                    else "linear"
-                ),
-            )
+            else:
+                field_architecture = NeuralFieldConfig(
+                    ambient_dim=train_cpu.shape[1],
+                    hidden_dim=resolved_config.hidden_dim,
+                    depth=resolved_config.depth,
+                    condition_dim=resolved_config.time_embedding_dim,
+                    fourier_features=resolved_config.fourier_features,
+                    max_condition_frequency=resolved_config.max_condition_frequency,
+                    dropout=resolved_config.dropout,
+                    condition_transform=(
+                        "log"
+                        if canonical_family
+                        in {"gaussian_diffusion", "brownian_schrodinger_bridge"}
+                        else "linear"
+                    ),
+                )
             model = ScaleConditionedNeuralField(field_architecture).to(device)
         model._lid_family = canonical_family
+        if canonical_family == "independent_affine_flow":
+            model._lid_affine_spec = _affine_spec_from_training_config(resolved_config)
         train_tensor = train_cpu.to(device)
         validation_tensor = validation_cpu.to(device)
         optimizer = torch.optim.AdamW(
@@ -983,12 +1218,17 @@ def load_checkpoint(
     if set(payload) != required:
         raise ValueError("checkpoint schema mismatch")
     family = _canonical_family(payload["family"])
-    if (
-        schema_version == LEGACY_CHECKPOINT_SCHEMA_VERSION
-        and family == "scale_conditioned_normalizing_flow"
-    ):
-        raise ValueError("scale-conditioned NF requires checkpoint schema_version 2")
+    if schema_version == LEGACY_CHECKPOINT_SCHEMA_VERSION and family in {
+        "scale_conditioned_normalizing_flow",
+        "independent_affine_flow",
+    }:
+        raise ValueError(f"{family} requires checkpoint schema_version 2")
     config = TrainingConfig.from_mapping(payload["training_config"])
+    if family != "independent_affine_flow" and _has_affine_settings(config):
+        raise ValueError(
+            "checkpoint carries inactive independent affine-flow settings for "
+            f"family {family}"
+        )
     expected_contract = _model_contract(family, config)
     if (
         schema_version == CHECKPOINT_SCHEMA_VERSION
@@ -1010,10 +1250,21 @@ def load_checkpoint(
         ambient_dim = flow_architecture.ambient_dim
     else:
         field_architecture = NeuralFieldConfig.from_mapping(payload["architecture"])
+        if family == "independent_affine_flow":
+            expected_architecture = _affine_field_architecture_from_training_config(
+                config, ambient_dim=field_architecture.ambient_dim
+            )
+            if field_architecture != expected_architecture:
+                raise ValueError(
+                    "checkpoint affine neural-field architecture does not match "
+                    "training_config"
+                )
         model = ScaleConditionedNeuralField(field_architecture).to(resolved_device)
         ambient_dim = field_architecture.ambient_dim
     model.load_state_dict(payload["model_state"], strict=True)
     model._lid_family = family
+    if family == "independent_affine_flow":
+        model._lid_affine_spec = _affine_spec_from_training_config(config)
     model.eval()
 
     history_raw = payload["history"]
@@ -1113,6 +1364,296 @@ def _bridge_spec_for_model(
     )
 
 
+def _affine_spec_for_model(
+    model_or_result: ScaleConditionedNeuralField | TrainingResult,
+) -> AffineFlowSpec:
+    """Recover the immutable affine-FM contract used for training."""
+
+    if isinstance(model_or_result, TrainingResult):
+        return _affine_spec_from_training_config(model_or_result.config)
+    spec = getattr(model_or_result, "_lid_affine_spec", None)
+    if isinstance(spec, AffineFlowSpec):
+        return spec
+    raise ValueError(
+        "bare independent-affine models require their checkpointed "
+        "_lid_affine_spec contract"
+    )
+
+
+class _PosteriorFromAffineVelocity(nn.Module):
+    """View a direct affine velocity network as its posterior-mean field."""
+
+    def __init__(
+        self,
+        velocity_model: nn.Module,
+        state: Any,
+    ) -> None:
+        super().__init__()
+        self.velocity_model = velocity_model
+        self.state = state
+
+    def forward(self, inputs: Tensor, condition: Tensor | float) -> Tensor:
+        velocity = self.velocity_model(inputs, condition)
+        return velocity_to_posterior(velocity, inputs, self.state)
+
+
+def predict_affine_primitives(
+    model_or_result: nn.Module | TrainingResult,
+    query: Any,
+    noise_ratio: float,
+    *,
+    family: str | None = None,
+    divergence_backend: Literal["exact", "hutchinson"] = "hutchinson",
+    trace_probes: int = 16,
+    trace_seed: int = 0,
+    batch_size: int = 256,
+) -> AffineFieldPrediction:
+    """Evaluate all equivalent affine-FM fields at one physical ``lambda``.
+
+    The primary trace is always taken through the posterior field.  For the
+    posterior rectified variant this differentiates the raw network output,
+    never its singular reconstructed velocity.  Direct-velocity variants are
+    wrapped by their exact affine posterior identity before differentiation.
+    """
+
+    model, canonical_family, mean, normalization_scale = _model_and_context(
+        model_or_result, family
+    )
+    if canonical_family != "independent_affine_flow":
+        raise ValueError("predict_affine_primitives requires independent_affine_flow")
+    spec = _affine_spec_for_model(model_or_result)
+    if not math.isfinite(noise_ratio) or noise_ratio <= 0.0:
+        raise ValueError("affine-FM noise ratio must be finite and positive")
+    if not spec.noise_ratio_min <= noise_ratio <= spec.noise_ratio_max:
+        raise ValueError(
+            "affine-FM noise ratio lies outside the checkpointed training interval"
+        )
+    if divergence_backend not in {"exact", "hutchinson"}:
+        raise ValueError("divergence_backend must be exact or hutchinson")
+    if isinstance(batch_size, bool) or batch_size <= 0:
+        raise ValueError("batch_size must be a positive integer")
+    if divergence_backend == "hutchinson" and (
+        isinstance(trace_probes, bool) or trace_probes <= 0
+    ):
+        raise ValueError("trace_probes must be positive for Hutchinson divergence")
+    if isinstance(trace_seed, bool) or trace_seed < 0:
+        raise ValueError("trace_seed must be a non-negative integer")
+
+    query_cpu = _flat_finite_data(query, name="query")
+    if query_cpu.shape[1] != model.config.ambient_dim:
+        raise ValueError("query ambient dimension does not match model")
+    normalized = (query_cpu - mean.reshape(1, -1)) / normalization_scale
+    parameter = next(model.parameters())
+    device = parameter.device
+    dtype = parameter.dtype
+    model.eval()
+    generator: torch.Generator | None = None
+    if divergence_backend == "hutchinson":
+        generator = torch.Generator(device=device)
+        generator.manual_seed(trace_seed)
+
+    model_outputs: list[Tensor] = []
+    model_output_divergences: list[Tensor] = []
+    velocities: list[Tensor] = []
+    velocity_divergences: list[Tensor] = []
+    velocity_divergences_from_posterior: list[Tensor] = []
+    posterior_means: list[Tensor] = []
+    posterior_divergences: list[Tensor] = []
+    marginal_scores: list[Tensor] = []
+    marginal_score_divergences: list[Tensor] = []
+    channel_scores: list[Tensor] = []
+    channel_score_divergences: list[Tensor] = []
+    evaluation_points: list[Tensor] = []
+    channel_points: list[Tensor] = []
+    model_conditions: list[Tensor] = []
+
+    parameterization = canonical_parameterization(spec.parameterization)
+    for start in range(0, normalized.shape[0], batch_size):
+        channel_point = normalized[start : start + batch_size].to(
+            device=device, dtype=dtype
+        )
+        batch_noise_ratio = torch.full(
+            (channel_point.shape[0],),
+            float(noise_ratio),
+            device=device,
+            dtype=dtype,
+        )
+        state = affine_schedule_state(batch_noise_ratio, spec.schedule)
+        alpha = state.alpha.reshape(-1, 1)
+        evaluation_point = alpha * channel_point
+        condition = schedule_condition(state, spec.conditioning)
+
+        if parameterization == "posterior_mean":
+            posterior_field: nn.Module = model
+        else:
+            posterior_field = _PosteriorFromAffineVelocity(model, state)
+        if divergence_backend == "exact":
+            posterior_divergence = exact_divergence(
+                posterior_field,
+                evaluation_point,
+                condition,
+                create_graph=False,
+            )
+            raw_model_divergence = (
+                posterior_divergence
+                if parameterization == "posterior_mean"
+                else exact_divergence(
+                    model,
+                    evaluation_point,
+                    condition,
+                    create_graph=False,
+                )
+            )
+        else:
+            assert generator is not None
+            probes = rademacher_probes_like(
+                evaluation_point,
+                num_probes=trace_probes,
+                seed=None,
+                generator=generator,
+            )
+            posterior_divergence = hutchinson_divergence(
+                posterior_field,
+                evaluation_point,
+                condition,
+                num_probes=trace_probes,
+                seed=None,
+                probes=probes,
+                create_graph=False,
+            )
+            raw_model_divergence = (
+                posterior_divergence
+                if parameterization == "posterior_mean"
+                else hutchinson_divergence(
+                    model,
+                    evaluation_point,
+                    condition,
+                    num_probes=trace_probes,
+                    seed=None,
+                    probes=probes,
+                    create_graph=False,
+                )
+            )
+        with torch.no_grad():
+            model_output = model(evaluation_point, condition)
+            identity_state = affine_schedule_state(
+                torch.full(
+                    (channel_point.shape[0],),
+                    float(noise_ratio),
+                    device=device,
+                    dtype=torch.float64,
+                ),
+                spec.schedule,
+            )
+            velocity_divergence_from_posterior = (
+                posterior_divergence_to_velocity_divergence(
+                    posterior_divergence.to(torch.float64),
+                    identity_state,
+                    ambient_dim=model.config.ambient_dim,
+                )
+            )
+            if parameterization == "posterior_mean":
+                posterior_mean = model_output
+                velocity = posterior_to_velocity(
+                    posterior_mean, evaluation_point, state
+                )
+                velocity_divergence = velocity_divergence_from_posterior
+                model_output_divergence = posterior_divergence
+            else:
+                velocity = model_output
+                posterior_mean = velocity_to_posterior(
+                    velocity, evaluation_point, state
+                )
+                velocity_divergence = raw_model_divergence
+                model_output_divergence = raw_model_divergence
+            marginal_score = posterior_to_marginal_score(
+                posterior_mean, evaluation_point, state
+            )
+            marginal_score_divergence = (
+                posterior_divergence_to_marginal_score_divergence(
+                    posterior_divergence,
+                    state,
+                    ambient_dim=model.config.ambient_dim,
+                )
+            )
+            channel_score = posterior_to_channel_score(
+                posterior_mean, channel_point, state
+            )
+            channel_score_divergence = posterior_divergence_to_channel_score_divergence(
+                posterior_divergence,
+                state,
+                ambient_dim=model.config.ambient_dim,
+            )
+        model_outputs.append(model_output.detach().cpu())
+        model_output_divergences.append(model_output_divergence.detach().cpu())
+        velocities.append(velocity.detach().cpu())
+        velocity_divergences.append(velocity_divergence.detach().cpu())
+        velocity_divergences_from_posterior.append(
+            velocity_divergence_from_posterior.detach().cpu()
+        )
+        posterior_means.append(posterior_mean.detach().cpu())
+        posterior_divergences.append(posterior_divergence.detach().cpu())
+        marginal_scores.append(marginal_score.detach().cpu())
+        marginal_score_divergences.append(marginal_score_divergence.detach().cpu())
+        channel_scores.append(channel_score.detach().cpu())
+        channel_score_divergences.append(channel_score_divergence.detach().cpu())
+        evaluation_points.append(evaluation_point.detach().cpu())
+        channel_points.append(channel_point.detach().cpu())
+        model_conditions.append(condition.detach().cpu())
+
+    scalar_state = affine_schedule_state(
+        torch.tensor(float(noise_ratio), dtype=torch.float64), spec.schedule
+    )
+
+    def array(values: list[Tensor]) -> npt.NDArray[np.float64]:
+        return np.asarray(torch.cat(values).numpy(), dtype=np.float64)
+
+    return AffineFieldPrediction(
+        model_output=array(model_outputs),
+        model_output_divergence=array(model_output_divergences),
+        velocity=array(velocities),
+        velocity_divergence=array(velocity_divergences),
+        velocity_divergence_from_posterior=array(velocity_divergences_from_posterior),
+        posterior_mean=array(posterior_means),
+        posterior_divergence=array(posterior_divergences),
+        marginal_score=array(marginal_scores),
+        marginal_score_divergence=array(marginal_score_divergences),
+        channel_score=array(channel_scores),
+        channel_score_divergence=array(channel_score_divergences),
+        evaluation_point=array(evaluation_points),
+        channel_point=array(channel_points),
+        variant_id=spec.variant_id,
+        schedule=spec.schedule,
+        parameterization=parameterization,
+        noise_ratio=float(noise_ratio),
+        native_time=float(scalar_state.native_time.item()),
+        alpha=float(scalar_state.alpha.item()),
+        beta=float(scalar_state.beta.item()),
+        alpha_derivative=float(scalar_state.alpha_derivative.item()),
+        beta_derivative=float(scalar_state.beta_derivative.item()),
+        alpha_log_derivative=float(scalar_state.alpha_log_derivative.item()),
+        log_noise_ratio_derivative=float(
+            scalar_state.log_noise_ratio_derivative.item()
+        ),
+        model_condition=float(torch.cat(model_conditions)[0].item()),
+        divergence_backend=divergence_backend,
+        trace_probe_kind=(
+            "rademacher" if divergence_backend == "hutchinson" else "exact"
+        ),
+        trace_seed=trace_seed if divergence_backend == "hutchinson" else None,
+        trace_probes=trace_probes if divergence_backend == "hutchinson" else 0,
+        shared_posterior_velocity_probes=(
+            divergence_backend == "hutchinson" and parameterization == "direct_velocity"
+        ),
+        primary_trace_field="posterior_mean",
+        velocity_divergence_source=(
+            "raw_model_trace"
+            if parameterization == "direct_velocity"
+            else "derived_from_posterior_trace"
+        ),
+    )
+
+
 def predict_primitives(
     model_or_result: nn.Module | TrainingResult,
     query: Any,
@@ -1133,6 +1674,23 @@ def predict_primitives(
     model, canonical_family, mean, normalization_scale = _model_and_context(
         model_or_result, family
     )
+    if canonical_family == "independent_affine_flow":
+        affine = predict_affine_primitives(
+            model_or_result,
+            query,
+            scale,
+            family=canonical_family,
+            divergence_backend=divergence_backend,
+            trace_probes=trace_probes,
+            trace_seed=trace_seed,
+            batch_size=batch_size,
+        )
+        return FieldPrediction(
+            field=affine.velocity,
+            divergence=affine.velocity_divergence,
+            evaluation_point=affine.evaluation_point,
+            condition=affine.noise_ratio,
+        )
     if canonical_family == "scale_conditioned_normalizing_flow":
         raise ValueError(
             "scale-conditioned NF exposes a fixed-likelihood readout, not "
@@ -1242,7 +1800,7 @@ def predict_lid(
     scale: float,
     *,
     family: str | None = None,
-    readout: Literal["full", "response", "fixed_likelihood"] = "full",
+    readout: Literal["full", "response", "fm_to_score", "fixed_likelihood"] = "full",
     divergence_backend: Literal["exact", "hutchinson"] = "hutchinson",
     trace_probes: int = 16,
     trace_seed: int = 0,
@@ -1294,6 +1852,45 @@ def predict_lid(
             )
             predictions.append(fixed_point_lid(model, batch, scale).detach().cpu())
         return np.asarray(torch.cat(predictions).numpy(), dtype=np.float64)
+    if canonical_family == "independent_affine_flow":
+        prediction = predict_affine_primitives(
+            model_or_result,
+            query,
+            scale,
+            family=canonical_family,
+            divergence_backend=divergence_backend,
+            trace_probes=trace_probes,
+            trace_seed=trace_seed,
+            batch_size=batch_size,
+        )
+        response = prediction.alpha * prediction.posterior_divergence
+        if readout == "response":
+            return np.asarray(response, dtype=np.float64)
+        if readout == "full":
+            scaled_bias = (
+                prediction.posterior_mean - prediction.channel_point
+            ) / prediction.noise_ratio
+            return np.asarray(
+                response + np.einsum("ij,ij->i", scaled_bias, scaled_bias),
+                dtype=np.float64,
+            )
+        if readout == "fm_to_score":
+            return np.asarray(
+                model.config.ambient_dim
+                + prediction.beta**2
+                * (
+                    prediction.marginal_score_divergence
+                    + np.einsum(
+                        "ij,ij->i",
+                        prediction.marginal_score,
+                        prediction.marginal_score,
+                    )
+                ),
+                dtype=np.float64,
+            )
+        raise ValueError(
+            "independent affine flow readout must be response, full, or fm_to_score"
+        )
     prediction = predict_primitives(
         model_or_result,
         query,

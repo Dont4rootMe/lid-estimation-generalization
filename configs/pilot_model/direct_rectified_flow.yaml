@@ -1,0 +1,62 @@
+name: direct_rectified_flow
+family: independent_affine_flow
+experiment_name: lid-generalization-e8-suite-fm-rectified-direct-velocity-all-readouts-debug-train-mae-lambda-selection-seed-${seed}
+readout: full
+selection_prefer: smaller
+derivative_backend: hutchinson
+trace_probes: 16
+
+training:
+  seed: ${seed}
+  device: cuda
+  epochs: 200
+  batch_size: 512
+  learning_rate: 0.0002
+  weight_decay: 0.000001
+  hidden_dim: 1024
+  depth: 6
+  time_embedding_dim: 128
+  validation_interval: 1
+  early_stopping_patience: 20
+  gradient_clip_norm: 1.0
+  num_workers: 4
+  deterministic: true
+  fourier_features: 32
+  max_condition_frequency: 100.0
+  dropout: 0.0
+  normalize: true
+  normalization_epsilon: 1.0e-8
+  flow_variant_id: direct_rectified_flow
+  flow_schedule: rectified_linear
+  flow_parameterization: direct_velocity
+  flow_conditioning: log_noise_ratio
+  flow_scale_sampling: log_uniform_noise_ratio
+  flow_loss_weighting: posterior_bias_equivalent
+  flow_noise_ratio_min: 0.01
+  flow_noise_ratio_max: 1.0
+
+scales:
+  - 0.01
+  - 0.0178
+  - 0.0316
+  - 0.0562
+  - 0.1
+  - 0.1778
+  - 0.3162
+  - 0.5623
+  - 1.0
+
+diagnostics:
+  schema_version: 1
+  enabled: true
+  source_split: train_selection
+  primary_divergence_backend: hutchinson
+  probe_kind: rademacher
+  trace_probes: 16
+  trace_seed: ${seed}
+  exact_subset_size: 32
+  exact_subset_seed: ${seed}
+  oracle_reference_size: 4096
+  oracle_reference_seed: ${seed}
+  oracle_chunk_size: 1024
+  batch_size: 128

@@ -57,6 +57,7 @@ _FAMILY_FOR_ARTIFACTS = {
     "diffusion": "gaussian_diffusion",
     "gaussian_diffusion": "gaussian_diffusion",
     "rectified_flow": "rectified_flow",
+    "independent_affine_flow": "independent_affine_flow",
     "scale_conditioned_nf": "scale_conditioned_normalizing_flow",
     "schrodinger_bridge": "brownian_schrodinger_bridge",
 }
@@ -76,6 +77,76 @@ _EXPERIMENT_NAME_STEM = {
         "lid-generalization-e8-suite-brownian-schrodinger-bridge-"
         "train-mae-time-selection"
     ),
+}
+_AFFINE_VARIANTS: dict[str, dict[str, str]] = {
+    "direct_rectified_flow": {
+        "schedule": "rectified_linear",
+        "parameterization": "direct_velocity",
+        "experiment_stem": (
+            "lid-generalization-e8-suite-fm-rectified-direct-velocity-"
+            "all-readouts-debug-train-mae-lambda-selection"
+        ),
+    },
+    "posterior_rectified_flow": {
+        "schedule": "rectified_linear",
+        "parameterization": "posterior_mean",
+        "experiment_stem": (
+            "lid-generalization-e8-suite-fm-rectified-posterior-mean-"
+            "all-readouts-debug-train-mae-lambda-selection"
+        ),
+    },
+    "direct_log_noise_affine_flow": {
+        "schedule": "log_noise",
+        "parameterization": "direct_velocity",
+        "experiment_stem": (
+            "lid-generalization-e8-suite-fm-log-noise-direct-velocity-"
+            "all-readouts-debug-train-mae-lambda-selection"
+        ),
+    },
+    "posterior_log_noise_affine_flow": {
+        "schedule": "log_noise",
+        "parameterization": "posterior_mean",
+        "experiment_stem": (
+            "lid-generalization-e8-suite-fm-log-noise-posterior-mean-"
+            "all-readouts-debug-train-mae-lambda-selection"
+        ),
+    },
+    "direct_vp_trigonometric_flow": {
+        "schedule": "vp_trigonometric",
+        "parameterization": "direct_velocity",
+        "experiment_stem": (
+            "lid-generalization-e8-suite-fm-vp-trigonometric-direct-velocity-"
+            "all-readouts-debug-train-mae-lambda-selection"
+        ),
+    },
+    "posterior_vp_trigonometric_flow": {
+        "schedule": "vp_trigonometric",
+        "parameterization": "posterior_mean",
+        "experiment_stem": (
+            "lid-generalization-e8-suite-fm-vp-trigonometric-posterior-mean-"
+            "all-readouts-debug-train-mae-lambda-selection"
+        ),
+    },
+}
+_AFFINE_READOUTS = ("response", "full", "fm_to_score")
+_AFFINE_SCALE_GRID = np.asarray(
+    (0.01, 0.0178, 0.0316, 0.0562, 0.1, 0.1778, 0.3162, 0.5623, 1.0),
+    dtype=np.float64,
+)
+_AFFINE_DIAGNOSTIC_FIELDS = {
+    "schema_version",
+    "enabled",
+    "source_split",
+    "primary_divergence_backend",
+    "probe_kind",
+    "trace_probes",
+    "trace_seed",
+    "exact_subset_size",
+    "exact_subset_seed",
+    "oracle_reference_size",
+    "oracle_reference_seed",
+    "oracle_chunk_size",
+    "batch_size",
 }
 _COMMON_TRAINING_FIELDS = {
     "seed",
@@ -101,6 +172,17 @@ _FAMILY_TRAINING_FIELDS = {
     "diffusion": {"depth", "sigma_min", "sigma_max"},
     "gaussian_diffusion": {"depth", "sigma_min", "sigma_max"},
     "rectified_flow": {"depth", "time_min", "time_max"},
+    "independent_affine_flow": {
+        "depth",
+        "flow_variant_id",
+        "flow_schedule",
+        "flow_parameterization",
+        "flow_conditioning",
+        "flow_scale_sampling",
+        "flow_loss_weighting",
+        "flow_noise_ratio_min",
+        "flow_noise_ratio_max",
+    },
     # NF integration owns these exact likelihood-path and architecture fields.
     "scale_conditioned_nf": {
         "num_coupling_layers",
@@ -127,6 +209,9 @@ _FAMILY_TRAINING_FIELDS = {
 
 FloatArray = npt.NDArray[np.float64]
 LogCallback = Callable[[str, Mapping[str, Any]], None]
+PrimitiveFunction = Callable[..., Any]
+DiagnosticsFunction = Callable[..., Path]
+DiagnosticsValidator = Callable[[Path], list[str]]
 
 
 @dataclass(frozen=True)
@@ -239,6 +324,112 @@ def _contains_secret_field(value: Any) -> bool:
     elif isinstance(value, (list, tuple)):
         return any(_contains_secret_field(child) for child in value)
     return False
+
+
+def _expected_experiment_name(model: Mapping[str, Any], *, seed: int) -> str:
+    family = str(model.get("family"))
+    if family == "independent_affine_flow":
+        training = model.get("training")
+        if not isinstance(training, Mapping):
+            raise PilotConfigError("pilot_model.training must be a mapping")
+        variant_id = training.get("flow_variant_id")
+        try:
+            stem = _AFFINE_VARIANTS[str(variant_id)]["experiment_stem"]
+        except KeyError as exc:
+            raise PilotConfigError(
+                "pilot_model.training.flow_variant_id must be one of "
+                f"{sorted(_AFFINE_VARIANTS)!r}"
+            ) from exc
+    else:
+        stem = _EXPERIMENT_NAME_STEM[family]
+    return f"{stem}-seed-{seed}"
+
+
+def _validate_affine_diagnostics(
+    diagnostics: Any,
+    *,
+    evaluation: Mapping[str, Any],
+    selection: Mapping[str, Any],
+) -> None:
+    if not isinstance(diagnostics, dict):
+        raise PilotConfigError(
+            "independent affine flow requires pilot_model.diagnostics mapping"
+        )
+    _reject_unknown(
+        diagnostics,
+        _AFFINE_DIAGNOSTIC_FIELDS,
+        field="pilot_model.diagnostics",
+    )
+    missing = _AFFINE_DIAGNOSTIC_FIELDS - set(diagnostics)
+    if missing:
+        raise PilotConfigError(
+            f"missing pilot_model.diagnostics fields: {sorted(missing)}"
+        )
+    exact_values = {
+        "schema_version": 1,
+        "enabled": True,
+        "source_split": "train_selection",
+        "primary_divergence_backend": "hutchinson",
+        "probe_kind": "rademacher",
+    }
+    for field, expected in exact_values.items():
+        if diagnostics[field] != expected or (
+            field == "schema_version" and isinstance(diagnostics[field], bool)
+        ):
+            raise PilotConfigError(
+                f"pilot_model.diagnostics.{field} must be exactly {expected!r}"
+            )
+    for field in (
+        "trace_probes",
+        "exact_subset_size",
+        "oracle_reference_size",
+        "oracle_chunk_size",
+        "batch_size",
+    ):
+        _positive_int(diagnostics[field], field=f"pilot_model.diagnostics.{field}")
+    exact_sizes = {
+        "trace_probes": 16,
+        "exact_subset_size": 32,
+        "oracle_reference_size": 4096,
+        "oracle_chunk_size": 1024,
+        "batch_size": 128,
+    }
+    for field, expected in exact_sizes.items():
+        if diagnostics[field] != expected:
+            raise PilotConfigError(
+                f"pilot_model.diagnostics.{field} must be exactly {expected}"
+            )
+    for field in ("trace_seed", "exact_subset_seed", "oracle_reference_seed"):
+        raw = diagnostics[field]
+        if isinstance(raw, bool) or not isinstance(raw, int) or not 0 <= raw < 2**64:
+            raise PilotConfigError(
+                f"pilot_model.diagnostics.{field} must be an integer in [0, 2**64)"
+            )
+    if diagnostics["trace_probes"] != evaluation["trace_probes"]:
+        raise PilotConfigError(
+            "diagnostics.trace_probes must equal evaluation.trace_probes"
+        )
+    if diagnostics["trace_seed"] != evaluation["trace_seed"]:
+        raise PilotConfigError(
+            "diagnostics.trace_seed must equal evaluation.trace_seed"
+        )
+    for field in ("exact_subset_seed", "oracle_reference_seed"):
+        if diagnostics[field] != evaluation["trace_seed"]:
+            raise PilotConfigError(
+                f"diagnostics.{field} must equal evaluation.trace_seed"
+            )
+    if diagnostics["batch_size"] != evaluation["batch_size"]:
+        raise PilotConfigError(
+            "diagnostics.batch_size must equal evaluation.batch_size"
+        )
+    if diagnostics["exact_subset_size"] > selection["subset_size"]:
+        raise PilotConfigError(
+            "diagnostics.exact_subset_size must not exceed selection.subset_size"
+        )
+    if diagnostics["oracle_chunk_size"] > diagnostics["oracle_reference_size"]:
+        raise PilotConfigError(
+            "diagnostics.oracle_chunk_size must not exceed oracle_reference_size"
+        )
 
 
 def validate_pilot_config(
@@ -389,6 +580,7 @@ def validate_pilot_config(
             "trace_probes",
             "training",
             "scales",
+            "diagnostics",
         },
         field="pilot_model",
     )
@@ -396,11 +588,12 @@ def validate_pilot_config(
     if family not in _FAMILY_FOR_ARTIFACTS:
         raise PilotConfigError(
             "pilot_model.family must be diffusion/gaussian_diffusion, "
-            "rectified_flow, scale_conditioned_nf, or schrodinger_bridge"
+            "rectified_flow, independent_affine_flow, scale_conditioned_nf, "
+            "or schrodinger_bridge"
         )
     if not isinstance(model.get("name"), str) or not model["name"]:
         raise PilotConfigError("pilot_model.name must be non-empty")
-    expected_experiment_name = f"{_EXPERIMENT_NAME_STEM[family]}-seed-{seed}"
+    expected_experiment_name = _expected_experiment_name(model, seed=seed)
     if model.get("experiment_name") != expected_experiment_name:
         raise PilotConfigError(
             "pilot_model.experiment_name must be exactly "
@@ -411,7 +604,11 @@ def validate_pilot_config(
     allowed_readouts = (
         {"fixed_likelihood"}
         if family == "scale_conditioned_nf"
-        else {"full", "response"}
+        else (
+            set(_AFFINE_READOUTS)
+            if family == "independent_affine_flow"
+            else {"full", "response"}
+        )
     )
     if model.get("readout") not in allowed_readouts:
         raise PilotConfigError(
@@ -458,6 +655,63 @@ def validate_pilot_config(
     if missing_training_fields:
         raise PilotConfigError(
             f"missing pilot_model.training fields: {sorted(missing_training_fields)}"
+        )
+    diagnostics = model.get("diagnostics")
+    if family == "independent_affine_flow":
+        if model["readout"] != "full":
+            raise PilotConfigError(
+                "independent affine flow primary readout must be exactly 'full'"
+            )
+        if model["selection_prefer"] != "smaller":
+            raise PilotConfigError(
+                "independent affine flow must prefer smaller lambda on selection ties"
+            )
+        affine_training = model["training"]
+        variant_id = affine_training["flow_variant_id"]
+        if model["name"] != variant_id:
+            raise PilotConfigError(
+                "pilot_model.name must equal training.flow_variant_id for affine flow"
+            )
+        try:
+            expected_variant = _AFFINE_VARIANTS[str(variant_id)]
+        except KeyError as exc:
+            raise PilotConfigError(
+                f"unsupported independent affine-flow variant {variant_id!r}"
+            ) from exc
+        for field, expected in (
+            ("flow_schedule", expected_variant["schedule"]),
+            ("flow_parameterization", expected_variant["parameterization"]),
+            ("flow_conditioning", "log_noise_ratio"),
+            ("flow_scale_sampling", "log_uniform_noise_ratio"),
+            ("flow_loss_weighting", "posterior_bias_equivalent"),
+        ):
+            if affine_training[field] != expected:
+                raise PilotConfigError(
+                    f"pilot_model.training.{field} must be exactly {expected!r} "
+                    f"for {variant_id!r}"
+                )
+        for field, expected in (
+            ("flow_noise_ratio_min", 0.01),
+            ("flow_noise_ratio_max", 1.0),
+        ):
+            raw = affine_training[field]
+            if (
+                isinstance(raw, bool)
+                or not isinstance(raw, (int, float))
+                or not math.isfinite(float(raw))
+                or float(raw) != expected
+            ):
+                raise PilotConfigError(
+                    f"pilot_model.training.{field} must be exactly {expected}"
+                )
+        _validate_affine_diagnostics(
+            diagnostics,
+            evaluation=evaluation,
+            selection=selection,
+        )
+    elif diagnostics is not None:
+        raise PilotConfigError(
+            "pilot_model.diagnostics is reserved for independent_affine_flow"
         )
     if family == "scale_conditioned_nf":
         nf_training = model["training"]
@@ -539,6 +793,18 @@ def validate_pilot_config(
         )
     if family == "rectified_flow" and np.any(scales >= 1):
         raise PilotConfigError("rectified-flow scales must lie strictly in (0, 1)")
+    if family == "independent_affine_flow":
+        if not np.array_equal(scales, _AFFINE_SCALE_GRID):
+            raise PilotConfigError(
+                "independent affine-flow scales must be the exact common lambda grid "
+                f"{_AFFINE_SCALE_GRID.tolist()!r}"
+            )
+        minimum = float(model["training"]["flow_noise_ratio_min"])
+        maximum = float(model["training"]["flow_noise_ratio_max"])
+        if np.any(scales < minimum) or np.any(scales > maximum):
+            raise PilotConfigError(
+                "independent affine-flow lambda scales must lie inside training bounds"
+            )
     if family == "scale_conditioned_nf":
         epsilon_min = float(model["training"]["epsilon_min"])
         epsilon_max = float(model["training"]["epsilon_max"])
@@ -829,6 +1095,7 @@ def _prediction_at_scale(
     family: str,
     model: Mapping[str, Any],
     evaluation: Mapping[str, Any],
+    readout: str | None = None,
 ) -> FloatArray:
     """Evaluate exactly one declared model scale and preserve row cardinality."""
 
@@ -840,7 +1107,7 @@ def _prediction_at_scale(
                 query,
                 float(scale),
                 family=family,
-                readout=str(model["readout"]),
+                readout=str(model["readout"] if readout is None else readout),
                 divergence_backend=str(evaluation["divergence_backend"]),
                 trace_probes=int(evaluation.get("trace_probes") or 0),
                 trace_seed=int(evaluation["trace_seed"]),
@@ -854,6 +1121,138 @@ def _prediction_at_scale(
             f"predict_lid returned {prediction.shape}, expected {(n_samples,)}"
         )
     return np.ascontiguousarray(prediction, dtype=np.float64)
+
+
+def _readouts_from_affine_primitives(prediction: Any) -> dict[str, FloatArray]:
+    """Compute every declared readout from one shared field/trace evaluation."""
+
+    posterior_mean = np.asarray(prediction.posterior_mean, dtype=np.float64)
+    channel_point = np.asarray(prediction.channel_point, dtype=np.float64)
+    posterior_divergence = np.ravel(
+        np.asarray(prediction.posterior_divergence, dtype=np.float64)
+    )
+    marginal_score = np.asarray(prediction.marginal_score, dtype=np.float64)
+    marginal_score_divergence = np.ravel(
+        np.asarray(prediction.marginal_score_divergence, dtype=np.float64)
+    )
+    if (
+        posterior_mean.ndim != 2
+        or channel_point.shape != posterior_mean.shape
+        or marginal_score.shape != posterior_mean.shape
+        or posterior_divergence.shape != (posterior_mean.shape[0],)
+        or marginal_score_divergence.shape != (posterior_mean.shape[0],)
+    ):
+        raise ValueError("affine primitive arrays have inconsistent shapes")
+    alpha = float(prediction.alpha)
+    beta = float(prediction.beta)
+    noise_ratio = float(prediction.noise_ratio)
+    if not all(math.isfinite(value) for value in (alpha, beta, noise_ratio)):
+        raise FloatingPointError("affine primitive scale metadata is non-finite")
+    if noise_ratio <= 0.0:
+        raise ValueError("affine primitive noise_ratio must be positive")
+    response = alpha * posterior_divergence
+    scaled_bias = (posterior_mean - channel_point) / noise_ratio
+    full = response + np.einsum("ij,ij->i", scaled_bias, scaled_bias)
+    fm_to_score = posterior_mean.shape[1] + beta**2 * (
+        marginal_score_divergence
+        + np.einsum("ij,ij->i", marginal_score, marginal_score)
+    )
+    result = {
+        "response": np.ascontiguousarray(response, dtype=np.float64),
+        "full": np.ascontiguousarray(full, dtype=np.float64),
+        "fm_to_score": np.ascontiguousarray(fm_to_score, dtype=np.float64),
+    }
+    for readout, values in result.items():
+        _require_all_finite(values, label=f"shared-primitive {readout}")
+    return result
+
+
+def _frozen_affine_readouts(
+    *,
+    predict_fn: PredictFunction,
+    trained: Any,
+    selected_lambda: float,
+    model: Mapping[str, Any],
+    evaluation: Mapping[str, Any],
+    split_queries: Mapping[str, npt.ArrayLike],
+    split_targets: Mapping[str, npt.ArrayLike],
+    primary_predictions: Mapping[str, npt.ArrayLike],
+    primitive_fn: PrimitiveFunction | None = None,
+) -> tuple[dict[str, dict[str, FloatArray]], dict[str, Any]]:
+    """Evaluate every affine readout once at the train-selected lambda."""
+
+    predictions: dict[str, dict[str, FloatArray]] = {}
+    metrics: dict[str, Any] = {}
+    for split, query in split_queries.items():
+        target = np.ravel(np.asarray(split_targets[split], dtype=np.float64))
+        split_predictions: dict[str, FloatArray] = {}
+        shared_predictions: Mapping[str, FloatArray] | None = None
+        if primitive_fn is not None:
+            primitives = primitive_fn(
+                trained,
+                query,
+                selected_lambda,
+                family="independent_affine_flow",
+                divergence_backend=str(evaluation["divergence_backend"]),
+                trace_probes=int(evaluation.get("trace_probes") or 0),
+                trace_seed=int(evaluation["trace_seed"]),
+                batch_size=int(evaluation["batch_size"]),
+            )
+            shared_predictions = _readouts_from_affine_primitives(primitives)
+        for readout in _AFFINE_READOUTS:
+            if shared_predictions is not None:
+                prediction = shared_predictions[readout]
+            elif readout == model["readout"] and split in primary_predictions:
+                prediction = np.ascontiguousarray(
+                    np.ravel(np.asarray(primary_predictions[split], dtype=np.float64))
+                )
+            else:
+                prediction = _prediction_at_scale(
+                    predict_fn=predict_fn,
+                    trained=trained,
+                    query=query,
+                    scale=selected_lambda,
+                    family="independent_affine_flow",
+                    model=model,
+                    evaluation=evaluation,
+                    readout=readout,
+                )
+            if readout == model["readout"] and split in primary_predictions:
+                primary = np.ravel(
+                    np.asarray(primary_predictions[split], dtype=np.float64)
+                )
+                if not np.array_equal(prediction, primary):
+                    raise RuntimeError(
+                        f"shared affine primitives changed the primary {split} "
+                        f"{readout} prediction"
+                    )
+                prediction = np.ascontiguousarray(primary, dtype=np.float64)
+            _require_all_finite(
+                prediction, label=f"{split} {readout} frozen prediction"
+            )
+            if prediction.shape != target.shape:
+                raise ValueError(
+                    f"{split} {readout} prediction has shape {prediction.shape}, "
+                    f"expected {target.shape}"
+                )
+            split_predictions[readout] = prediction
+            metrics.setdefault(readout, {})[split] = known_lid_metrics(
+                prediction, target
+            )
+        predictions[split] = split_predictions
+    summary = {
+        "schema_version": 1,
+        "scale_semantics": "noise_ratio_lambda=beta/alpha",
+        "selected_lambda": float(selected_lambda),
+        "primary_readout": "full",
+        "scale_selected_with_readout": "full",
+        "validation_candidate_count_per_readout": 1,
+        "test_candidate_count_per_readout": 1,
+        "retrospective_validation_curves_saved": False,
+        "retrospective_test_curves_saved": False,
+        "readouts": metrics,
+    }
+    return predictions, summary
 
 
 def _require_all_finite(value: npt.ArrayLike, *, label: str) -> None:
@@ -1047,6 +1446,13 @@ def _selection_coordinate(
             "(1 - t) / t",
             "t",
         )
+    if family == "independent_affine_flow":
+        return (
+            scales.copy(),
+            "lambda",
+            "beta / alpha",
+            "lambda",
+        )
     if family == "scale_conditioned_nf":
         return (
             np.ascontiguousarray(np.log(scales), dtype=np.float64),
@@ -1109,6 +1515,34 @@ def _reported_selection_diagnostics(
         result["selected_tau"] = selected_model_scale
         result["selected_t"] = terminal_time - selected_model_scale
         result["selected_sigma"] = math.sqrt(diffusivity * selected_model_scale)
+    elif model_scale_name == "lambda":
+        schedule = str(model_training["flow_schedule"])
+        result["selected_lambda"] = selected_model_scale
+        if schedule == "log_noise":
+            native_name = "u"
+            native_formula = "log(lambda)"
+            native_value = math.log(selected_model_scale)
+        elif schedule == "rectified_linear":
+            native_name = "t"
+            native_formula = "1 / (1 + lambda)"
+            native_value = 1.0 / (1.0 + selected_model_scale)
+        elif schedule == "vp_trigonometric":
+            native_name = "t"
+            native_formula = "2 * atan(1 / lambda) / pi"
+            native_value = 2.0 * math.atan(1.0 / selected_model_scale) / math.pi
+        else:
+            raise ValueError(f"unsupported affine-flow schedule {schedule!r}")
+        result["affine_flow"] = {
+            "variant_id": str(model_training["flow_variant_id"]),
+            "schedule": schedule,
+            "parameterization": str(model_training["flow_parameterization"]),
+            "scale_semantics": "noise_ratio_lambda=beta/alpha",
+            "selected_native_coordinate": {
+                "name": native_name,
+                "formula": native_formula,
+                "value": native_value,
+            },
+        }
     return result
 
 
@@ -1125,6 +1559,213 @@ def _training_result_record(result: Any) -> dict[str, Any]:
     return _strict_json_value(fields)
 
 
+def _validate_affine_contract(contract: Any, *, training: Mapping[str, Any]) -> None:
+    """Bind an affine model contract to the exact Hydra variant identity."""
+
+    if not isinstance(contract, Mapping):
+        raise TypeError(
+            "independent affine-flow result must expose a model_contract mapping"
+        )
+    expected = {
+        "family": "independent_affine_flow",
+        "scale_semantics": "noise_ratio_lambda=beta/alpha",
+        "variant_id": training["flow_variant_id"],
+        "schedule": training["flow_schedule"],
+        "parameterization": training["flow_parameterization"],
+        "conditioning": training["flow_conditioning"],
+        "scale_sampling": training["flow_scale_sampling"],
+        "loss_weighting": training["flow_loss_weighting"],
+        "noise_ratio_min": float(training["flow_noise_ratio_min"]),
+        "noise_ratio_max": float(training["flow_noise_ratio_max"]),
+        "readouts": list(_AFFINE_READOUTS),
+    }
+    mismatches = {
+        key: {"expected": expected_value, "actual": contract.get(key)}
+        for key, expected_value in expected.items()
+        if contract.get(key) != expected_value
+    }
+    if mismatches:
+        raise RuntimeError(
+            "affine-flow checkpoint contract differs from resolved Hydra config: "
+            f"{mismatches}"
+        )
+
+
+def _validate_affine_training_result(
+    trained: Any, *, training: Mapping[str, Any]
+) -> None:
+    """Bind a trained affine checkpoint to the exact Hydra variant identity."""
+
+    _validate_affine_contract(
+        getattr(trained, "model_contract", None), training=training
+    )
+
+
+def _features_in_model_space(
+    trained: Any, value: npt.ArrayLike, *, label: str
+) -> np.ndarray:
+    """Mirror the predictor's CPU-fp32 normalization exactly."""
+
+    import torch
+
+    raw = torch.as_tensor(value).detach().to(device="cpu", dtype=torch.float32)
+    if raw.ndim < 2 or raw.shape[0] <= 0:
+        raise ValueError(f"{label} must contain a nonempty batch")
+    raw = raw.reshape(raw.shape[0], -1).contiguous()
+    mean_value = getattr(trained, "normalization_mean", None)
+    scale_value = getattr(trained, "normalization_scale", None)
+    if mean_value is None or scale_value is None:
+        raise TypeError(
+            "independent affine-flow result must expose normalization_mean/scale"
+        )
+    mean = (
+        torch.as_tensor(mean_value)
+        .detach()
+        .to(device="cpu", dtype=torch.float32)
+        .reshape(-1)
+    )
+    scale = float(scale_value)
+    if mean.shape != (raw.shape[1],):
+        raise ValueError(f"{label} normalization mean has the wrong shape")
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError(f"{label} normalization scale must be finite and positive")
+    model_space = ((raw - mean.reshape(1, -1)) / scale).contiguous()
+    if not torch.isfinite(model_space).all():
+        raise FloatingPointError(f"{label} model-space features are non-finite")
+    return model_space.numpy()
+
+
+def _run_affine_diagnostics(
+    *,
+    name: str,
+    cell_dir: Path,
+    partition: TrainSelectionPartition,
+    trained: Any,
+    scales: FloatArray,
+    model: Mapping[str, Any],
+    experiment_name: str,
+    log_callback: LogCallback | None,
+    diagnostics_fn: DiagnosticsFunction | None,
+    diagnostics_validate_fn: DiagnosticsValidator | None,
+    primitive_fn: PrimitiveFunction | None,
+) -> dict[str, Any]:
+    """Run, validate, and attest train-only affine diagnostics."""
+
+    if (
+        diagnostics_fn is None
+        or diagnostics_validate_fn is None
+        or primitive_fn is None
+    ):
+        raise RuntimeError(
+            "independent affine-flow diagnostics implementation is missing"
+        )
+    diagnostic_config = model["diagnostics"]
+    if partition.fit_features.shape[0] < int(
+        diagnostic_config["oracle_reference_size"]
+    ):
+        raise PilotConfigError(
+            "diagnostics.oracle_reference_size exceeds optimizer-fit rows"
+        )
+    query_model_space = _features_in_model_space(
+        trained,
+        partition.selection_features,
+        label="train-selection",
+    )
+    reference_model_space = _features_in_model_space(
+        trained,
+        partition.fit_features,
+        label="optimizer-fit oracle reference",
+    )
+    diagnostics_dir = cell_dir / "fm_diagnostics"
+    returned = Path(
+        diagnostics_fn(
+            diagnostics_dir,
+            variant_id=str(model["training"]["flow_variant_id"]),
+            trained=trained,
+            query=partition.selection_features,
+            query_model_space=query_model_space,
+            target=partition.selection_target,
+            oracle_reference_model_space=reference_model_space,
+            scales=scales,
+            config=dict(diagnostic_config),
+            primitive_fn=primitive_fn,
+        )
+    )
+    if returned.resolve() != diagnostics_dir.resolve():
+        raise RuntimeError("FM diagnostics returned an unexpected output directory")
+    diagnostic_errors = diagnostics_validate_fn(diagnostics_dir)
+    if diagnostic_errors:
+        raise RuntimeError(
+            "FM diagnostics failed validation: " + "; ".join(diagnostic_errors)
+        )
+    try:
+        metadata = json.loads((diagnostics_dir / "metadata.json").read_text("utf-8"))
+        diagnostic_summary = json.loads(
+            (diagnostics_dir / "summary.json").read_text("utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"cannot load validated FM diagnostics: {exc}") from exc
+    if not isinstance(metadata, dict) or not isinstance(diagnostic_summary, dict):
+        raise TypeError("validated FM diagnostic JSON roots must be mappings")
+    variant_id = str(model["training"]["flow_variant_id"])
+    if metadata.get("variant_id") != variant_id:
+        raise RuntimeError("FM diagnostic variant differs from Hydra config")
+    if canonical_json(metadata.get("config")) != canonical_json(diagnostic_config):
+        raise RuntimeError("FM diagnostic config differs from resolved Hydra config")
+    if diagnostic_summary.get("variant_id") != variant_id:
+        raise RuntimeError("FM diagnostic summary variant differs from Hydra config")
+    checkpoint_sha = getattr(trained, "checkpoint_sha256", None)
+    if metadata.get("checkpoint_sha256") != checkpoint_sha:
+        raise RuntimeError("FM diagnostics are not bound to the trained checkpoint")
+    raw_query_sha = _array_sha256(partition.selection_features)
+    if metadata.get("raw_query_sha256") != raw_query_sha:
+        raise RuntimeError("FM diagnostics are not bound to the train-selection rows")
+    for row in diagnostic_summary.get("per_scale", []):
+        if not isinstance(row, Mapping):
+            raise TypeError("FM diagnostic per_scale rows must be mappings")
+        _emit(
+            log_callback,
+            f"dataset.{name}.fm_diagnostics.scale",
+            experiment_name=experiment_name,
+            family="independent_affine_flow",
+            dataset=name,
+            step=int(row["scale_index"]),
+            **dict(row),
+        )
+    uploaded_assets = {
+        filename: _log_asset(
+            log_callback,
+            diagnostics_dir / filename,
+            name=f"{PROJECT_NAME}-{variant_id}-{name}-fm-diagnostics-{filename}",
+        )
+        for filename in ("summary.json", "metadata.json", "manifest.json")
+    }
+    record = {
+        "schema_version": 1,
+        "path": "fm_diagnostics",
+        "variant_id": variant_id,
+        "source_split": "train_selection",
+        "protocol": metadata.get("protocol"),
+        "n_query": metadata.get("n_query"),
+        "n_scales": metadata.get("n_scales"),
+        "checkpoint_sha256": checkpoint_sha,
+        "raw_query_sha256": raw_query_sha,
+        "manifest_sha256": sha256_path(diagnostics_dir / "manifest.json"),
+        "metadata_sha256": sha256_path(diagnostics_dir / "metadata.json"),
+        "summary_sha256": sha256_path(diagnostics_dir / "summary.json"),
+    }
+    _emit(
+        log_callback,
+        f"dataset.{name}.fm_diagnostics.completed",
+        experiment_name=experiment_name,
+        family="independent_affine_flow",
+        dataset=name,
+        diagnostics=record,
+        uploaded_assets=uploaded_assets,
+    )
+    return record
+
+
 def _macro_metrics(
     dataset_summaries: Mapping[str, Any], split: str
 ) -> dict[str, float]:
@@ -1138,6 +1779,32 @@ def _macro_metrics(
         ]
         if values:
             result[f"mean_{metric}"] = float(np.mean(values))
+    return result
+
+
+def _macro_frozen_readouts(dataset_summaries: Mapping[str, Any]) -> dict[str, Any]:
+    """Aggregate the three affine readouts without accepting evaluation curves."""
+
+    result: dict[str, Any] = {}
+    for readout in _AFFINE_READOUTS:
+        result[readout] = {}
+        for split in ("train_selection", "validation", "test"):
+            metric_names = ("mae", "rmse", "bias", "median_absolute_error")
+            result[readout][split] = {
+                f"mean_{metric}": float(
+                    np.mean(
+                        [
+                            float(
+                                summary["frozen_readouts"]["readouts"][readout][split][
+                                    metric
+                                ]
+                            )
+                            for summary in dataset_summaries.values()
+                        ]
+                    )
+                )
+                for metric in metric_names
+            }
     return result
 
 
@@ -1189,6 +1856,9 @@ def _run_dataset(
     config: Mapping[str, Any],
     train_fn: TrainFunction,
     predict_fn: PredictFunction,
+    affine_primitive_fn: PrimitiveFunction | None,
+    diagnostics_fn: DiagnosticsFunction | None,
+    diagnostics_validate_fn: DiagnosticsValidator | None,
     log_callback: LogCallback | None,
 ) -> dict[str, Any]:
     model = config["pilot_model"]
@@ -1255,6 +1925,8 @@ def _run_dataset(
             "TrainingResult family mismatch: "
             f"expected {_FAMILY_FOR_ARTIFACTS[family]!r}, got {actual_family!r}"
         )
+    if family == "independent_affine_flow":
+        _validate_affine_training_result(trained, training=model["training"])
 
     scales = np.asarray(model["scales"], dtype=np.float64)
     train_selection_curve = _prediction_curve(
@@ -1320,6 +1992,21 @@ def _run_dataset(
         train_selection=train_selection_metrics,
         partition=partition.record,
     )
+    fm_diagnostics_record: dict[str, Any] | None = None
+    if family == "independent_affine_flow":
+        fm_diagnostics_record = _run_affine_diagnostics(
+            name=name,
+            cell_dir=cell_dir,
+            partition=partition,
+            trained=trained,
+            scales=scales,
+            model=model,
+            experiment_name=experiment_name,
+            log_callback=log_callback,
+            diagnostics_fn=diagnostics_fn,
+            diagnostics_validate_fn=diagnostics_validate_fn,
+            primitive_fn=affine_primitive_fn,
+        )
     # The selected index is immutable before either benchmark evaluation split
     # is touched. Even their feature/target arrays are intentionally resolved
     # below this boundary. Each split is evaluated exactly once at the frozen
@@ -1327,28 +2014,56 @@ def _run_dataset(
     selected_scale = float(scales[selected_index])
     validation = _flatten_features(splits["val"])
     validation_target = np.ravel(np.asarray(splits["val"].lid, dtype=np.float64))
-    validation_prediction = _prediction_at_scale(
-        predict_fn=predict_fn,
-        trained=trained,
-        query=validation,
-        scale=selected_scale,
-        family=family,
-        model=model,
-        evaluation=evaluation,
-    )
-    _require_all_finite(validation_prediction, label="validation prediction")
-    validation_metrics = known_lid_metrics(validation_prediction, validation_target)
     test = _flatten_features(splits["test"])
     test_target = np.ravel(np.asarray(splits["test"].lid, dtype=np.float64))
-    test_prediction = _prediction_at_scale(
-        predict_fn=predict_fn,
-        trained=trained,
-        query=test,
-        scale=selected_scale,
-        family=family,
-        model=model,
-        evaluation=evaluation,
-    )
+
+    frozen_readout_predictions: dict[str, dict[str, FloatArray]] | None = None
+    frozen_readout_summary: dict[str, Any] | None = None
+    if family == "independent_affine_flow":
+        frozen_readout_predictions, frozen_readout_summary = _frozen_affine_readouts(
+            predict_fn=predict_fn,
+            trained=trained,
+            selected_lambda=selected_scale,
+            model=model,
+            evaluation=evaluation,
+            split_queries={
+                "train_selection": partition.selection_features,
+                "validation": validation,
+                "test": test,
+            },
+            split_targets={
+                "train_selection": partition.selection_target,
+                "validation": validation_target,
+                "test": test_target,
+            },
+            primary_predictions={
+                "train_selection": train_selection_prediction,
+            },
+            primitive_fn=affine_primitive_fn,
+        )
+        validation_prediction = frozen_readout_predictions["validation"]["full"]
+        test_prediction = frozen_readout_predictions["test"]["full"]
+    else:
+        validation_prediction = _prediction_at_scale(
+            predict_fn=predict_fn,
+            trained=trained,
+            query=validation,
+            scale=selected_scale,
+            family=family,
+            model=model,
+            evaluation=evaluation,
+        )
+        test_prediction = _prediction_at_scale(
+            predict_fn=predict_fn,
+            trained=trained,
+            query=test,
+            scale=selected_scale,
+            family=family,
+            model=model,
+            evaluation=evaluation,
+        )
+    _require_all_finite(validation_prediction, label="validation prediction")
+    validation_metrics = known_lid_metrics(validation_prediction, validation_target)
     _require_all_finite(test_prediction, label="test prediction")
     test_metrics = known_lid_metrics(test_prediction, test_target)
 
@@ -1362,6 +2077,10 @@ def _run_dataset(
     _save_npy(cell_dir / "test_prediction.npy", test_prediction)
     _save_npy(cell_dir / "validation_target.npy", validation_target)
     _save_npy(cell_dir / "test_target.npy", test_target)
+    if frozen_readout_predictions is not None:
+        for split, predictions in frozen_readout_predictions.items():
+            for readout, prediction in predictions.items():
+                _save_npy(cell_dir / f"{split}_prediction__{readout}.npy", prediction)
     history = getattr(trained, "history", [])
     _write_json(cell_dir / "training_history.json", history)
 
@@ -1428,6 +2147,10 @@ def _run_dataset(
         "validation": validation_metrics,
         "test": test_metrics,
     }
+    if frozen_readout_summary is not None:
+        summary["frozen_readouts"] = frozen_readout_summary
+    if fm_diagnostics_record is not None:
+        summary["fm_diagnostics"] = fm_diagnostics_record
     _write_json(cell_dir / "summary.json", summary)
     _emit(
         log_callback,
@@ -1440,6 +2163,11 @@ def _run_dataset(
         model_scale=selection_diagnostics["model_scale"],
         validation=validation_metrics,
         test=test_metrics,
+        **(
+            {"frozen_readouts": frozen_readout_summary}
+            if frozen_readout_summary is not None
+            else {}
+        ),
     )
     return summary
 
@@ -1451,6 +2179,9 @@ def run_pilot(
     output_root: Path | None = None,
     train_fn: TrainFunction | None = None,
     predict_fn: PredictFunction | None = None,
+    affine_primitive_fn: PrimitiveFunction | None = None,
+    diagnostics_fn: DiagnosticsFunction | None = None,
+    diagnostics_validate_fn: DiagnosticsValidator | None = None,
     log_callback: LogCallback | None = None,
 ) -> Path:
     """Train three dataset-specific models and write a sealed experiment."""
@@ -1462,6 +2193,29 @@ def run_pilot(
 
         train_fn = train_model if train_fn is None else train_fn
         predict_fn = predict_lid if predict_fn is None else predict_fn
+    if (
+        config["pilot_model"]["family"] == "independent_affine_flow"
+        and affine_primitive_fn is None
+    ):
+        from models.training import predict_affine_primitives
+
+        affine_primitive_fn = predict_affine_primitives
+    if config["pilot_model"]["family"] == "independent_affine_flow" and (
+        diagnostics_fn is None or diagnostics_validate_fn is None
+    ):
+        from experiments.fm_diagnostics import (
+            run_fm_diagnostics,
+            validate_fm_diagnostics,
+        )
+
+        diagnostics_fn = (
+            run_fm_diagnostics if diagnostics_fn is None else diagnostics_fn
+        )
+        diagnostics_validate_fn = (
+            validate_fm_diagnostics
+            if diagnostics_validate_fn is None
+            else diagnostics_validate_fn
+        )
     _, _, _, loaded, input_record = _load_inputs(root=project_root, config=config)
     input_sha = _input_identity(input_record)
     config_sha = sha256_bytes(canonical_json(config).encode("utf-8"))
@@ -1483,7 +2237,12 @@ def run_pilot(
         selected_output = project_root / selected_output
     selected_output = selected_output.resolve()
     family = str(config["pilot_model"]["family"])
-    final_dir = selected_output / f"{family}__{run_id}"
+    run_label = (
+        str(config["pilot_model"]["training"]["flow_variant_id"])
+        if family == "independent_affine_flow"
+        else family
+    )
+    final_dir = selected_output / f"{run_label}__{run_id}"
     if final_dir.exists():
         errors = validate_pilot_experiment(final_dir)
         if errors:
@@ -1493,7 +2252,7 @@ def run_pilot(
         return final_dir
 
     selected_output.mkdir(parents=True, exist_ok=True)
-    work_dir = selected_output / f".{family}__{run_id}.incomplete-{os.getpid()}"
+    work_dir = selected_output / f".{run_label}__{run_id}.incomplete-{os.getpid()}"
     if work_dir.exists():
         raise RuntimeError(f"pilot work directory already exists: {work_dir}")
     work_dir.mkdir()
@@ -1515,6 +2274,9 @@ def run_pilot(
             config=config,
             train_fn=train_fn,
             predict_fn=predict_fn,
+            affine_primitive_fn=affine_primitive_fn,
+            diagnostics_fn=diagnostics_fn,
+            diagnostics_validate_fn=diagnostics_validate_fn,
             log_callback=log_callback,
         )
     aggregate = {
@@ -1535,6 +2297,8 @@ def run_pilot(
         "macro_validation": _macro_metrics(summaries, "validation"),
         "macro_test": _macro_metrics(summaries, "test"),
     }
+    if family == "independent_affine_flow":
+        aggregate["macro_frozen_readouts"] = _macro_frozen_readouts(summaries)
     _write_json(work_dir / "summary.json", aggregate)
     artifact_registry = _artifact_registry(run_dir=work_dir, datasets=summaries)
     _write_yaml(work_dir / "artifact_registry.yaml", artifact_registry)
@@ -1586,6 +2350,11 @@ def run_pilot(
         macro_train_selection=aggregate["macro_train_selection"],
         macro_validation=aggregate["macro_validation"],
         macro_test=aggregate["macro_test"],
+        **(
+            {"macro_frozen_readouts": aggregate["macro_frozen_readouts"]}
+            if family == "independent_affine_flow"
+            else {}
+        ),
         shared_filesystem_run_dir=str(final_dir),
         summary_path=str(final_dir / "summary.json"),
         manifest_path=str(final_dir / "manifest.json"),
@@ -1615,6 +2384,52 @@ def _load_numeric_output(path: Path) -> np.ndarray:
     return value
 
 
+def _affine_diagnostic_binding_errors(
+    *,
+    dataset_name: str,
+    metadata: Mapping[str, Any],
+    diagnostic_scales: npt.ArrayLike,
+    diagnostic_target: npt.ArrayLike,
+    diagnostic_full: npt.ArrayLike,
+    cell_arrays: Mapping[str, npt.ArrayLike],
+    summary: Mapping[str, Any],
+    checkpoint_path: Path,
+) -> list[str]:
+    """Bind a self-valid diagnostic tree to this exact trained cell."""
+
+    errors: list[str] = []
+    checkpoint_sha = sha256_path(checkpoint_path)
+    scale_selection = summary.get("scale_selection")
+    partition = (
+        scale_selection.get("partition", {})
+        if isinstance(scale_selection, Mapping)
+        else {}
+    )
+    raw_query_sha = (
+        partition.get("selection_features_sha256")
+        if isinstance(partition, Mapping)
+        else None
+    )
+    if (
+        metadata.get("checkpoint_sha256") != checkpoint_sha
+        or summary.get("checkpoint_sha256") != checkpoint_sha
+    ):
+        errors.append(f"{dataset_name}: FM diagnostics are not bound to checkpoint.pt")
+    if metadata.get("raw_query_sha256") != raw_query_sha:
+        errors.append(
+            f"{dataset_name}: FM diagnostics are not bound to the train-selection rows"
+        )
+    if not np.array_equal(diagnostic_scales, cell_arrays["scales"]):
+        errors.append(f"{dataset_name}: FM diagnostic scales differ from selection")
+    if not np.array_equal(diagnostic_target, cell_arrays["train_selection_target"]):
+        errors.append(f"{dataset_name}: FM diagnostic targets differ from selection")
+    if not np.array_equal(diagnostic_full, cell_arrays["train_selection_curve"]):
+        errors.append(
+            f"{dataset_name}: FM diagnostic full curve differs from selection"
+        )
+    return errors
+
+
 def _validate_selection_cell(
     *,
     directory: Path,
@@ -1627,6 +2442,7 @@ def _validate_selection_cell(
 
     cell = directory / "datasets" / dataset_name
     errors: list[str] = []
+    model = config["pilot_model"]
     try:
         summary_value = json.loads((cell / "summary.json").read_text("utf-8"))
         if not isinstance(summary_value, dict):
@@ -1650,6 +2466,11 @@ def _validate_selection_cell(
                 "test_target",
             )
         }
+        if model["family"] == "independent_affine_flow":
+            for split in ("train_selection", "validation", "test"):
+                for readout in _AFFINE_READOUTS:
+                    key = f"{split}_prediction__{readout}"
+                    arrays[key] = _load_numeric_output(cell / f"{key}.npy")
     except (
         OSError,
         UnicodeError,
@@ -1660,16 +2481,124 @@ def _validate_selection_cell(
     ) as exc:
         return [f"{dataset_name}: invalid selection artifact: {exc}"], None
 
-    for forbidden_name in ("validation_curve.npy", "test_curve.npy"):
-        if (cell / forbidden_name).exists():
+    for forbidden_path in tuple(cell.glob("validation_curve*.npy")) + tuple(
+        cell.glob("test_curve*.npy")
+    ):
+        if forbidden_path.exists():
             errors.append(
                 f"{dataset_name}: retrospective evaluation artifact is forbidden: "
-                f"{forbidden_name}"
+                f"{forbidden_path.name}"
             )
 
-    model = config["pilot_model"]
     evaluation = config["evaluation"]
     selection = evaluation["selection"]
+    if canonical_json(training_value.get("model")) != canonical_json(model):
+        errors.append(f"{dataset_name}: training.yaml model differs from Hydra config")
+    if model["family"] == "independent_affine_flow":
+        summary_model = summary.get("model")
+        model_contract = (
+            summary_model.get("model_contract")
+            if isinstance(summary_model, Mapping)
+            else None
+        )
+        try:
+            _validate_affine_contract(
+                model_contract,
+                training=model["training"],
+            )
+        except (RuntimeError, TypeError) as exc:
+            errors.append(f"{dataset_name}: invalid affine-flow model contract: {exc}")
+        diagnostics_dir = cell / "fm_diagnostics"
+        try:
+            from experiments.fm_diagnostics import validate_fm_diagnostics
+
+            diagnostic_errors = validate_fm_diagnostics(diagnostics_dir)
+            metadata_value = json.loads(
+                (diagnostics_dir / "metadata.json").read_text(encoding="utf-8")
+            )
+            if not isinstance(metadata_value, dict):
+                raise TypeError("FM diagnostics metadata must be a mapping")
+            diagnostic_scales = _load_numeric_output(
+                diagnostics_dir / "arrays" / "scales.npy"
+            )
+            diagnostic_target = _load_numeric_output(
+                diagnostics_dir / "arrays" / "target.npy"
+            )
+            diagnostic_full = _load_numeric_output(
+                diagnostics_dir / "arrays" / "full.npy"
+            )
+            checkpoint_sha = sha256_path(cell / "checkpoint.pt")
+            scale_selection_record = summary.get("scale_selection")
+            partition_record = (
+                scale_selection_record.get("partition", {})
+                if isinstance(scale_selection_record, Mapping)
+                else {}
+            )
+            raw_query_sha = (
+                partition_record.get("selection_features_sha256")
+                if isinstance(partition_record, Mapping)
+                else None
+            )
+            expected_diagnostic_record = {
+                "schema_version": 1,
+                "path": "fm_diagnostics",
+                "variant_id": model["training"]["flow_variant_id"],
+                "source_split": "train_selection",
+                "protocol": metadata_value.get("protocol"),
+                "n_query": metadata_value.get("n_query"),
+                "n_scales": metadata_value.get("n_scales"),
+                "checkpoint_sha256": checkpoint_sha,
+                "raw_query_sha256": raw_query_sha,
+                "manifest_sha256": sha256_path(diagnostics_dir / "manifest.json"),
+                "metadata_sha256": sha256_path(diagnostics_dir / "metadata.json"),
+                "summary_sha256": sha256_path(diagnostics_dir / "summary.json"),
+            }
+        except (
+            OSError,
+            TypeError,
+            UnicodeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as exc:
+            errors.append(f"{dataset_name}: invalid FM diagnostics: {exc}")
+        else:
+            errors.extend(
+                f"{dataset_name}: invalid FM diagnostics: {error}"
+                for error in diagnostic_errors
+            )
+            if canonical_json(metadata_value.get("config")) != canonical_json(
+                model["diagnostics"]
+            ):
+                errors.append(
+                    f"{dataset_name}: FM diagnostic config differs from Hydra"
+                )
+            if metadata_value.get("variant_id") != model["training"]["flow_variant_id"]:
+                errors.append(
+                    f"{dataset_name}: FM diagnostic variant differs from Hydra"
+                )
+            errors.extend(
+                _affine_diagnostic_binding_errors(
+                    dataset_name=dataset_name,
+                    metadata=metadata_value,
+                    diagnostic_scales=diagnostic_scales,
+                    diagnostic_target=diagnostic_target,
+                    diagnostic_full=diagnostic_full,
+                    cell_arrays=arrays,
+                    summary=summary,
+                    checkpoint_path=cell / "checkpoint.pt",
+                )
+            )
+            if canonical_json(summary.get("fm_diagnostics")) != canonical_json(
+                expected_diagnostic_record
+            ):
+                errors.append(
+                    f"{dataset_name}: FM diagnostic attestation does not recompute"
+                )
+    else:
+        if (cell / "fm_diagnostics").exists() or "fm_diagnostics" in summary:
+            errors.append(
+                f"{dataset_name}: FM diagnostics are reserved for affine flow"
+            )
     scales = np.ravel(np.asarray(arrays["scales"], dtype=np.float64))
     configured_scales = np.asarray(model["scales"], dtype=np.float64)
     if not np.array_equal(scales, configured_scales):
@@ -1855,6 +2784,79 @@ def _validate_selection_cell(
             metric = known_lid_metrics(prediction, target)
             if canonical_json(summary.get(split)) != canonical_json(metric):
                 errors.append(f"{dataset_name}: {split} metrics do not recompute")
+
+        if model["family"] == "independent_affine_flow":
+            expected_readout_metrics: dict[str, Any] = {}
+            target_by_split = {
+                "train_selection": selection_target,
+                "validation": np.ravel(
+                    np.asarray(arrays["validation_target"], dtype=np.float64)
+                ),
+                "test": np.ravel(np.asarray(arrays["test_target"], dtype=np.float64)),
+            }
+            primary_by_split = {
+                "train_selection": np.ravel(
+                    np.asarray(arrays["train_selection_prediction"], dtype=np.float64)
+                ),
+                "validation": np.ravel(
+                    np.asarray(arrays["validation_prediction"], dtype=np.float64)
+                ),
+                "test": np.ravel(
+                    np.asarray(arrays["test_prediction"], dtype=np.float64)
+                ),
+            }
+            for readout in _AFFINE_READOUTS:
+                expected_readout_metrics[readout] = {}
+                for split, target in target_by_split.items():
+                    prediction = np.ravel(
+                        np.asarray(
+                            arrays[f"{split}_prediction__{readout}"],
+                            dtype=np.float64,
+                        )
+                    )
+                    if prediction.shape != target.shape:
+                        errors.append(
+                            f"{dataset_name}: invalid {split} {readout} "
+                            "frozen prediction shape"
+                        )
+                        continue
+                    if not np.isfinite(prediction).all():
+                        errors.append(
+                            f"{dataset_name}: non-finite {split} {readout} output"
+                        )
+                        continue
+                    if readout == "full" and not np.array_equal(
+                        prediction, primary_by_split[split]
+                    ):
+                        errors.append(
+                            f"{dataset_name}: frozen full {split} output differs "
+                            "from primary prediction"
+                        )
+                    expected_readout_metrics[readout][split] = known_lid_metrics(
+                        prediction, target
+                    )
+            expected_frozen_readouts = {
+                "schema_version": 1,
+                "scale_semantics": "noise_ratio_lambda=beta/alpha",
+                "selected_lambda": float(scales[selected_index]),
+                "primary_readout": "full",
+                "scale_selected_with_readout": "full",
+                "validation_candidate_count_per_readout": 1,
+                "test_candidate_count_per_readout": 1,
+                "retrospective_validation_curves_saved": False,
+                "retrospective_test_curves_saved": False,
+                "readouts": expected_readout_metrics,
+            }
+            if canonical_json(summary.get("frozen_readouts")) != canonical_json(
+                expected_frozen_readouts
+            ):
+                errors.append(
+                    f"{dataset_name}: frozen affine readout metrics do not recompute"
+                )
+        elif "frozen_readouts" in summary:
+            errors.append(
+                f"{dataset_name}: frozen_readouts is reserved for affine flow"
+            )
 
     expected_attestation = {
         "selection_protocol": TRAIN_SELECTION_PROTOCOL,
@@ -2076,6 +3078,23 @@ def validate_pilot_experiment(
                 expected_macro = _macro_metrics(cell_summaries, split)
                 if aggregate_value.get(field) != expected_macro:
                     errors.append(f"{field} does not recompute from dataset summaries")
+            if resolved["pilot_model"]["family"] == "independent_affine_flow":
+                try:
+                    expected_readouts = _macro_frozen_readouts(cell_summaries)
+                except (KeyError, TypeError, ValueError) as exc:
+                    errors.append(f"macro_frozen_readouts cannot be recomputed: {exc}")
+                else:
+                    if (
+                        aggregate_value.get("macro_frozen_readouts")
+                        != expected_readouts
+                    ):
+                        errors.append(
+                            "macro_frozen_readouts does not recompute from datasets"
+                        )
+            elif "macro_frozen_readouts" in aggregate_value:
+                errors.append(
+                    "aggregate macro_frozen_readouts is reserved for affine flow"
+                )
             for key, expected in {
                 "selection_protocol": TRAIN_SELECTION_PROTOCOL,
                 "selection_target_split": "train_selection",
@@ -2121,7 +3140,14 @@ def _logging_callback(
         ) from exc
     return create_comet_callback(
         experiment_name=str(config["logging"]["experiment_name"]),
-        tags=(str(config["pilot_model"]["family"]),),
+        tags=tuple(
+            dict.fromkeys(
+                (
+                    str(config["pilot_model"]["family"]),
+                    str(config["pilot_model"]["name"]),
+                )
+            )
+        ),
     )
 
 
