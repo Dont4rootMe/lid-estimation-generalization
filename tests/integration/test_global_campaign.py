@@ -9,6 +9,8 @@ from typing import Any
 
 import numpy as np
 import pytest
+from hydra import initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
 
 from experiments import global_campaign
 from experiments.comet_logging import CometConfigurationError
@@ -28,6 +30,93 @@ from experiments.run_manifest import canonical_json, sha256_bytes, sha256_path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_SHA = "4" * 64
+
+
+def test_real_hydra_entrypoint_can_resolve_every_nested_pilot_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    observed: dict[str, Any] = {}
+
+    def validate_only(config):
+        hydra_before = GlobalHydra.instance().hydra
+        observed["config"] = validate_global_campaign_config(config)
+        observed["plans"] = global_campaign.model_plans(observed["config"])
+        assert GlobalHydra.instance().hydra is hydra_before
+        return tmp_path / "validated"
+
+    monkeypatch.setattr(global_campaign, "run_global_campaign", validate_only)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "global_campaign",
+            "logging.backend=none",
+            f"hydra.run.dir={tmp_path / 'hydra'}",
+        ],
+    )
+
+    global_campaign.main()
+
+    assert (
+        tuple(row["id"] for row in observed["config"]["campaign"]["models"])
+        == global_campaign.APPROVED_MODEL_VARIANTS
+    )
+    assert tuple(plan.variant_id for plan in observed["plans"]) == (
+        global_campaign.APPROVED_MODEL_VARIANTS
+    )
+    assert not GlobalHydra.instance().is_initialized()
+
+
+def test_nested_pilot_compose_rejects_an_unapproved_active_hydra_path(
+    tmp_path: Path,
+) -> None:
+    with (
+        initialize_config_dir(version_base="1.3", config_dir=str(tmp_path.resolve())),
+        pytest.raises(
+            GlobalCampaignError,
+            match="cannot compose approved pilot model",
+        ) as error,
+    ):
+        global_campaign._resolved_pilot_model("diffusion", 0)
+    assert isinstance(error.value.__cause__, GlobalCampaignError)
+    assert "active Hydra search path differs" in str(error.value.__cause__)
+
+
+def test_nested_pilot_compose_rejects_an_extra_package_search_provider() -> None:
+    config_dir = (PROJECT_ROOT / "configs").resolve()
+    with initialize_config_dir(version_base="1.3", config_dir=str(config_dir)):
+        search_path = GlobalHydra.instance().hydra.config_loader.get_search_path()
+        search_path.prepend(provider="unapproved", path="pkg://unapproved.configs")
+        with pytest.raises(
+            GlobalCampaignError,
+            match="cannot compose approved pilot model",
+        ) as error:
+            global_campaign._resolved_pilot_model("diffusion", 0)
+    assert isinstance(error.value.__cause__, GlobalCampaignError)
+    assert "active Hydra search path differs" in str(error.value.__cause__)
+
+
+def test_nested_pilot_compose_rejects_a_shadowed_pilot_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_dir = (PROJECT_ROOT / "configs").resolve()
+    with initialize_config_dir(version_base="1.3", config_dir=str(config_dir)):
+        repository = GlobalHydra.instance().hydra.config_loader.repository
+        original_load_config = repository.load_config
+
+        def shadow_pilot(config_name: str):
+            if config_name == "pilot.yaml":
+                return SimpleNamespace(provider="main", path="pkg://experiments")
+            return original_load_config(config_name)
+
+        monkeypatch.setattr(repository, "load_config", shadow_pilot)
+        with pytest.raises(
+            GlobalCampaignError,
+            match="cannot compose approved pilot model",
+        ) as error:
+            global_campaign._resolved_pilot_model("diffusion", 0)
+    assert isinstance(error.value.__cause__, GlobalCampaignError)
+    assert "selected an unapproved source" in str(error.value.__cause__)
 
 
 def _tiny_plans(config: dict[str, Any]) -> tuple[ModelPlan, ...]:

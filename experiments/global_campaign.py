@@ -38,6 +38,7 @@ import numpy as np
 import numpy.typing as npt
 import yaml
 from hydra import compose, initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
 from omegaconf import DictConfig, OmegaConf
 
 from datasets.registry import (
@@ -352,9 +353,56 @@ def _positive_int(value: Any, *, field: str) -> int:
 
 def _resolved_pilot_model(variant_id: str, seed: int) -> dict[str, Any]:
     try:
-        pilot = validate_pilot_config(
-            compose_pilot_config((f"pilot_model={variant_id}", f"seed={seed}"))
-        )
+        overrides = (f"pilot_model={variant_id}", f"seed={seed}")
+        global_hydra = GlobalHydra.instance()
+        if global_hydra.is_initialized():
+            search_path = global_hydra.hydra.config_loader.get_search_path()
+            approved_config_dir = _config_dir().resolve()
+            actual_search_path = tuple(
+                (str(entry.provider), str(entry.path))
+                for entry in search_path.config_search_path
+            )
+            approved_library_search_path = (
+                ("hydra", "pkg://hydra.conf"),
+                ("main", str(approved_config_dir)),
+                ("schema", "structured://"),
+            )
+            approved_cli_search_path = (
+                ("hydra", "pkg://hydra.conf"),
+                ("main", "pkg://experiments"),
+                ("command-line", approved_config_dir.as_uri()),
+                ("schema", "structured://"),
+            )
+            approved_layouts = {
+                approved_library_search_path: "main",
+                approved_cli_search_path: "command-line",
+            }
+            if actual_search_path not in approved_layouts:
+                raise GlobalCampaignError(
+                    "active Hydra search path differs from the exact approved library "
+                    "and CLI layouts"
+                )
+            expected_provider = approved_layouts[actual_search_path]
+            expected_path = approved_config_dir.as_uri()
+            for config_name in (
+                "pilot.yaml",
+                f"pilot_model/{variant_id}.yaml",
+            ):
+                selected = global_hydra.hydra.config_loader.repository.load_config(
+                    config_name
+                )
+                if (
+                    selected is None
+                    or selected.provider != expected_provider
+                    or selected.path != expected_path
+                ):
+                    raise GlobalCampaignError(
+                        f"active Hydra selected an unapproved source for {config_name!r}"
+                    )
+            pilot_config = compose(config_name="pilot", overrides=list(overrides))
+        else:
+            pilot_config = compose_pilot_config(overrides)
+        pilot = validate_pilot_config(pilot_config)
     except Exception as exc:
         raise GlobalCampaignError(
             f"cannot compose approved pilot model {variant_id!r}"
