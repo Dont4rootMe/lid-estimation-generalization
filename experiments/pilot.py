@@ -129,6 +129,7 @@ _AFFINE_VARIANTS: dict[str, dict[str, str]] = {
     },
 }
 _AFFINE_READOUTS = ("response", "full", "fm_to_score")
+_AFFINE_OUTER_CURVE_ROUNDOFF_UNITS = 64.0
 _AFFINE_SCALE_GRID = np.asarray(
     (0.01, 0.0178, 0.0316, 0.0562, 0.1, 0.1778, 0.3162, 0.5623, 1.0),
     dtype=np.float64,
@@ -1283,6 +1284,83 @@ def _array_sha256(value: npt.ArrayLike) -> str:
     return digest.hexdigest()
 
 
+def _affine_outer_curve_consistency_error(
+    *,
+    diagnostic_full: npt.ArrayLike,
+    diagnostic_response: npt.ArrayLike,
+    diagnostic_correction: npt.ArrayLike,
+    outer_selection_curve: npt.ArrayLike,
+) -> str | None:
+    """Compare independently evaluated affine readouts by a forward-error bound.
+
+    The outer selector and the diagnostic runner evaluate the same checkpoint,
+    rows, probes, and scales through independent code paths.  Requiring their
+    floating-point results to be bitwise identical is invalid: even a different
+    association of ``response + correction`` can change the last few float64
+    bits.  The conditioning scale for that addition is
+    ``abs(response) + abs(correction)``, including cancellation cases where the
+    final full readout is small.  Sixty-four float64 unit roundoffs is a tight,
+    deterministic allowance for the duplicated conversion/readout arithmetic.
+
+    Cryptographic identity is deliberately handled separately by
+    ``outer_selection_curve_sha256``.  This function only establishes that the
+    independently recomputed inner curve is numerically the same computation.
+    """
+
+    full = np.asarray(diagnostic_full, dtype=np.float64)
+    response = np.asarray(diagnostic_response, dtype=np.float64)
+    correction = np.asarray(diagnostic_correction, dtype=np.float64)
+    outer = np.asarray(outer_selection_curve, dtype=np.float64)
+    shapes = {
+        "diagnostic_full": full.shape,
+        "diagnostic_response": response.shape,
+        "diagnostic_correction": correction.shape,
+        "outer_selection_curve": outer.shape,
+    }
+    if len(set(shapes.values())) != 1 or full.ndim != 2:
+        return f"FM diagnostic/selection curve shape mismatch: {shapes}"
+    if full.size == 0:
+        return "FM diagnostic/selection curves must be nonempty"
+    for label, value in (
+        ("diagnostic full", full),
+        ("diagnostic response", response),
+        ("diagnostic correction", correction),
+        ("outer selection", outer),
+    ):
+        if not np.isfinite(value).all():
+            return f"{label} curve contains non-finite values"
+
+    magnitude = np.maximum.reduce(
+        (
+            np.ones_like(full),
+            np.abs(full),
+            np.abs(outer),
+            np.abs(response) + np.abs(correction),
+        )
+    )
+    allowance = (
+        _AFFINE_OUTER_CURVE_ROUNDOFF_UNITS * float(np.finfo(np.float64).eps) * magnitude
+    )
+    error = np.abs(full - outer)
+    violations = error > allowance
+    if not np.any(violations):
+        return None
+    normalized = np.divide(
+        error,
+        allowance,
+        out=np.full_like(error, np.inf),
+        where=allowance > 0.0,
+    )
+    index = tuple(
+        int(value) for value in np.unravel_index(np.argmax(normalized), full.shape)
+    )
+    return (
+        "FM diagnostic full curve exceeds conditioned roundoff bound at "
+        f"index={index}: abs_error={float(error[index]):.17g}, "
+        f"allowance={float(allowance[index]):.17g}"
+    )
+
+
 def _deterministic_selection_indices(
     n_samples: int, *, subset_size: int, seed: int
 ) -> npt.NDArray[np.int64]:
@@ -1642,6 +1720,7 @@ def _run_affine_diagnostics(
     partition: TrainSelectionPartition,
     trained: Any,
     scales: FloatArray,
+    selection_curve: FloatArray,
     model: Mapping[str, Any],
     experiment_name: str,
     log_callback: LogCallback | None,
@@ -1676,11 +1755,13 @@ def _run_affine_diagnostics(
         partition.fit_features,
         label="optimizer-fit oracle reference",
     )
+    outer_selection_curve_sha = _array_sha256(selection_curve)
     diagnostics_dir = cell_dir / "fm_diagnostics"
     returned = Path(
         diagnostics_fn(
             diagnostics_dir,
             variant_id=str(model["training"]["flow_variant_id"]),
+            outer_selection_curve_sha256=outer_selection_curve_sha,
             trained=trained,
             query=partition.selection_features,
             query_model_space=query_model_space,
@@ -1717,9 +1798,33 @@ def _run_affine_diagnostics(
     checkpoint_sha = getattr(trained, "checkpoint_sha256", None)
     if metadata.get("checkpoint_sha256") != checkpoint_sha:
         raise RuntimeError("FM diagnostics are not bound to the trained checkpoint")
+    if metadata.get("outer_selection_curve_sha256") != outer_selection_curve_sha:
+        raise RuntimeError(
+            "FM diagnostics are not cryptographically bound to the outer "
+            "train-selection curve"
+        )
     raw_query_sha = _array_sha256(partition.selection_features)
     if metadata.get("raw_query_sha256") != raw_query_sha:
         raise RuntimeError("FM diagnostics are not bound to the train-selection rows")
+    try:
+        curve_error = _affine_outer_curve_consistency_error(
+            diagnostic_full=_load_numeric_output(
+                diagnostics_dir / "arrays" / "full.npy"
+            ),
+            diagnostic_response=_load_numeric_output(
+                diagnostics_dir / "arrays" / "response.npy"
+            ),
+            diagnostic_correction=_load_numeric_output(
+                diagnostics_dir / "arrays" / "correction.npy"
+            ),
+            outer_selection_curve=selection_curve,
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"cannot bind FM diagnostics to the outer selection curve: {exc}"
+        ) from exc
+    if curve_error is not None:
+        raise RuntimeError(curve_error)
     for row in diagnostic_summary.get("per_scale", []):
         if not isinstance(row, Mapping):
             raise TypeError("FM diagnostic per_scale rows must be mappings")
@@ -1741,7 +1846,7 @@ def _run_affine_diagnostics(
         for filename in ("summary.json", "metadata.json", "manifest.json")
     }
     record = {
-        "schema_version": 1,
+        "schema_version": metadata.get("schema_version"),
         "path": "fm_diagnostics",
         "variant_id": variant_id,
         "source_split": "train_selection",
@@ -1749,6 +1854,7 @@ def _run_affine_diagnostics(
         "n_query": metadata.get("n_query"),
         "n_scales": metadata.get("n_scales"),
         "checkpoint_sha256": checkpoint_sha,
+        "outer_selection_curve_sha256": outer_selection_curve_sha,
         "raw_query_sha256": raw_query_sha,
         "manifest_sha256": sha256_path(diagnostics_dir / "manifest.json"),
         "metadata_sha256": sha256_path(diagnostics_dir / "metadata.json"),
@@ -2000,6 +2106,7 @@ def _run_dataset(
             partition=partition,
             trained=trained,
             scales=scales,
+            selection_curve=train_selection_curve,
             model=model,
             experiment_name=experiment_name,
             log_callback=log_callback,
@@ -2391,6 +2498,8 @@ def _affine_diagnostic_binding_errors(
     diagnostic_scales: npt.ArrayLike,
     diagnostic_target: npt.ArrayLike,
     diagnostic_full: npt.ArrayLike,
+    diagnostic_response: npt.ArrayLike,
+    diagnostic_correction: npt.ArrayLike,
     cell_arrays: Mapping[str, npt.ArrayLike],
     summary: Mapping[str, Any],
     checkpoint_path: Path,
@@ -2419,14 +2528,24 @@ def _affine_diagnostic_binding_errors(
         errors.append(
             f"{dataset_name}: FM diagnostics are not bound to the train-selection rows"
         )
+    outer_curve_sha = _array_sha256(cell_arrays["train_selection_curve"])
+    if metadata.get("outer_selection_curve_sha256") != outer_curve_sha:
+        errors.append(
+            f"{dataset_name}: FM diagnostics are not cryptographically bound to "
+            "the train-selection curve"
+        )
     if not np.array_equal(diagnostic_scales, cell_arrays["scales"]):
         errors.append(f"{dataset_name}: FM diagnostic scales differ from selection")
     if not np.array_equal(diagnostic_target, cell_arrays["train_selection_target"]):
         errors.append(f"{dataset_name}: FM diagnostic targets differ from selection")
-    if not np.array_equal(diagnostic_full, cell_arrays["train_selection_curve"]):
-        errors.append(
-            f"{dataset_name}: FM diagnostic full curve differs from selection"
-        )
+    curve_error = _affine_outer_curve_consistency_error(
+        diagnostic_full=diagnostic_full,
+        diagnostic_response=diagnostic_response,
+        diagnostic_correction=diagnostic_correction,
+        outer_selection_curve=cell_arrays["train_selection_curve"],
+    )
+    if curve_error is not None:
+        errors.append(f"{dataset_name}: {curve_error}")
     return errors
 
 
@@ -2527,6 +2646,12 @@ def _validate_selection_cell(
             diagnostic_full = _load_numeric_output(
                 diagnostics_dir / "arrays" / "full.npy"
             )
+            diagnostic_response = _load_numeric_output(
+                diagnostics_dir / "arrays" / "response.npy"
+            )
+            diagnostic_correction = _load_numeric_output(
+                diagnostics_dir / "arrays" / "correction.npy"
+            )
             checkpoint_sha = sha256_path(cell / "checkpoint.pt")
             scale_selection_record = summary.get("scale_selection")
             partition_record = (
@@ -2540,7 +2665,7 @@ def _validate_selection_cell(
                 else None
             )
             expected_diagnostic_record = {
-                "schema_version": 1,
+                "schema_version": metadata_value.get("schema_version"),
                 "path": "fm_diagnostics",
                 "variant_id": model["training"]["flow_variant_id"],
                 "source_split": "train_selection",
@@ -2548,6 +2673,9 @@ def _validate_selection_cell(
                 "n_query": metadata_value.get("n_query"),
                 "n_scales": metadata_value.get("n_scales"),
                 "checkpoint_sha256": checkpoint_sha,
+                "outer_selection_curve_sha256": _array_sha256(
+                    arrays["train_selection_curve"]
+                ),
                 "raw_query_sha256": raw_query_sha,
                 "manifest_sha256": sha256_path(diagnostics_dir / "manifest.json"),
                 "metadata_sha256": sha256_path(diagnostics_dir / "metadata.json"),
@@ -2583,6 +2711,8 @@ def _validate_selection_cell(
                     diagnostic_scales=diagnostic_scales,
                     diagnostic_target=diagnostic_target,
                     diagnostic_full=diagnostic_full,
+                    diagnostic_response=diagnostic_response,
+                    diagnostic_correction=diagnostic_correction,
                     cell_arrays=arrays,
                     summary=summary,
                     checkpoint_path=cell / "checkpoint.pt",

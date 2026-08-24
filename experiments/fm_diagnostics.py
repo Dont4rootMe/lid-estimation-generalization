@@ -29,8 +29,8 @@ import numpy.typing as npt
 
 from experiments.run_manifest import canonical_json, sha256_path
 
-FM_DIAGNOSTIC_SCHEMA_VERSION = 1
-FM_DIAGNOSTIC_PROTOCOL = "train-selection-independent-affine-fm-debug-v1"
+FM_DIAGNOSTIC_SCHEMA_VERSION = 2
+FM_DIAGNOSTIC_PROTOCOL = "train-selection-independent-affine-fm-debug-v2"
 PROBE_KIND = "rademacher"
 SUPPORTED_VARIANTS = {
     "direct_rectified_flow": ("rectified", "direct_velocity"),
@@ -487,6 +487,39 @@ def _predictor_score_conversion(
     )
 
 
+def _predictor_score_conversion_roundoff_scales(
+    primitives: AffinePrimitiveBatch,
+    point: AffineSchedulePoint,
+    *,
+    ambient_dim: int,
+    compute_dtype: str,
+) -> tuple[FloatArray, FloatArray]:
+    """Return operand-conditioned scales for score and score divergence.
+
+    The Gaussian score conversions divide two cancellation-prone numerators
+    by ``beta**2``.  Their componentwise forward-error scales are therefore
+    ``(|alpha*q| + |y|) / beta**2`` and
+    ``(|alpha*div(q)| + D) / beta**2``.  Using the small post-cancellation
+    result as the sole scale is invalid near the data endpoint.
+    """
+
+    dtype = np.float32 if compute_dtype == "float32" else np.float64
+    alpha, beta = _numeric_schedule_alpha_beta(point, compute_dtype=compute_dtype)
+    posterior = np.asarray(primitives.posterior_mean, dtype=dtype)
+    evaluation_point = np.asarray(primitives.evaluation_point, dtype=dtype)
+    posterior_divergence = np.asarray(primitives.posterior_divergence, dtype=dtype)
+    denominator = np.abs(np.square(beta))
+    score_scale = (np.abs(alpha * posterior) + np.abs(evaluation_point)) / denominator
+    score_divergence_scale = (
+        np.abs(alpha * posterior_divergence)
+        + np.asarray(float(ambient_dim), dtype=dtype)
+    ) / denominator
+    return (
+        np.asarray(score_scale, dtype=np.float64),
+        np.asarray(score_divergence_scale, dtype=np.float64),
+    )
+
+
 def _require_roundoff_consistency(
     actual: FloatArray,
     expected: FloatArray,
@@ -891,17 +924,27 @@ def _derived_components(
         ambient_dim=ambient_dim,
         compute_dtype=compute_dtype,
     )
+    score_roundoff_scale, score_divergence_roundoff_scale = (
+        _predictor_score_conversion_roundoff_scales(
+            primitives,
+            point,
+            ambient_dim=ambient_dim,
+            compute_dtype=compute_dtype,
+        )
+    )
     _require_roundoff_consistency(
         primitives.score,
         predictor_score,
         compute_dtype=compute_dtype,
         label="reported Gaussian score",
+        forward_error_scale=score_roundoff_scale,
     )
     _require_roundoff_consistency(
         primitives.score_divergence,
         predictor_score_divergence,
         compute_dtype=compute_dtype,
         label="reported Gaussian score divergence",
+        forward_error_scale=score_divergence_roundoff_scale,
     )
     response_native = (
         ambient_dim + (ambient_dim * alpha_log - primitives.velocity_divergence) / kappa
@@ -1158,6 +1201,7 @@ def run_fm_diagnostics(
     output_dir: Path,
     *,
     variant_id: str,
+    outer_selection_curve_sha256: str,
     trained: Any,
     query: npt.ArrayLike,
     query_model_space: npt.ArrayLike,
@@ -1170,6 +1214,10 @@ def run_fm_diagnostics(
     """Evaluate and seal exhaustive diagnostics on train-selection rows only."""
 
     diagnostic_config = validate_fm_diagnostic_config(config)
+    if not _is_sha256(outer_selection_curve_sha256):
+        raise FMDiagnosticConfigError(
+            "outer_selection_curve_sha256 must be lowercase 64-hex"
+        )
     schedule_name = _schedule_name(variant_id)
     parameterization = SUPPORTED_VARIANTS[str(variant_id)][1]
     checkpoint_sha256 = _checkpoint_sha256_from_trained(trained)
@@ -1655,6 +1703,7 @@ def run_fm_diagnostics(
         "parameterization": SUPPORTED_VARIANTS[str(variant_id)][1],
         "compute_dtype": compute_dtype,
         "checkpoint_sha256": checkpoint_sha256,
+        "outer_selection_curve_sha256": outer_selection_curve_sha256,
         "raw_query_sha256": _array_sha256(raw_query),
         "source_split": "train_selection",
         "ambient_dim": ambient_dim,
@@ -1982,6 +2031,7 @@ def validate_fm_diagnostics(output_dir: Path) -> list[str]:
         "parameterization",
         "compute_dtype",
         "checkpoint_sha256",
+        "outer_selection_curve_sha256",
         "raw_query_sha256",
         "source_split",
         "ambient_dim",
@@ -2021,6 +2071,8 @@ def validate_fm_diagnostics(output_dir: Path) -> list[str]:
         errors.append("unsupported FM diagnostic compute_dtype")
     if not _is_sha256(metadata.get("checkpoint_sha256")):
         errors.append("invalid FM diagnostic checkpoint_sha256")
+    if not _is_sha256(metadata.get("outer_selection_curve_sha256")):
+        errors.append("invalid FM diagnostic outer_selection_curve_sha256")
     if not _is_sha256(metadata.get("raw_query_sha256")):
         errors.append("invalid FM diagnostic raw_query_sha256")
     if metadata.get("source_split") != "train_selection":
@@ -2212,6 +2264,14 @@ def validate_fm_diagnostics(output_dir: Path) -> list[str]:
                 compute_dtype=compute_dtype,
             )
         )
+        _, primary_score_divergence_roundoff_scale = (
+            _predictor_score_conversion_roundoff_scales(
+                primary_primitives,
+                point,
+                ambient_dim=ambient_dim,
+                compute_dtype=compute_dtype,
+            )
+        )
         expected_predictor_q_residual = np.linalg.norm(
             q - predictor_reconstructed_q, axis=1
         )
@@ -2345,6 +2405,7 @@ def validate_fm_diagnostics(output_dir: Path) -> list[str]:
                 expected_predictor_score_divergence,
                 compute_dtype=compute_dtype,
                 label="saved Gaussian score divergence",
+                forward_error_scale=primary_score_divergence_roundoff_scale,
             )
         except ValueError as exc:
             errors.append(f"scale index {index}: {exc}")
@@ -2388,16 +2449,26 @@ def validate_fm_diagnostics(output_dir: Path) -> list[str]:
                 compute_dtype=compute_dtype,
             )
         )
-        for label, actual, expected in (
+        exact_score_roundoff_scale, exact_score_divergence_roundoff_scale = (
+            _predictor_score_conversion_roundoff_scales(
+                exact_primitives,
+                point,
+                ambient_dim=ambient_dim,
+                compute_dtype=compute_dtype,
+            )
+        )
+        for label, actual, expected, forward_error_scale in (
             (
                 "exact Gaussian score",
                 exact_primitives.score,
                 expected_exact_score,
+                exact_score_roundoff_scale,
             ),
             (
                 "exact Gaussian score divergence",
                 exact_primitives.score_divergence,
                 expected_exact_score_divergence,
+                exact_score_divergence_roundoff_scale,
             ),
         ):
             try:
@@ -2406,6 +2477,7 @@ def validate_fm_diagnostics(output_dir: Path) -> list[str]:
                     expected,
                     compute_dtype=compute_dtype,
                     label=label,
+                    forward_error_scale=forward_error_scale,
                 )
             except ValueError as exc:
                 errors.append(f"scale index {index}: {exc}")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -417,3 +418,98 @@ def test_diagnostic_model_space_conversion_matches_predictor_fp32_semantics() ->
     actual = pilot._features_in_model_space(Trained(), raw, label="fixture")
     assert actual.dtype == np.float32
     assert np.array_equal(actual, expected)
+
+
+def _outer_curve_binding_fixture(tmp_path: Path) -> dict[str, Any]:
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"outer-curve-binding-fixture")
+    checkpoint_sha = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    scales = np.asarray([0.1, 0.2], dtype=np.float64)
+    target = np.asarray([2.0, 3.0], dtype=np.float64)
+    # The full readout is cancellation-prone.  These operands give the
+    # comparison a realistic forward-error scale while keeping the result O(1).
+    response = np.asarray([[100_000.0, 10.0], [2_000.0, -5_000.0]], dtype=np.float64)
+    correction = np.asarray([[-99_999.0, -9.0], [-1_998.0, 5_003.0]], dtype=np.float64)
+    diagnostic_full = response + correction
+    outer_curve = diagnostic_full.copy()
+    # Mirrors the largest production posterior-rectified discrepancy while
+    # remaining far below the operand-conditioned float64 error bound.
+    outer_curve[0, 0] += 2.91e-11
+    raw_query_sha = "a" * 64
+    metadata = {
+        "checkpoint_sha256": checkpoint_sha,
+        "raw_query_sha256": raw_query_sha,
+        "outer_selection_curve_sha256": pilot._array_sha256(outer_curve),
+    }
+    summary = {
+        "checkpoint_sha256": checkpoint_sha,
+        "scale_selection": {"partition": {"selection_features_sha256": raw_query_sha}},
+    }
+    return {
+        "checkpoint": checkpoint,
+        "metadata": metadata,
+        "summary": summary,
+        "scales": scales,
+        "target": target,
+        "diagnostic_full": diagnostic_full,
+        "response": response,
+        "correction": correction,
+        "outer_curve": outer_curve,
+    }
+
+
+def _outer_curve_binding_errors(fixture: dict[str, Any]) -> list[str]:
+    return pilot._affine_diagnostic_binding_errors(
+        dataset_name="e8_gaussian4_pca",
+        metadata=fixture["metadata"],
+        diagnostic_scales=fixture["scales"],
+        diagnostic_target=fixture["target"],
+        diagnostic_full=fixture["diagnostic_full"],
+        diagnostic_response=fixture["response"],
+        diagnostic_correction=fixture["correction"],
+        cell_arrays={
+            "scales": fixture["scales"],
+            "train_selection_target": fixture["target"],
+            "train_selection_curve": fixture["outer_curve"],
+        },
+        summary=fixture["summary"],
+        checkpoint_path=fixture["checkpoint"],
+    )
+
+
+def test_outer_curve_binding_accepts_genuine_conditioned_roundoff(
+    tmp_path: Path,
+) -> None:
+    fixture = _outer_curve_binding_fixture(tmp_path)
+    assert _outer_curve_binding_errors(fixture) == []
+
+
+def test_outer_curve_binding_rejects_resealed_outer_curve_tamper(
+    tmp_path: Path,
+) -> None:
+    fixture = _outer_curve_binding_fixture(tmp_path)
+    # A post-hoc change this small remains inside the numerical allowance.  It
+    # must still fail because resealing only the outer inventory cannot rewrite
+    # the SHA already sealed inside the diagnostic metadata/manifest.
+    fixture["outer_curve"] = fixture["outer_curve"].copy()
+    fixture["outer_curve"][0, 1] = np.nextafter(fixture["outer_curve"][0, 1], np.inf)
+    errors = _outer_curve_binding_errors(fixture)
+    assert any("not cryptographically bound" in error for error in errors)
+    assert not any("exceeds conditioned roundoff bound" in error for error in errors)
+
+
+def test_outer_curve_binding_rejects_swapped_diagnostics_even_if_resealed(
+    tmp_path: Path,
+) -> None:
+    fixture = _outer_curve_binding_fixture(tmp_path)
+    # Model an attacker swapping in a different cell's outer curve and updating
+    # the unkeyed metadata SHA plus both inventories.  The independent inner
+    # full readout still exposes the swap through the tight numeric gate.
+    fixture["outer_curve"] = fixture["outer_curve"].copy() + 0.25
+    fixture["metadata"] = {
+        **fixture["metadata"],
+        "outer_selection_curve_sha256": pilot._array_sha256(fixture["outer_curve"]),
+    }
+    errors = _outer_curve_binding_errors(fixture)
+    assert not any("not cryptographically bound" in error for error in errors)
+    assert any("exceeds conditioned roundoff bound" in error for error in errors)

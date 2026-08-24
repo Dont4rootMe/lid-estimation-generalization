@@ -29,6 +29,8 @@ VARIANTS = (
     "posterior_vp_trigonometric_flow",
 )
 CHECKPOINT_SHA256 = "a" * 64
+OUTER_SELECTION_CURVE_SHA256 = "b" * 64
+OLD_FM_DIAGNOSTIC_PROTOCOL = "train-selection-independent-affine-fm-debug-v1"
 
 
 def _config() -> dict[str, Any]:
@@ -173,6 +175,7 @@ def _run(tmp_path: Path, variant_id: str) -> tuple[Path, _AnalyticPrimitive]:
     output = run_fm_diagnostics(
         tmp_path / variant_id,
         variant_id=variant_id,
+        outer_selection_curve_sha256=OUTER_SELECTION_CURVE_SHA256,
         trained=SimpleNamespace(checkpoint_sha256=CHECKPOINT_SHA256),
         query=query,
         query_model_space=query,
@@ -213,12 +216,37 @@ def test_pilot_hook_runs_and_seals_train_only_diagnostics(tmp_path: Path) -> Non
 
     cell = tmp_path / "cell"
     cell.mkdir()
+    # Reproduce the outer pilot's independently evaluated train-selection
+    # curve.  The diagnostic hook must bind to these exact semantics while its
+    # separately evaluated inner full readout is checked numerically.
+    outer_primitive = _AnalyticPrimitive("posterior_rectified_flow")
+    selection_curve = np.ascontiguousarray(
+        np.column_stack(
+            [
+                pilot_module._readouts_from_affine_primitives(
+                    outer_primitive(
+                        trained,
+                        query,
+                        scale,
+                        family="independent_affine_flow",
+                        divergence_backend="hutchinson",
+                        trace_probes=4,
+                        trace_seed=137,
+                        batch_size=4,
+                    )
+                )["full"]
+                for scale in (0.2, 0.6)
+            ]
+        ),
+        dtype=np.float64,
+    )
     record = pilot_module._run_affine_diagnostics(
         name="e8_gaussian4_pca",
         cell_dir=cell,
         partition=partition,
         trained=trained,
         scales=np.asarray([0.2, 0.6]),
+        selection_curve=selection_curve,
         model={
             "training": {"flow_variant_id": "posterior_rectified_flow"},
             "diagnostics": _config(),
@@ -236,6 +264,9 @@ def test_pilot_hook_runs_and_seals_train_only_diagnostics(tmp_path: Path) -> Non
     assert record["variant_id"] == "posterior_rectified_flow"
     assert record["source_split"] == "train_selection"
     assert record["checkpoint_sha256"] == CHECKPOINT_SHA256
+    assert record["outer_selection_curve_sha256"] == pilot_module._array_sha256(
+        selection_curve
+    )
     assert record["raw_query_sha256"] == diagnostics_module._array_sha256(query)
     assert record["manifest_sha256"] == sha256_path(output / "manifest.json")
     assert [event for event, _ in events] == [
@@ -262,10 +293,13 @@ def test_outer_cell_binding_rejects_resealed_cross_checkpoint_diagnostics(
     scales = np.asarray([0.01, 0.1, 1.0], dtype=np.float64)
     target = np.asarray([2.0, 2.0], dtype=np.float64)
     full = np.asarray([[1.0, 1.5, 2.0], [1.2, 1.7, 2.2]], dtype=np.float64)
+    response = full.copy()
+    correction = np.zeros_like(full)
     raw_query = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
     raw_query_sha = diagnostics_module._array_sha256(raw_query)
     metadata = {
         "checkpoint_sha256": checkpoint_sha,
+        "outer_selection_curve_sha256": pilot_module._array_sha256(full),
         "raw_query_sha256": raw_query_sha,
     }
     summary = {
@@ -291,6 +325,8 @@ def test_outer_cell_binding_rejects_resealed_cross_checkpoint_diagnostics(
             diagnostic_scales=local_scales,
             diagnostic_target=local_target,
             diagnostic_full=local_full,
+            diagnostic_response=response,
+            diagnostic_correction=correction,
             cell_arrays=cell_arrays,
             summary=summary,
             checkpoint_path=checkpoint,
@@ -308,10 +344,19 @@ def test_outer_cell_binding_rejects_resealed_cross_checkpoint_diagnostics(
         for error in validate(local_metadata={**metadata, "raw_query_sha256": "1" * 64})
     )
     assert any(
+        "cryptographically bound" in error
+        for error in validate(
+            local_metadata={
+                **metadata,
+                "outer_selection_curve_sha256": "2" * 64,
+            }
+        )
+    )
+    assert any(
         "scales differ" in error for error in validate(local_scales=scales[::-1])
     )
     assert any("targets differ" in error for error in validate(local_target=target + 1))
-    assert any("full curve differs" in error for error in validate(local_full=full + 1))
+    assert any("full curve exceeds" in error for error in validate(local_full=full + 1))
 
 
 @pytest.mark.parametrize("variant_id", VARIANTS)
@@ -331,6 +376,8 @@ def test_fm_diagnostics_seals_all_variants_and_bounds_expensive_calls(
         * 2
     )
     summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+    metadata = json.loads((output / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["outer_selection_curve_sha256"] == OUTER_SELECTION_CURVE_SHA256
     assert summary["primary_selection_readout"] == "full"
     for scale in summary["per_scale"]:
         assert set(scale["readouts"]) == {"response", "full", "fm_to_score"}
@@ -426,7 +473,30 @@ def test_run_requires_canonical_checkpoint_provenance(
         run_fm_diagnostics(
             tmp_path / "invalid-provenance",
             variant_id="direct_rectified_flow",
+            outer_selection_curve_sha256=OUTER_SELECTION_CURVE_SHA256,
             trained=SimpleNamespace(checkpoint_sha256=checkpoint_sha256),
+            query=query,
+            query_model_space=query,
+            target=target,
+            oracle_reference_model_space=reference,
+            scales=[0.2, 0.6],
+            config=_config(),
+            primitive_fn=_AnalyticPrimitive("direct_rectified_flow"),
+        )
+
+
+@pytest.mark.parametrize("curve_sha256", (None, "B" * 64, "abc"))
+def test_run_requires_canonical_outer_selection_curve_provenance(
+    tmp_path: Path,
+    curve_sha256: str | None,
+) -> None:
+    query, target, reference = _inputs()
+    with pytest.raises(FMDiagnosticConfigError, match="outer_selection_curve_sha256"):
+        run_fm_diagnostics(
+            tmp_path / "invalid-outer-curve-provenance",
+            variant_id="direct_rectified_flow",
+            outer_selection_curve_sha256=curve_sha256,  # type: ignore[arg-type]
+            trained=SimpleNamespace(checkpoint_sha256=CHECKPOINT_SHA256),
             query=query,
             query_model_space=query,
             target=target,
@@ -450,6 +520,45 @@ def test_validator_rejects_resealed_malformed_input_provenance(tmp_path: Path) -
 
     errors = validate_fm_diagnostics(output)
     assert "invalid FM diagnostic raw_query_sha256" in errors
+
+
+def test_validator_rejects_resealed_malformed_outer_curve_provenance(
+    tmp_path: Path,
+) -> None:
+    output, _ = _run(tmp_path, "posterior_rectified_flow")
+    metadata_path = output / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["outer_selection_curve_sha256"] = "not-a-sha"
+    metadata_path.write_text(
+        json.dumps(metadata, allow_nan=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    _reseal(output)
+
+    errors = validate_fm_diagnostics(output)
+    assert "invalid FM diagnostic outer_selection_curve_sha256" in errors
+
+
+def test_validator_rejects_resealed_pre_attestation_v1_artifact(
+    tmp_path: Path,
+) -> None:
+    output, _ = _run(tmp_path, "posterior_rectified_flow")
+    for filename in ("metadata.json", "summary.json", "manifest.json"):
+        path = output / filename
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["schema_version"] = 1
+        document["protocol"] = OLD_FM_DIAGNOSTIC_PROTOCOL
+        path.write_text(
+            json.dumps(document, allow_nan=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    _reseal(output)
+
+    errors = validate_fm_diagnostics(output)
+    assert "unsupported FM diagnostic manifest schema" in errors
+    assert "unsupported FM diagnostic protocol" in errors
+    assert "unsupported FM diagnostic metadata schema" in errors
+    assert "invalid metadata protocol" in errors
 
 
 @pytest.mark.parametrize(
@@ -522,6 +631,7 @@ def test_real_fp32_endpoint_score_conversion_uses_predictor_arithmetic(
     output = run_fm_diagnostics(
         tmp_path / "real-fp32",
         variant_id=spec.variant_id,
+        outer_selection_curve_sha256=OUTER_SELECTION_CURVE_SHA256,
         trained=AnalyticFP32Field(),
         query=query,
         query_model_space=query,
@@ -772,6 +882,7 @@ def test_posterior_vp_conversion_bound_accounts_for_operand_cancellation(
     output = run_fm_diagnostics(
         tmp_path / "sealed-posterior-vp-cancellation",
         variant_id="posterior_vp_trigonometric_flow",
+        outer_selection_curve_sha256=OUTER_SELECTION_CURVE_SHA256,
         trained=SimpleNamespace(
             model=Float32Marker(), checkpoint_sha256=CHECKPOINT_SHA256
         ),
@@ -792,6 +903,226 @@ def test_posterior_vp_conversion_bound_accounts_for_operand_cancellation(
     )
     assert sealed_residual.shape == (2, 2)
     assert np.all(sealed_residual > 0.0)
+
+
+def test_direct_vp_score_bounds_account_for_endpoint_cancellation(
+    tmp_path: Path,
+) -> None:
+    """Seal lambda=.01/D784 one-ulp score conversions and reject corruption."""
+
+    ambient_dim = 784
+
+    class Float32Marker:
+        def parameters(self):  # type: ignore[no-untyped-def]
+            return iter((SimpleNamespace(dtype="torch.float32"),))
+
+    class DirectVPPrimitive:
+        def __init__(self, *, corrupt_score: bool = False) -> None:
+            self.corrupt_score = corrupt_score
+            self.score_kernel_gaps: list[float] = []
+            self.divergence_kernel_gaps: list[float] = []
+
+        def __call__(
+            self,
+            _trained: object,
+            raw_query: np.ndarray,
+            scale: float,
+            *,
+            family: str,
+            divergence_backend: str,
+            trace_probes: int,
+            trace_seed: int,
+            batch_size: int,
+        ) -> SimpleNamespace:
+            assert family == "independent_affine_flow"
+            assert trace_seed == 137
+            assert batch_size == 1
+            point = affine_schedule_point("vp_trigonometric", scale)
+            state = diagnostics_module._numeric_schedule_scalars(
+                point, compute_dtype="float32"
+            )
+            channel_point = np.asarray(raw_query, dtype=np.float32).reshape(
+                raw_query.shape[0], -1
+            )
+            evaluation_point = np.asarray(
+                state["alpha"] * channel_point,
+                dtype=np.float32,
+            )
+            point_term = state["beta_log_derivative"] * evaluation_point
+            coefficient = state["alpha_log_noise_derivative"]
+            requested_posterior = np.asarray(
+                channel_point + np.float32(scale * scale),
+                dtype=np.float32,
+            )
+            velocity = np.asarray(
+                point_term - coefficient * requested_posterior,
+                dtype=np.float32,
+            )
+            posterior = np.asarray(
+                (point_term - velocity) / coefficient,
+                dtype=np.float32,
+            )
+
+            score_point_term = np.asarray(
+                state["alpha"] * posterior,
+                dtype=np.float32,
+            )
+            score_denominator = np.square(state["beta"])
+            predictor_score = np.asarray(
+                (score_point_term - evaluation_point) / score_denominator,
+                dtype=np.float32,
+            )
+            gpu_like_score_term = np.nextafter(
+                score_point_term,
+                np.full_like(score_point_term, np.inf),
+            )
+            score = np.asarray(
+                (gpu_like_score_term - evaluation_point) / score_denominator,
+                dtype=np.float32,
+            )
+            self.score_kernel_gaps.append(
+                float(np.max(np.abs(score - predictor_score)))
+            )
+
+            posterior_divergence = np.full(
+                channel_point.shape[0],
+                np.float32(float(ambient_dim) / float(state["alpha"])),
+                dtype=np.float32,
+            )
+            score_divergence_term = np.asarray(
+                state["alpha"] * posterior_divergence,
+                dtype=np.float32,
+            )
+            predictor_score_divergence = np.asarray(
+                (
+                    score_divergence_term
+                    - np.asarray(float(ambient_dim), dtype=np.float32)
+                )
+                / score_denominator,
+                dtype=np.float32,
+            )
+            gpu_like_divergence_term = np.nextafter(
+                score_divergence_term,
+                np.full_like(score_divergence_term, np.inf),
+            )
+            score_divergence = np.asarray(
+                (
+                    gpu_like_divergence_term
+                    - np.asarray(float(ambient_dim), dtype=np.float32)
+                )
+                / score_denominator,
+                dtype=np.float32,
+            )
+            self.divergence_kernel_gaps.append(
+                float(np.max(np.abs(score_divergence - predictor_score_divergence)))
+            )
+            if self.corrupt_score:
+                score = np.asarray(score + np.float32(1.0), dtype=np.float32)
+
+            velocity_divergence = (
+                (point.alpha_log_derivative + point.log_noise_ratio_derivative)
+                * ambient_dim
+                - point.log_noise_ratio_derivative
+                * point.alpha
+                * np.asarray(posterior_divergence, dtype=np.float64)
+            )
+            return SimpleNamespace(
+                velocity=velocity,
+                velocity_divergence=velocity_divergence,
+                velocity_divergence_from_posterior=velocity_divergence,
+                evaluation_point=evaluation_point,
+                channel_point=channel_point,
+                posterior_mean=posterior,
+                posterior_divergence=posterior_divergence,
+                marginal_score=score,
+                marginal_score_divergence=score_divergence,
+                variant_id="direct_vp_trigonometric_flow",
+                schedule="vp_trigonometric",
+                parameterization="direct_velocity",
+                noise_ratio=point.noise_ratio,
+                native_time=point.native_coordinate,
+                alpha=point.alpha,
+                beta=point.beta,
+                alpha_derivative=point.alpha_derivative,
+                beta_derivative=point.beta_derivative,
+                alpha_log_derivative=point.alpha_log_derivative,
+                log_noise_ratio_derivative=point.log_noise_ratio_derivative,
+                divergence_backend=divergence_backend,
+                trace_probe_kind=(
+                    "rademacher" if divergence_backend == "hutchinson" else "exact"
+                ),
+                trace_seed=(trace_seed if divergence_backend == "hutchinson" else None),
+                trace_probes=(
+                    trace_probes if divergence_backend == "hutchinson" else 0
+                ),
+                shared_posterior_velocity_probes=(divergence_backend == "hutchinson"),
+                primary_trace_field="posterior_mean",
+                velocity_divergence_source="raw_model_trace",
+            )
+
+    query = np.full((2, ambient_dim), 1.0, dtype=np.float32)
+    reference = np.vstack((query, query + np.float32(0.25)))
+    config = _config()
+    config.update(
+        exact_subset_size=1,
+        oracle_reference_size=2,
+        oracle_chunk_size=1,
+        batch_size=1,
+    )
+    trained = SimpleNamespace(
+        model=Float32Marker(), checkpoint_sha256=CHECKPOINT_SHA256
+    )
+    primitive = DirectVPPrimitive()
+    output = run_fm_diagnostics(
+        tmp_path / "sealed-direct-vp-score-cancellation",
+        variant_id="direct_vp_trigonometric_flow",
+        outer_selection_curve_sha256=OUTER_SELECTION_CURVE_SHA256,
+        trained=trained,
+        query=query,
+        query_model_space=query,
+        target=np.full(query.shape[0], 5.0, dtype=np.float64),
+        oracle_reference_model_space=reference,
+        scales=[0.01, 0.02],
+        config=config,
+        primitive_fn=primitive,
+    )
+    assert validate_fm_diagnostics(output) == []
+    assert min(primitive.score_kernel_gaps) > 7.62939e-6
+    assert min(primitive.divergence_kernel_gaps) > 7.62939e-6
+    score_residual = np.load(
+        output / "arrays" / "score_norm_sq_numeric_residual.npy",
+        allow_pickle=False,
+    )
+    divergence_residual = np.load(
+        output / "arrays" / "score_divergence_numeric_residual.npy",
+        allow_pickle=False,
+    )
+    assert np.any(score_residual != 0.0)
+    assert np.any(divergence_residual != 0.0)
+
+    # A self-consistently resealed artifact still fails strict revalidation
+    # when the reported score is moved outside the conditioned bound.
+    exact_score_path = output / "arrays" / "exact_score.npy"
+    exact_score = np.load(exact_score_path, allow_pickle=False)
+    np.save(exact_score_path, exact_score + 1.0, allow_pickle=False)
+    _reseal(output)
+    strict_errors = validate_fm_diagnostics(output)
+    assert any("exact Gaussian score exceeds" in error for error in strict_errors)
+
+    with pytest.raises(ValueError, match="reported Gaussian score exceeds"):
+        run_fm_diagnostics(
+            tmp_path / "corrupted-direct-vp-score",
+            variant_id="direct_vp_trigonometric_flow",
+            outer_selection_curve_sha256=OUTER_SELECTION_CURVE_SHA256,
+            trained=trained,
+            query=query,
+            query_model_space=query,
+            target=np.full(query.shape[0], 5.0, dtype=np.float64),
+            oracle_reference_model_space=reference,
+            scales=[0.01, 0.02],
+            config=config,
+            primitive_fn=DirectVPPrimitive(corrupt_score=True),
+        )
 
 
 def test_real_trained_direct_rectified_field_identity_uses_predictor_arithmetic(
@@ -851,6 +1182,7 @@ def test_real_trained_direct_rectified_field_identity_uses_predictor_arithmetic(
     output = run_fm_diagnostics(
         tmp_path / "trained-direct-rf-diagnostics",
         variant_id="direct_rectified_flow",
+        outer_selection_curve_sha256=OUTER_SELECTION_CURVE_SHA256,
         trained=trained,
         query=selection,
         query_model_space=selection_model_space,
