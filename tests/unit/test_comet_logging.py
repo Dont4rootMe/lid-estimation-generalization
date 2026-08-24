@@ -7,7 +7,8 @@ from typing import Any
 import pytest
 
 from experiments.comet_logging import (
-    COMET_NAMESPACE,
+    COMET_EXPERIMENT_NAME,
+    COMET_PROJECT_NAME,
     CometConfigurationError,
     create_comet_callback,
     create_comet_event_logger,
@@ -61,8 +62,8 @@ def test_public_scheduler_environment_is_fixed_and_secret_free(
     monkeypatch.setenv("COMET_API_KEY", "do-not-copy")
     environment = safe_scheduler_environment()
     assert "COMET_API_KEY" not in environment
-    assert environment["COMET_PROJECT_NAME"] == COMET_NAMESPACE
-    assert environment["COMET_EXPERIMENT_NAME"] == COMET_NAMESPACE
+    assert environment["COMET_PROJECT_NAME"] == COMET_PROJECT_NAME
+    assert environment["COMET_EXPERIMENT_NAME"] == COMET_EXPERIMENT_NAME
     assert "do-not-copy" not in repr(environment)
 
 
@@ -76,10 +77,18 @@ def test_comet_environment_is_required_and_namespace_is_exact() -> None:
     require_comet_environment(
         {
             "COMET_API_KEY": "present",
-            "COMET_PROJECT_NAME": COMET_NAMESPACE,
-            "COMET_EXPERIMENT_NAME": COMET_NAMESPACE,
+            "COMET_PROJECT_NAME": COMET_PROJECT_NAME,
+            "COMET_EXPERIMENT_NAME": COMET_EXPERIMENT_NAME,
         }
     )
+    with pytest.raises(CometConfigurationError, match="COMET_EXPERIMENT_NAME"):
+        require_comet_environment(
+            {
+                "COMET_API_KEY": "present",
+                "COMET_PROJECT_NAME": COMET_PROJECT_NAME,
+                "COMET_EXPERIMENT_NAME": COMET_PROJECT_NAME,
+            }
+        )
 
 
 def test_factory_never_passes_api_key_to_comet_sdk(
@@ -93,10 +102,10 @@ def test_factory_never_passes_api_key_to_comet_sdk(
         tags=("diffusion",), environ={"COMET_API_KEY": "super-secret"}
     )
     experiment = FakeExperiment.instances[-1]
-    assert experiment.kwargs == {"project_name": COMET_NAMESPACE}
+    assert experiment.kwargs == {"project_name": COMET_PROJECT_NAME}
     assert "super-secret" not in repr(experiment.__dict__)
-    assert experiment.names == [COMET_NAMESPACE]
-    assert experiment.tags == [COMET_NAMESPACE, "diffusion"]
+    assert experiment.names == [COMET_EXPERIMENT_NAME]
+    assert experiment.tags == [COMET_EXPERIMENT_NAME, "diffusion"]
     logger.end()
     assert experiment.ended
 

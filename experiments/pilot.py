@@ -43,7 +43,8 @@ from models.oracle import select_stable_scale
 from utils.provenance import sha256_file
 
 
-PROJECT_NAME = "ent-block-diffusion-eval"
+PROJECT_NAME = "lid-generalization"
+EXPERIMENT_NAME = "ent-block-diffusion-eval"
 PILOT_DATASETS = (
     "e8_gaussian4_pca",
     "e8_spaghetti_pca",
@@ -207,9 +208,13 @@ def validate_pilot_config(
         value.get("schema_version"), bool
     ):
         raise PilotConfigError("pilot schema_version must be 1")
-    for field in ("project", "experiment_name"):
-        if value.get(field) != PROJECT_NAME:
-            raise PilotConfigError(f"{field} must be exactly {PROJECT_NAME!r}")
+    required_identity = {
+        "project": PROJECT_NAME,
+        "experiment_name": EXPERIMENT_NAME,
+    }
+    for field, expected in required_identity.items():
+        if value.get(field) != expected:
+            raise PilotConfigError(f"{field} must be exactly {expected!r}")
     if _contains_secret_field(value):
         raise PilotConfigError(
             "credentials are forbidden in Hydra config; use environment variables"
@@ -348,10 +353,10 @@ def validate_pilot_config(
     )
     if logging.get("backend") not in {"none", "comet"}:
         raise PilotConfigError("logging.backend must be 'none' or 'comet'")
-    for field in ("project", "experiment_name"):
-        if logging.get(field) != PROJECT_NAME:
+    for field, expected in required_identity.items():
+        if logging.get(field) != expected:
             raise PilotConfigError(
-                f"logging.{field} must be exactly {PROJECT_NAME!r}"
+                f"logging.{field} must be exactly {expected!r}"
             )
     return value
 
@@ -537,7 +542,7 @@ def _emit(
         return
     record: dict[str, Any] = {
         "project": PROJECT_NAME,
-        "experiment_name": PROJECT_NAME,
+        "experiment_name": EXPERIMENT_NAME,
         "family": family,
     }
     if dataset is not None:
@@ -887,7 +892,7 @@ def _run_dataset(
     training_config = {
         "schema_version": 1,
         "project": PROJECT_NAME,
-        "experiment_name": PROJECT_NAME,
+        "experiment_name": EXPERIMENT_NAME,
         "model": dict(model),
         "dataset": {
             "name": name,
@@ -920,7 +925,7 @@ def _run_dataset(
     summary = {
         "schema_version": 1,
         "project": PROJECT_NAME,
-        "experiment_name": PROJECT_NAME,
+        "experiment_name": EXPERIMENT_NAME,
         "dataset": name,
         "representation": "dataset",
         "model": _training_result_record(trained),
@@ -972,6 +977,7 @@ def run_pilot(
     identity = {
         "schema_version": 1,
         "project": PROJECT_NAME,
+        "experiment_name": EXPERIMENT_NAME,
         "family": config["pilot_model"]["family"],
         "config_sha256": config_sha,
         "source_tree_sha256": source_sha,
@@ -1016,7 +1022,7 @@ def run_pilot(
     aggregate = {
         "schema_version": 1,
         "project": PROJECT_NAME,
-        "experiment_name": PROJECT_NAME,
+        "experiment_name": EXPERIMENT_NAME,
         "run_id": run_id,
         "family": family,
         "selection_uses_lid_targets": False,
@@ -1031,7 +1037,7 @@ def run_pilot(
     manifest = {
         "schema_version": PILOT_MANIFEST_SCHEMA_VERSION,
         "project": PROJECT_NAME,
-        "experiment_name": PROJECT_NAME,
+        "experiment_name": EXPERIMENT_NAME,
         "run_id": run_id,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "family": family,
@@ -1130,9 +1136,13 @@ def validate_pilot_experiment(
         )
     if manifest.get("schema_version") != PILOT_MANIFEST_SCHEMA_VERSION:
         errors.append("unsupported pilot manifest schema_version")
-    for field in ("project", "experiment_name"):
-        if manifest.get(field) != PROJECT_NAME:
-            errors.append(f"manifest.{field} is not {PROJECT_NAME!r}")
+    required_identity = {
+        "project": PROJECT_NAME,
+        "experiment_name": EXPERIMENT_NAME,
+    }
+    for field, expected in required_identity.items():
+        if manifest.get(field) != expected:
+            errors.append(f"manifest.{field} is not {expected!r}")
     if manifest.get("selection_uses_lid_targets") is not False:
         errors.append("manifest must attest target-free scale selection")
 
@@ -1150,6 +1160,7 @@ def validate_pilot_experiment(
         identity = {
             "schema_version": 1,
             "project": PROJECT_NAME,
+            "experiment_name": EXPERIMENT_NAME,
             "family": resolved["pilot_model"]["family"],
             "config_sha256": actual_config_sha,
             "source_tree_sha256": manifest.get("source_tree_sha256"),
@@ -1259,6 +1270,7 @@ if __name__ == "__main__":
 __all__ = [
     "PILOT_DATASETS",
     "PROJECT_NAME",
+    "EXPERIMENT_NAME",
     "PilotConfigError",
     "compose_pilot_config",
     "run_pilot",

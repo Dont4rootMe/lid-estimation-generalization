@@ -13,6 +13,7 @@ import yaml
 
 import experiments.pilot as pilot_module
 from experiments.pilot import (
+    EXPERIMENT_NAME,
     PILOT_DATASETS,
     PROJECT_NAME,
     PilotConfigError,
@@ -192,6 +193,10 @@ def test_pilot_trains_three_models_and_seals_all_metrics(
         for _, payload in training_events
     )
     assert all(payload["project"] == PROJECT_NAME for _, payload in logger.events)
+    assert all(
+        payload["experiment_name"] == EXPERIMENT_NAME
+        for _, payload in logger.events
+    )
     assert {path.name for path, _ in logger.assets} == {
         "summary.json",
         "manifest.json",
@@ -430,6 +435,24 @@ def test_pilot_config_rejects_dataset_or_project_drift() -> None:
     wrong_project = OmegaConf.create({**base, "project": "some-other-project"})
     with pytest.raises(PilotConfigError, match="project must be exactly"):
         validate_pilot_config(wrong_project)
+
+    wrong_experiment = OmegaConf.create(
+        {**base, "experiment_name": PROJECT_NAME}
+    )
+    with pytest.raises(PilotConfigError, match="experiment_name must be exactly"):
+        validate_pilot_config(wrong_experiment)
+
+    wrong_logging_project = OmegaConf.create(base)
+    wrong_logging_project.logging.project = EXPERIMENT_NAME
+    with pytest.raises(PilotConfigError, match="logging.project must be exactly"):
+        validate_pilot_config(wrong_logging_project)
+
+    wrong_logging_experiment = OmegaConf.create(base)
+    wrong_logging_experiment.logging.experiment_name = PROJECT_NAME
+    with pytest.raises(
+        PilotConfigError, match="logging.experiment_name must be exactly"
+    ):
+        validate_pilot_config(wrong_logging_experiment)
 
     wrong_datasets = OmegaConf.create(base)
     wrong_datasets.data.names = list(reversed(PILOT_DATASETS))

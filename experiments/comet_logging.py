@@ -17,7 +17,8 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 
 
-COMET_NAMESPACE = "ent-block-diffusion-eval"
+COMET_PROJECT_NAME = "lid-generalization"
+COMET_EXPERIMENT_NAME = "ent-block-diffusion-eval"
 COMET_API_KEY_ENV = "COMET_API_KEY"
 _FORBIDDEN_KEY_PARTS = ("api_key", "apikey", "password", "secret", "token")
 
@@ -58,11 +59,15 @@ def require_comet_environment(
         raise CometConfigurationError(
             f"{COMET_API_KEY_ENV} must be set in the job environment"
         )
-    for variable in ("COMET_PROJECT_NAME", "COMET_EXPERIMENT_NAME"):
+    required_names = {
+        "COMET_PROJECT_NAME": COMET_PROJECT_NAME,
+        "COMET_EXPERIMENT_NAME": COMET_EXPERIMENT_NAME,
+    }
+    for variable, expected in required_names.items():
         configured = source.get(variable)
-        if configured is not None and configured != COMET_NAMESPACE:
+        if configured is not None and configured != expected:
             raise CometConfigurationError(
-                f"{variable} must be exactly {COMET_NAMESPACE!r}"
+                f"{variable} must be exactly {expected!r}"
             )
 
 
@@ -75,8 +80,8 @@ def safe_scheduler_environment() -> dict[str, str]:
     """
 
     return {
-        "COMET_PROJECT_NAME": COMET_NAMESPACE,
-        "COMET_EXPERIMENT_NAME": COMET_NAMESPACE,
+        "COMET_PROJECT_NAME": COMET_PROJECT_NAME,
+        "COMET_EXPERIMENT_NAME": COMET_EXPERIMENT_NAME,
         "COMET_MODE": "online",
         "COMET_LOGGING_CONSOLE": "true",
     }
@@ -124,7 +129,10 @@ class CometEventLogger:
         self._experiment = experiment
 
     def __repr__(self) -> str:
-        return f"{type(self).__name__}(namespace={COMET_NAMESPACE!r})"
+        return (
+            f"{type(self).__name__}(project={COMET_PROJECT_NAME!r}, "
+            f"experiment={COMET_EXPERIMENT_NAME!r})"
+        )
 
     def __call__(self, event_name: str, payload: Mapping[str, Any]) -> None:
         if not isinstance(event_name, str) or not event_name.strip():
@@ -187,9 +195,9 @@ def create_comet_event_logger(
         if not isinstance(tag, str) or not tag.strip():
             raise CometConfigurationError("Comet tags must be non-empty strings")
     comet_ml = importlib.import_module("comet_ml")
-    experiment = comet_ml.Experiment(project_name=COMET_NAMESPACE)
-    experiment.set_name(COMET_NAMESPACE)
-    experiment.add_tag(COMET_NAMESPACE)
+    experiment = comet_ml.Experiment(project_name=COMET_PROJECT_NAME)
+    experiment.set_name(COMET_EXPERIMENT_NAME)
+    experiment.add_tag(COMET_EXPERIMENT_NAME)
     for tag in tags:
         experiment.add_tag(tag)
     return CometEventLogger(experiment)
@@ -211,7 +219,8 @@ def create_comet_callback(
 
 __all__ = [
     "COMET_API_KEY_ENV",
-    "COMET_NAMESPACE",
+    "COMET_EXPERIMENT_NAME",
+    "COMET_PROJECT_NAME",
     "CometConfigurationError",
     "CometEventLogger",
     "create_comet_callback",

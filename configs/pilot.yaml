@@ -3,7 +3,7 @@ defaults:
   - _self_
 
 schema_version: 1
-project: ent-block-diffusion-eval
+project: lid-generalization
 experiment_name: ent-block-diffusion-eval
 seed: 137
 output_root: artifacts/pilot
@@ -29,7 +29,7 @@ evaluation:
 
 logging:
   backend: comet
-  project: ent-block-diffusion-eval
+  project: lid-generalization
   experiment_name: ent-block-diffusion-eval
 
 hydra:

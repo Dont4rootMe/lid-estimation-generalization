@@ -31,7 +31,7 @@ environment:
   CUBLAS_WORKSPACE_CONFIG: ":4096:8"
   MLS_JOB_TOTAL_GPU: 1
   MLS_JOB_REGION_NAME: A100-MT
-  COMET_PROJECT_NAME: ent-block-diffusion-eval
+  COMET_PROJECT_NAME: lid-generalization
   COMET_EXPERIMENT_NAME: ent-block-diffusion-eval
   COMET_MODE: online
   COMET_LOGGING_CONSOLE: "true"

@@ -59,7 +59,7 @@ def test_payload_has_no_serialized_secret_or_family_scheduler_metadata() -> None
         payload = planned.payload
         assert "COMET_API_KEY" not in payload["env_variables"]
         assert payload["env_variables"]["COMET_PROJECT_NAME"] == (
-            "ent-block-diffusion-eval"
+            "lid-generalization"
         )
         assert payload["env_variables"]["COMET_EXPERIMENT_NAME"] == (
             "ent-block-diffusion-eval"
@@ -73,9 +73,16 @@ def test_payload_has_no_serialized_secret_or_family_scheduler_metadata() -> None
         metadata_text = metadata_text.replace(JOB_DESC, "")
         metadata_text = metadata_text.replace(
             str(payload["base_image"]), ""
-        ).replace("ent-block-diffusion-eval", "")
+        ).replace("ent-block-diffusion-eval", "").replace(
+            "lid-generalization", ""
+        )
         assert planned.family not in metadata_text
         assert f"pilot_model={planned.family}" in payload["script"]
+        assert "logging.project=lid-generalization" in payload["script"]
+        assert (
+            "logging.experiment_name=ent-block-diffusion-eval"
+            in payload["script"]
+        )
         assert "conda activate block-diff" in payload["script"]
         assert "COMET_API_KEY=$(" in payload["script"]
         assert " output_root=" in payload["script"]
@@ -324,7 +331,8 @@ def test_submit_cli_prints_only_safe_acknowledged_job_names(
     assert main(["--config", str(CONFIG), "--submit"]) == 0
     output = capsys.readouterr().out
     assert "status: submitted" in output
-    assert "project: ent-block-diffusion-eval" in output
+    assert "project: lid-generalization" in output
+    assert "experiment_name: ent-block-diffusion-eval" in output
     assert "lm-mpi-job-one" in output
     assert "lm-mpi-job-two" in output
     assert "COMET_API_KEY" not in output

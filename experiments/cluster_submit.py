@@ -21,7 +21,8 @@ from omegaconf import OmegaConf
 
 from experiments.comet_logging import (
     COMET_API_KEY_ENV,
-    COMET_NAMESPACE,
+    COMET_EXPERIMENT_NAME,
+    COMET_PROJECT_NAME,
     safe_scheduler_environment,
 )
 
@@ -281,7 +282,8 @@ def _job_script(config: ClusterConfig, family: str) -> str:
         f"data.root={execution['data_root']}",
         f"output_root={output_dir}",
         f"seed={execution['seed']}",
-        f"logging.project={COMET_NAMESPACE}",
+        f"logging.project={COMET_PROJECT_NAME}",
+        f"logging.experiment_name={COMET_EXPERIMENT_NAME}",
     ]
     return "\n".join(
         (
@@ -391,8 +393,12 @@ def validate_job_payload(payload: Mapping[str, Any]) -> None:
     script = payload.get("script")
     if not isinstance(script, str) or "set -euo pipefail" not in script:
         raise ClusterConfigError("job script must be fail-closed")
-    if f"logging.project={COMET_NAMESPACE}" not in script:
-        raise ClusterConfigError("job script must pin the approved logging namespace")
+    if f"logging.project={COMET_PROJECT_NAME}" not in script:
+        raise ClusterConfigError("job script must pin the approved Comet project")
+    if f"logging.experiment_name={COMET_EXPERIMENT_NAME}" not in script:
+        raise ClusterConfigError(
+            "job script must pin the approved Comet experiment name"
+        )
     if "export COMET_API_KEY=" in script:
         raise ClusterConfigError("job script must not contain a literal Comet key")
     if "COMET_API_KEY=$(" not in script or "export COMET_API_KEY" not in script:
@@ -514,7 +520,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 OmegaConf.create(
                     {
                         "status": "submitted",
-                        "project": COMET_NAMESPACE,
+                        "project": COMET_PROJECT_NAME,
+                        "experiment_name": COMET_EXPERIMENT_NAME,
                         "job_names": list(job_names),
                     }
                 ),

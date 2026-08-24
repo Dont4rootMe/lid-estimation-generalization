@@ -73,8 +73,10 @@ python -m experiments.cluster_submit \
 
 Launcher fail-closed фиксирует ровно две jobs по одной GPU, `queue_name=shared`,
 `priority_class=shared-medium` и literal job description
-`echimbulatov | ent-block-diffusion-eval #ID0137 #rnd`. Comet создаёт по одному
-experiment на model family; training и validation series разделены по dataset.
+`echimbulatov | ent-block-diffusion-eval #ID0137 #rnd`. Comet использует новый
+project `lid-generalization` и создаёт в нём по одному experiment с именем
+`ent-block-diffusion-eval` на model family; training и validation series
+разделены по dataset.
 API key читается только во время исполнения из mode-0600 Comet config и не
 попадает в Hydra YAML, scheduler environment, dry-run или manifests.
 
