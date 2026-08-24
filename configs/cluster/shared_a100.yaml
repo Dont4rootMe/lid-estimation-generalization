@@ -16,6 +16,7 @@ execution:
   repo_root: /home/jovyan/echimbulatov/fork_afedorov/constant_repos/lid-estimation-generalization
   python: /home/jovyan/.mlspace/envs/block-diff/bin/python
   module: experiments.pilot
+  entrypoint: /home/jovyan/echimbulatov/fork_afedorov/constant_repos/lid-estimation-generalization/experiments/pilot_job.py
   data_root: /home/jovyan/echimbulatov/fork_afedorov/constant_repos/lid-estimation-generalization/data/lid_benchmarks_exact/benchmarks
   output_dir: /home/jovyan/echimbulatov/fork_afedorov/constant_repos/lid-estimation-generalization/artifacts/pilot
   seed: 0

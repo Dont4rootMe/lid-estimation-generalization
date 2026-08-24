@@ -48,6 +48,7 @@ REPO_ROOT = (
 )
 BLOCK_DIFF_PYTHON = "/home/jovyan/.mlspace/envs/block-diff/bin/python"
 PILOT_MODULE = "experiments.pilot"
+PILOT_ENTRYPOINT = f"{REPO_ROOT}/experiments/pilot_job.py"
 DATA_ROOT = f"{REPO_ROOT}/data/lid_benchmarks_exact/benchmarks"
 OUTPUT_ROOT = f"{REPO_ROOT}/artifacts/pilot"
 _SAFE_SCRIPT = re.compile(r"[A-Za-z0-9_@%+=:,./ -]+\Z")
@@ -71,6 +72,7 @@ _EXECUTION_FIELDS = frozenset(
         "repo_root",
         "python",
         "module",
+        "entrypoint",
         "data_root",
         "output_dir",
         "seed",
@@ -214,6 +216,7 @@ def _validate_execution(value: Mapping[str, Any]) -> dict[str, Any]:
     for key in (
         "repo_root",
         "python",
+        "entrypoint",
         "data_root",
         "output_dir",
         "comet_config_file",
@@ -223,6 +226,7 @@ def _validate_execution(value: Mapping[str, Any]) -> dict[str, Any]:
         "repo_root": REPO_ROOT,
         "python": BLOCK_DIFF_PYTHON,
         "module": PILOT_MODULE,
+        "entrypoint": PILOT_ENTRYPOINT,
         "data_root": DATA_ROOT,
         "output_dir": OUTPUT_ROOT,
         "comet_config_file": COMET_CONFIG_PATH,
@@ -284,9 +288,7 @@ def _job_script(config: ClusterConfig, family: str) -> str:
     execution = config.execution
     output_dir = str(PurePosixPath(str(execution["output_dir"])) / family)
     python_args = [
-        str(execution["python"]),
-        "-m",
-        str(execution["module"]),
+        str(execution["entrypoint"]),
         f"pilot_model={family}",
         f"data.root={execution['data_root']}",
         f"output_root={output_dir}",
@@ -398,14 +400,14 @@ def validate_job_payload(payload: Mapping[str, Any]) -> None:
             "job script must be one safe command without shell operators"
         )
     command = shlex.split(script)
-    expected_prefix = [BLOCK_DIFF_PYTHON, "-m", PILOT_MODULE]
-    if command[:3] != expected_prefix:
+    expected_prefix = [PILOT_ENTRYPOINT]
+    if command[:1] != expected_prefix:
         raise ClusterConfigError(
-            "job script must directly invoke experiments.pilot with block-diff Python"
+            "job script must invoke the approved Python source entrypoint"
         )
-    if len(command) != 10:
+    if len(command) != 8:
         raise ClusterConfigError("job script must contain exactly seven Hydra overrides")
-    family_argument = command[3]
+    family_argument = command[1]
     if not family_argument.startswith("pilot_model="):
         raise ClusterConfigError("job script must select one approved model family")
     family = family_argument.removeprefix("pilot_model=")
@@ -420,7 +422,7 @@ def validate_job_payload(payload: Mapping[str, Any]) -> None:
         f"logging.experiment_name={COMET_EXPERIMENT_NAME}",
         f"logging.workspace={COMET_WORKSPACE_NAME}",
     ]
-    if command[3:] != expected_arguments:
+    if command[1:] != expected_arguments:
         raise ClusterConfigError("job script Hydra overrides differ from the allowlist")
     if f"logging.project={COMET_PROJECT_NAME}" not in script:
         raise ClusterConfigError("job script must pin the approved Comet project")

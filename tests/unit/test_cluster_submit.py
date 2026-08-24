@@ -17,6 +17,7 @@ from experiments.cluster_submit import (
     ClusterSubmissionError,
     INSTANCE_TYPE,
     JOB_DESC,
+    PILOT_ENTRYPOINT,
     build_job_payload,
     load_cluster_config,
     main,
@@ -90,7 +91,7 @@ def test_payload_has_no_serialized_secret_or_family_scheduler_metadata() -> None
         )
         assert "logging.workspace=dont4rootme" in payload["script"]
         assert payload["script"].startswith(
-            "/home/jovyan/.mlspace/envs/block-diff/bin/python -m experiments.pilot "
+            f"{PILOT_ENTRYPOINT} "
         )
         assert "\n" not in payload["script"]
         assert not re.search(r"[$;&|`<>()]", payload["script"])
