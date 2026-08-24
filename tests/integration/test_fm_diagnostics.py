@@ -548,6 +548,252 @@ def test_real_fp32_endpoint_score_conversion_uses_predictor_arithmetic(
     np.testing.assert_allclose(ideal, full, rtol=1e-11, atol=1e-11)
 
 
+def test_posterior_vp_conversion_bound_accounts_for_operand_cancellation(
+    tmp_path: Path,
+) -> None:
+    """A one-ulp kernel difference is scaled by the cancelling operands.
+
+    This reproduces the production posterior-VP failure at lambda=.3162 and
+    ambient dimension 784: two roughly 1e3 affine terms cancel to a velocity
+    near one, so one float32 ulp of an operand is much larger than a
+    result-relative allowance.  The operand-conditioned conversion must pass,
+    while a genuine field mismatch must still fail.
+    """
+
+    ambient_dim = 784
+    point = affine_schedule_point("vp_trigonometric", 0.3162)
+    state = diagnostics_module._numeric_schedule_scalars(point, compute_dtype="float32")
+    evaluation_point = np.full((1, ambient_dim), 210.0, dtype=np.float32)
+    point_term = state["beta_log_derivative"] * evaluation_point
+    coefficient = state["alpha_log_noise_derivative"]
+    posterior_mean = np.asarray(
+        (point_term - np.float32(1.0)) / coefficient,
+        dtype=np.float32,
+    )
+    cpu_velocity = np.asarray(
+        point_term - coefficient * posterior_mean,
+        dtype=np.float32,
+    )
+    gpu_like_point_term = np.nextafter(
+        point_term,
+        np.full_like(point_term, np.inf),
+    )
+    gpu_like_velocity = np.asarray(
+        gpu_like_point_term - coefficient * posterior_mean,
+        dtype=np.float32,
+    )
+    operand_ulp = float(gpu_like_point_term[0, 0] - point_term[0, 0])
+    assert operand_ulp == pytest.approx(0.0001220703125)
+    assert float(gpu_like_velocity[0, 0] - cpu_velocity[0, 0]) == pytest.approx(
+        operand_ulp
+    )
+    with pytest.raises(ValueError, match="unconditioned control exceeds"):
+        diagnostics_module._require_roundoff_consistency(
+            np.asarray(gpu_like_velocity, dtype=np.float64),
+            np.asarray(cpu_velocity, dtype=np.float64),
+            compute_dtype="float32",
+            label="unconditioned control",
+        )
+
+    posterior_divergence = np.asarray([float(ambient_dim)], dtype=np.float32)
+    alpha = state["alpha"]
+    beta = state["beta"]
+    score = np.asarray(
+        (alpha * posterior_mean - evaluation_point) / np.square(beta),
+        dtype=np.float32,
+    )
+    score_divergence = np.asarray(
+        (
+            alpha * posterior_divergence
+            - np.asarray(float(ambient_dim), dtype=np.float32)
+        )
+        / np.square(beta),
+        dtype=np.float32,
+    )
+    velocity_divergence = np.asarray(
+        [
+            (point.alpha_log_derivative + point.log_noise_ratio_derivative)
+            * ambient_dim
+            - point.log_noise_ratio_derivative
+            * point.alpha
+            * float(posterior_divergence[0])
+        ],
+        dtype=np.float64,
+    )
+
+    def primitives(velocity: np.ndarray) -> diagnostics_module.AffinePrimitiveBatch:
+        return diagnostics_module.AffinePrimitiveBatch(
+            velocity=np.asarray(velocity, dtype=np.float64),
+            velocity_divergence=velocity_divergence,
+            velocity_divergence_from_posterior=velocity_divergence,
+            evaluation_point=np.asarray(evaluation_point, dtype=np.float64),
+            posterior_mean=np.asarray(posterior_mean, dtype=np.float64),
+            posterior_divergence=np.asarray(posterior_divergence, dtype=np.float64),
+            score=np.asarray(score, dtype=np.float64),
+            score_divergence=np.asarray(score_divergence, dtype=np.float64),
+        )
+
+    query_model_space = np.asarray(evaluation_point, dtype=np.float64) / point.alpha
+    derived = diagnostics_module._derived_components(
+        primitives(gpu_like_velocity),
+        query_model_space,
+        point,
+        compute_dtype="float32",
+        parameterization="posterior_mean",
+    )
+    np.testing.assert_allclose(
+        derived["velocity_posterior_predictor_residual_norm"],
+        [np.sqrt(ambient_dim) * operand_ulp],
+        rtol=1e-12,
+        atol=1e-12,
+    )
+
+    corrupted_velocity = np.asarray(gpu_like_velocity + np.float32(0.1))
+    with pytest.raises(
+        ValueError,
+        match="velocity reconstructed from posterior exceeds",
+    ):
+        diagnostics_module._derived_components(
+            primitives(corrupted_velocity),
+            query_model_space,
+            point,
+            compute_dtype="float32",
+            parameterization="posterior_mean",
+        )
+
+    class Float32Marker:
+        def parameters(self):  # type: ignore[no-untyped-def]
+            return iter((SimpleNamespace(dtype="torch.float32"),))
+
+    def cancellation_primitive(
+        _trained: object,
+        raw_query: np.ndarray,
+        scale: float,
+        *,
+        family: str,
+        divergence_backend: str,
+        trace_probes: int,
+        trace_seed: int,
+        batch_size: int,
+    ) -> SimpleNamespace:
+        assert family == "independent_affine_flow"
+        assert trace_seed == 137
+        assert batch_size == 1
+        local_point = affine_schedule_point("vp_trigonometric", scale)
+        local_state = diagnostics_module._numeric_schedule_scalars(
+            local_point, compute_dtype="float32"
+        )
+        channel_point = np.asarray(raw_query, dtype=np.float32).reshape(
+            raw_query.shape[0], -1
+        )
+        local_evaluation_point = np.asarray(
+            local_state["alpha"] * channel_point,
+            dtype=np.float32,
+        )
+        local_point_term = local_state["beta_log_derivative"] * local_evaluation_point
+        local_coefficient = local_state["alpha_log_noise_derivative"]
+        local_posterior = np.asarray(
+            (local_point_term - np.float32(1.0)) / local_coefficient,
+            dtype=np.float32,
+        )
+        gpu_like_term = np.nextafter(
+            local_point_term,
+            np.full_like(local_point_term, np.inf),
+        )
+        local_velocity = np.asarray(
+            gpu_like_term - local_coefficient * local_posterior,
+            dtype=np.float32,
+        )
+        local_posterior_divergence = np.full(
+            channel_point.shape[0],
+            float(channel_point.shape[1]),
+            dtype=np.float32,
+        )
+        local_velocity_divergence = (
+            local_point.alpha_log_derivative + local_point.log_noise_ratio_derivative
+        ) * channel_point.shape[
+            1
+        ] - local_point.log_noise_ratio_derivative * local_point.alpha * np.asarray(
+            local_posterior_divergence, dtype=np.float64
+        )
+        local_score = np.asarray(
+            (local_state["alpha"] * local_posterior - local_evaluation_point)
+            / np.square(local_state["beta"]),
+            dtype=np.float32,
+        )
+        local_score_divergence = np.asarray(
+            (
+                local_state["alpha"] * local_posterior_divergence
+                - np.asarray(float(channel_point.shape[1]), dtype=np.float32)
+            )
+            / np.square(local_state["beta"]),
+            dtype=np.float32,
+        )
+        return SimpleNamespace(
+            velocity=local_velocity,
+            velocity_divergence=local_velocity_divergence,
+            velocity_divergence_from_posterior=local_velocity_divergence,
+            evaluation_point=local_evaluation_point,
+            channel_point=channel_point,
+            posterior_mean=local_posterior,
+            posterior_divergence=local_posterior_divergence,
+            marginal_score=local_score,
+            marginal_score_divergence=local_score_divergence,
+            variant_id="posterior_vp_trigonometric_flow",
+            schedule="vp_trigonometric",
+            parameterization="posterior_mean",
+            noise_ratio=local_point.noise_ratio,
+            native_time=local_point.native_coordinate,
+            alpha=local_point.alpha,
+            beta=local_point.beta,
+            alpha_derivative=local_point.alpha_derivative,
+            beta_derivative=local_point.beta_derivative,
+            alpha_log_derivative=local_point.alpha_log_derivative,
+            log_noise_ratio_derivative=local_point.log_noise_ratio_derivative,
+            divergence_backend=divergence_backend,
+            trace_probe_kind=(
+                "rademacher" if divergence_backend == "hutchinson" else "exact"
+            ),
+            trace_seed=trace_seed if divergence_backend == "hutchinson" else None,
+            trace_probes=trace_probes if divergence_backend == "hutchinson" else 0,
+            shared_posterior_velocity_probes=False,
+            primary_trace_field="posterior_mean",
+            velocity_divergence_source="derived_from_posterior_trace",
+        )
+
+    sealed_query = np.full((2, ambient_dim), 220.0, dtype=np.float32)
+    sealed_config = _config()
+    sealed_config.update(
+        exact_subset_size=1,
+        oracle_reference_size=2,
+        oracle_chunk_size=1,
+        batch_size=1,
+    )
+    output = run_fm_diagnostics(
+        tmp_path / "sealed-posterior-vp-cancellation",
+        variant_id="posterior_vp_trigonometric_flow",
+        trained=SimpleNamespace(
+            model=Float32Marker(), checkpoint_sha256=CHECKPOINT_SHA256
+        ),
+        query=sealed_query,
+        query_model_space=sealed_query,
+        target=np.full(sealed_query.shape[0], 5.0, dtype=np.float64),
+        oracle_reference_model_space=np.vstack(
+            (sealed_query, sealed_query + np.float32(0.25))
+        ),
+        scales=[0.3162, 0.5],
+        config=sealed_config,
+        primitive_fn=cancellation_primitive,
+    )
+    assert validate_fm_diagnostics(output) == []
+    sealed_residual = np.load(
+        output / "arrays" / "velocity_posterior_predictor_residual_norm.npy",
+        allow_pickle=False,
+    )
+    assert sealed_residual.shape == (2, 2)
+    assert np.all(sealed_residual > 0.0)
+
+
 def test_real_trained_direct_rectified_field_identity_uses_predictor_arithmetic(
     tmp_path: Path,
 ) -> None:

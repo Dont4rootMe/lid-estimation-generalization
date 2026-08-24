@@ -425,6 +425,43 @@ def _predictor_field_conversions(
     )
 
 
+def _predictor_field_conversion_roundoff_scales(
+    primitives: AffinePrimitiveBatch,
+    point: AffineSchedulePoint,
+    *,
+    compute_dtype: str,
+) -> tuple[FloatArray, FloatArray]:
+    """Return componentwise forward-error scales for the q<->v conversions.
+
+    Both conversions contain a potentially ill-conditioned subtraction.  A
+    result-relative tolerance is therefore invalid when the two affine terms
+    nearly cancel: the standard floating-point forward-error scale for
+    ``a - b`` is ``abs(a) + abs(b)``, not ``abs(a - b)``.  For the posterior
+    conversion the numerator scale is additionally divided by
+    ``abs(alpha * kappa)`` so it is expressed in posterior-coordinate units.
+
+    The operands are formed in the checkpoint's compute dtype and in the same
+    operation order as the predictor.  This bounds CPU/GPU FMA and rounding
+    differences without relaxing identities that do not use these affine
+    conversions.
+    """
+
+    dtype = np.float32 if compute_dtype == "float32" else np.float64
+    state = _numeric_schedule_scalars(point, compute_dtype=compute_dtype)
+    evaluation_point = np.asarray(primitives.evaluation_point, dtype=dtype)
+    velocity = np.asarray(primitives.velocity, dtype=dtype)
+    posterior = np.asarray(primitives.posterior_mean, dtype=dtype)
+    point_term = state["beta_log_derivative"] * evaluation_point
+    posterior_term = state["alpha_log_noise_derivative"] * posterior
+    denominator = np.abs(state["alpha_log_noise_derivative"])
+    posterior_scale = (np.abs(point_term) + np.abs(velocity)) / denominator
+    velocity_scale = np.abs(point_term) + np.abs(posterior_term)
+    return (
+        np.asarray(posterior_scale, dtype=np.float64),
+        np.asarray(velocity_scale, dtype=np.float64),
+    )
+
+
 def _predictor_score_conversion(
     primitives: AffinePrimitiveBatch,
     point: AffineSchedulePoint,
@@ -456,17 +493,25 @@ def _require_roundoff_consistency(
     *,
     compute_dtype: str,
     label: str,
+    forward_error_scale: FloatArray | None = None,
 ) -> None:
     """Gate arithmetic identities by a scale-relative floating-point bound."""
 
     dtype = np.float32 if compute_dtype == "float32" else np.float64
     epsilon = float(np.finfo(dtype).eps)
-    magnitude = np.maximum.reduce(
-        [np.ones_like(actual), np.abs(actual), np.abs(expected)]
-    )
+    scales = [np.ones_like(actual), np.abs(actual), np.abs(expected)]
+    if forward_error_scale is not None:
+        conditioning_scale = np.asarray(forward_error_scale, dtype=np.float64)
+        if conditioning_scale.shape != actual.shape:
+            raise ValueError(f"{label} roundoff scale shape mismatch")
+        if not np.isfinite(conditioning_scale).all() or np.any(conditioning_scale < 0):
+            raise ValueError(f"{label} roundoff scale must be finite and non-negative")
+        scales.append(conditioning_scale)
+    magnitude = np.maximum.reduce(scales)
     # The conversion has multiply/subtract/square/divide plus schedule
     # evaluation.  Sixty-four unit roundoffs is conservative across CPU/GPU
-    # kernels while remaining relative to the endpoint-amplified result.
+    # kernels.  For cancellation-prone affine conversions ``magnitude`` also
+    # includes their componentwise operand-based forward-error scale.
     allowance = 64.0 * epsilon * magnitude
     error = np.abs(actual - expected)
     if np.all(error <= allowance):
@@ -803,12 +848,20 @@ def _derived_components(
         point,
         compute_dtype=compute_dtype,
     )
+    q_roundoff_scale, velocity_roundoff_scale = (
+        _predictor_field_conversion_roundoff_scales(
+            primitives,
+            point,
+            compute_dtype=compute_dtype,
+        )
+    )
     if parameterization == "direct_velocity":
         _require_roundoff_consistency(
             primitives.posterior_mean,
             reconstructed_q,
             compute_dtype=compute_dtype,
             label="posterior reconstructed from direct velocity",
+            forward_error_scale=q_roundoff_scale,
         )
     elif parameterization == "posterior_mean":
         _require_roundoff_consistency(
@@ -816,6 +869,7 @@ def _derived_components(
             reconstructed_velocity,
             compute_dtype=compute_dtype,
             label="velocity reconstructed from posterior",
+            forward_error_scale=velocity_roundoff_scale,
         )
     else:  # pragma: no cover - variant identity is closed before inference.
         raise AssertionError(f"unsupported parameterization {parameterization!r}")
@@ -2110,6 +2164,20 @@ def validate_fm_diagnostics(output_dir: Path) -> list[str]:
         expected_full = expected_response + expected_correction
         ideal_score = (point.alpha * q - point.alpha * query) / (point.beta**2)
         ideal_score_divergence = (point.alpha * q_div - ambient_dim) / (point.beta**2)
+        primary_primitives = AffinePrimitiveBatch(
+            velocity=np.asarray(velocity),
+            velocity_divergence=np.asarray(arrays["velocity_divergence"][:, index]),
+            velocity_divergence_from_posterior=np.asarray(
+                arrays["velocity_divergence_from_posterior"][:, index]
+            ),
+            evaluation_point=np.asarray(evaluation_point),
+            posterior_mean=np.asarray(q),
+            posterior_divergence=np.asarray(q_div),
+            # The full primary score field is intentionally not persisted;
+            # these fields are unused by the q<->v conversion helpers.
+            score=np.asarray(ideal_score),
+            score_divergence=np.asarray(arrays["score_divergence"][:, index]),
+        )
         expected_score_readout = ambient_dim + point.beta**2 * (
             arrays["score_divergence"][:, index] + arrays["score_norm_sq"][:, index]
         )
@@ -2131,11 +2199,16 @@ def validate_fm_diagnostics(output_dir: Path) -> list[str]:
         ) / (point.log_noise_ratio_derivative * point.alpha)
         compute_dtype = str(metadata.get("compute_dtype"))
         predictor_reconstructed_q, predictor_reconstructed_velocity = (
-            _predictor_field_conversions_from_arrays(
-                velocity=velocity,
-                evaluation_point=evaluation_point,
-                posterior_mean=q,
-                point=point,
+            _predictor_field_conversions(
+                primary_primitives,
+                point,
+                compute_dtype=compute_dtype,
+            )
+        )
+        q_roundoff_scale, velocity_roundoff_scale = (
+            _predictor_field_conversion_roundoff_scales(
+                primary_primitives,
+                point,
                 compute_dtype=compute_dtype,
             )
         )
@@ -2351,14 +2424,17 @@ def validate_fm_diagnostics(output_dir: Path) -> list[str]:
             field_identity_actual = q
             field_identity_expected = predictor_reconstructed_q
             field_identity_label = "posterior reconstructed from direct velocity"
+            field_identity_roundoff_scale = q_roundoff_scale
         elif parameterization == "posterior_mean":
             field_identity_actual = velocity
             field_identity_expected = predictor_reconstructed_velocity
             field_identity_label = "velocity reconstructed from posterior"
+            field_identity_roundoff_scale = velocity_roundoff_scale
         else:  # Reported separately by the metadata contract above.
             field_identity_actual = None
             field_identity_expected = None
             field_identity_label = "invalid parameterization"
+            field_identity_roundoff_scale = None
         if field_identity_actual is not None:
             try:
                 _require_roundoff_consistency(
@@ -2366,6 +2442,7 @@ def validate_fm_diagnostics(output_dir: Path) -> list[str]:
                     field_identity_expected,
                     compute_dtype=compute_dtype,
                     label=field_identity_label,
+                    forward_error_scale=field_identity_roundoff_scale,
                 )
             except ValueError as exc:
                 errors.append(f"scale index {index}: {exc}")
