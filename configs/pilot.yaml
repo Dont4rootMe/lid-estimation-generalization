@@ -4,7 +4,7 @@ defaults:
 
 schema_version: 1
 project: lid-generalization
-experiment_name: ent-block-diffusion-eval
+experiment_name: ${pilot_model.experiment_name}
 seed: 137
 output_root: artifacts/pilot
 
@@ -29,13 +29,13 @@ evaluation:
 
 logging:
   backend: comet
-  project: lid-generalization
-  experiment_name: ent-block-diffusion-eval
+  project: ${project}
+  experiment_name: ${experiment_name}
   workspace: dont4rootme
 
 hydra:
   job:
-    name: ent-block-diffusion-eval
+    name: ${experiment_name}
     chdir: false
   run:
     dir: artifacts/hydra/pilot/${pilot_model.family}/${now:%Y-%m-%d}/${now:%H-%M-%S-%f}

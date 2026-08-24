@@ -1,5 +1,6 @@
 name: rectified_flow
 family: rectified_flow
+experiment_name: lid-generalization-e8-suite-rectified-flow-matching-seed-${seed}
 readout: full
 selection_prefer: larger
 

@@ -32,7 +32,6 @@ environment:
   MLS_JOB_TOTAL_GPU: 1
   MLS_JOB_REGION_NAME: A100-MT
   COMET_PROJECT_NAME: lid-generalization
-  COMET_EXPERIMENT_NAME: ent-block-diffusion-eval
   COMET_WORKSPACE: dont4rootme
   COMET_CONFIG: /home/jovyan/.comet.config
   COMET_MODE: online

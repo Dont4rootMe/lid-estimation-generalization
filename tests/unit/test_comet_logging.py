@@ -8,7 +8,6 @@ import pytest
 
 from experiments.comet_logging import (
     COMET_CONFIG_PATH,
-    COMET_EXPERIMENT_NAME,
     COMET_PROJECT_NAME,
     COMET_WORKSPACE_NAME,
     CometConfigurationError,
@@ -16,6 +15,12 @@ from experiments.comet_logging import (
     create_comet_event_logger,
     require_comet_environment,
     safe_scheduler_environment,
+)
+
+
+EXPERIMENT_NAMES = (
+    "lid-generalization-e8-suite-diffusion-seed-0",
+    "lid-generalization-e8-suite-rectified-flow-matching-seed-0",
 )
 
 
@@ -65,7 +70,7 @@ def test_public_scheduler_environment_is_fixed_and_secret_free(
     environment = safe_scheduler_environment()
     assert "COMET_API_KEY" not in environment
     assert environment["COMET_PROJECT_NAME"] == COMET_PROJECT_NAME
-    assert environment["COMET_EXPERIMENT_NAME"] == COMET_EXPERIMENT_NAME
+    assert "COMET_EXPERIMENT_NAME" not in environment
     assert environment["COMET_WORKSPACE"] == COMET_WORKSPACE_NAME
     assert environment["COMET_CONFIG"] == COMET_CONFIG_PATH
     assert "do-not-copy" not in repr(environment)
@@ -86,7 +91,9 @@ def test_comet_environment_is_required_and_namespace_is_exact() -> None:
         require_comet_environment(
             {
                 **safe_scheduler_environment(),
-                "COMET_EXPERIMENT_NAME": COMET_PROJECT_NAME,
+                "COMET_EXPERIMENT_NAME": (
+                    "lid-generalization-e8-suite-diffusion-seed-0"
+                ),
             }
         )
     with pytest.raises(CometConfigurationError, match="COMET_WORKSPACE"):
@@ -95,14 +102,16 @@ def test_comet_environment_is_required_and_namespace_is_exact() -> None:
         )
 
 
+@pytest.mark.parametrize("experiment_name", EXPERIMENT_NAMES)
 def test_factory_never_passes_api_key_to_comet_sdk(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, experiment_name: str
 ) -> None:
     FakeExperiment.instances.clear()
     monkeypatch.setitem(
         sys.modules, "comet_ml", types.SimpleNamespace(Experiment=FakeExperiment)
     )
     logger = create_comet_event_logger(
+        experiment_name=experiment_name,
         tags=("diffusion",), environ=safe_scheduler_environment()
     )
     experiment = FakeExperiment.instances[-1]
@@ -110,8 +119,8 @@ def test_factory_never_passes_api_key_to_comet_sdk(
         "project_name": COMET_PROJECT_NAME,
         "workspace": COMET_WORKSPACE_NAME,
     }
-    assert experiment.names == [COMET_EXPERIMENT_NAME]
-    assert experiment.tags == [COMET_EXPERIMENT_NAME, "diffusion"]
+    assert experiment.names == [experiment_name]
+    assert experiment.tags == [experiment_name, "diffusion"]
     logger.end()
     assert experiment.ended
 
@@ -124,6 +133,7 @@ def test_production_callback_factory_returns_callback_and_close(
         sys.modules, "comet_ml", types.SimpleNamespace(Experiment=FakeExperiment)
     )
     callback, close = create_comet_callback(
+        experiment_name="lid-generalization-e8-suite-diffusion-seed-0",
         tags=("diffusion",), environ=safe_scheduler_environment()
     )
     callback("training", {"step": 1, "loss": 0.75})
@@ -141,6 +151,9 @@ def test_event_callback_logs_nested_metrics_and_parameters(
         sys.modules, "comet_ml", types.SimpleNamespace(Experiment=FakeExperiment)
     )
     logger = create_comet_event_logger(
+        experiment_name=(
+            "lid-generalization-e8-suite-rectified-flow-matching-seed-0"
+        ),
         environ=safe_scheduler_environment()
     )
     logger(
@@ -168,7 +181,25 @@ def test_event_callback_rejects_secret_like_fields(
         sys.modules, "comet_ml", types.SimpleNamespace(Experiment=FakeExperiment)
     )
     logger = create_comet_event_logger(
+        experiment_name="lid-generalization-e8-suite-diffusion-seed-0",
         environ=safe_scheduler_environment()
     )
     with pytest.raises(CometConfigurationError, match="secret-like field"):
         logger("training", {"metadata": {"access_token": "do-not-log"}})
+
+
+@pytest.mark.parametrize(
+    "experiment_name",
+    ["", "Rectified Flow", "rectified_flow", "ent-block-diffusion-eval"],
+)
+def test_factory_rejects_non_convention_experiment_names(
+    monkeypatch: pytest.MonkeyPatch, experiment_name: str
+) -> None:
+    monkeypatch.setitem(
+        sys.modules, "comet_ml", types.SimpleNamespace(Experiment=FakeExperiment)
+    )
+    with pytest.raises(CometConfigurationError, match="kebab-case"):
+        create_comet_event_logger(
+            experiment_name=experiment_name,
+            environ=safe_scheduler_environment(),
+        )

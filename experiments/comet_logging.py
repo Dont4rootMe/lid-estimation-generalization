@@ -14,18 +14,19 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import stat
 from typing import Any, Callable, Protocol
 
 
 COMET_PROJECT_NAME = "lid-generalization"
-COMET_EXPERIMENT_NAME = "ent-block-diffusion-eval"
 COMET_WORKSPACE_NAME = "dont4rootme"
 COMET_API_KEY_ENV = "COMET_API_KEY"
 COMET_CONFIG_ENV = "COMET_CONFIG"
 COMET_CONFIG_PATH = "/home/jovyan/.comet.config"
 COMET_WORKSPACE_ENV = "COMET_WORKSPACE"
 _FORBIDDEN_KEY_PARTS = ("api_key", "apikey", "password", "secret", "token")
+_EXPERIMENT_NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 
 
 class CometConfigurationError(RuntimeError):
@@ -69,7 +70,6 @@ def require_comet_environment(
         COMET_CONFIG_ENV: COMET_CONFIG_PATH,
         COMET_WORKSPACE_ENV: COMET_WORKSPACE_NAME,
         "COMET_PROJECT_NAME": COMET_PROJECT_NAME,
-        "COMET_EXPERIMENT_NAME": COMET_EXPERIMENT_NAME,
     }
     for variable, expected in required_names.items():
         configured = source.get(variable)
@@ -77,6 +77,10 @@ def require_comet_environment(
             raise CometConfigurationError(
                 f"{variable} must be exactly {expected!r}"
             )
+    if "COMET_EXPERIMENT_NAME" in source:
+        raise CometConfigurationError(
+            "COMET_EXPERIMENT_NAME must be absent; Hydra owns the experiment name"
+        )
     if environ is None:
         config_path = Path(COMET_CONFIG_PATH)
         try:
@@ -107,7 +111,6 @@ def safe_scheduler_environment() -> dict[str, str]:
         COMET_CONFIG_ENV: COMET_CONFIG_PATH,
         COMET_WORKSPACE_ENV: COMET_WORKSPACE_NAME,
         "COMET_PROJECT_NAME": COMET_PROJECT_NAME,
-        "COMET_EXPERIMENT_NAME": COMET_EXPERIMENT_NAME,
         "COMET_MODE": "online",
         "COMET_LOGGING_CONSOLE": "true",
     }
@@ -148,16 +151,33 @@ def _flatten(
     return flattened
 
 
+def _validate_experiment_name(experiment_name: str) -> str:
+    if (
+        not isinstance(experiment_name, str)
+        or not _EXPERIMENT_NAME.fullmatch(experiment_name)
+        or experiment_name.startswith("ent-block-")
+        or experiment_name.endswith("-eval")
+    ):
+        raise CometConfigurationError(
+            "Comet experiment name must be a model-specific lowercase "
+            "kebab-case identifier without legacy affixes"
+        )
+    return experiment_name
+
+
 class CometEventLogger:
     """Callable adapter for ``run_pilot(..., log_callback=...)``."""
 
-    def __init__(self, experiment: _CometExperiment) -> None:
+    def __init__(
+        self, experiment: _CometExperiment, *, experiment_name: str
+    ) -> None:
         self._experiment = experiment
+        self._experiment_name = experiment_name
 
     def __repr__(self) -> str:
         return (
             f"{type(self).__name__}(project={COMET_PROJECT_NAME!r}, "
-            f"experiment={COMET_EXPERIMENT_NAME!r})"
+            f"experiment={self._experiment_name!r})"
         )
 
     def __call__(self, event_name: str, payload: Mapping[str, Any]) -> None:
@@ -206,6 +226,7 @@ class CometEventLogger:
 
 def create_comet_event_logger(
     *,
+    experiment_name: str,
     tags: tuple[str, ...] = (),
     environ: Mapping[str, str] | None = None,
 ) -> CometEventLogger:
@@ -217,6 +238,7 @@ def create_comet_event_logger(
     """
 
     require_comet_environment(environ)
+    experiment_name = _validate_experiment_name(experiment_name)
     for tag in tags:
         if not isinstance(tag, str) or not tag.strip():
             raise CometConfigurationError("Comet tags must be non-empty strings")
@@ -225,15 +247,16 @@ def create_comet_event_logger(
         project_name=COMET_PROJECT_NAME,
         workspace=COMET_WORKSPACE_NAME,
     )
-    experiment.set_name(COMET_EXPERIMENT_NAME)
-    experiment.add_tag(COMET_EXPERIMENT_NAME)
+    experiment.set_name(experiment_name)
+    experiment.add_tag(experiment_name)
     for tag in tags:
         experiment.add_tag(tag)
-    return CometEventLogger(experiment)
+    return CometEventLogger(experiment, experiment_name=experiment_name)
 
 
 def create_comet_callback(
     *,
+    experiment_name: str,
     tags: tuple[str, ...] = (),
     environ: Mapping[str, str] | None = None,
 ) -> tuple[
@@ -242,7 +265,11 @@ def create_comet_callback(
 ]:
     """Return the callback/close pair consumed by the pilot runner."""
 
-    logger = create_comet_event_logger(tags=tags, environ=environ)
+    logger = create_comet_event_logger(
+        experiment_name=experiment_name,
+        tags=tags,
+        environ=environ,
+    )
     return logger, logger.end
 
 
@@ -250,7 +277,6 @@ __all__ = [
     "COMET_API_KEY_ENV",
     "COMET_CONFIG_ENV",
     "COMET_CONFIG_PATH",
-    "COMET_EXPERIMENT_NAME",
     "COMET_PROJECT_NAME",
     "COMET_WORKSPACE_ENV",
     "COMET_WORKSPACE_NAME",

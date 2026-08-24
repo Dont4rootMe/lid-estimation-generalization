@@ -24,7 +24,6 @@ from experiments.comet_logging import (
     COMET_API_KEY_ENV,
     COMET_CONFIG_ENV,
     COMET_CONFIG_PATH,
-    COMET_EXPERIMENT_NAME,
     COMET_PROJECT_NAME,
     COMET_WORKSPACE_NAME,
     safe_scheduler_environment,
@@ -84,7 +83,9 @@ _TOP_LEVEL_FIELDS = frozenset(
     {"schema_version", "scheduler", "execution", "environment"}
 )
 _FORBIDDEN_METADATA_TOKENS = (
+    "diffusion",
     "rectified_flow",
+    "rectified-flow-matching",
     "affine_fm",
     "gaussian_diffusion",
     "e8_gaussian4_pca",
@@ -121,7 +122,31 @@ class ClusterConfig:
 @dataclass(frozen=True)
 class PlannedJob:
     family: str
+    experiment_name: str
     payload: Mapping[str, Any]
+
+
+def _experiment_name_for_family(family: str) -> str:
+    """Resolve the Comet name from the selected Hydra model group."""
+
+    if family not in APPROVED_FAMILIES:
+        raise ClusterConfigError(f"unapproved pilot family: {family!r}")
+    from experiments.pilot import compose_pilot_config, validate_pilot_config
+
+    try:
+        resolved = validate_pilot_config(
+            compose_pilot_config((f"pilot_model={family}", "seed=0"))
+        )
+    except Exception as error:
+        raise ClusterConfigError(
+            f"cannot resolve Hydra experiment name for family {family!r}"
+        ) from error
+    experiment_name = resolved.get("experiment_name")
+    if not isinstance(experiment_name, str) or not experiment_name:
+        raise ClusterConfigError(
+            f"Hydra experiment name for family {family!r} must be non-empty"
+        )
+    return experiment_name
 
 
 def _reject_unknown_fields(
@@ -166,6 +191,11 @@ def _validate_environment(value: Mapping[str, Any]) -> dict[str, str | int]:
                 f"environment value {key!r} must be a string or integer"
             )
         result[key] = item
+
+    if "COMET_EXPERIMENT_NAME" in result:
+        raise ClusterConfigError(
+            "environment.COMET_EXPERIMENT_NAME is forbidden; Hydra owns the name"
+        )
 
     required_public = safe_scheduler_environment()
     for key, expected in required_public.items():
@@ -287,6 +317,7 @@ def load_cluster_config(path: str | Path) -> ClusterConfig:
 def _job_script(config: ClusterConfig, family: str) -> str:
     execution = config.execution
     output_dir = str(PurePosixPath(str(execution["output_dir"])) / family)
+    experiment_name = _experiment_name_for_family(family)
     python_args = [
         str(execution["entrypoint"]),
         f"pilot_model={family}",
@@ -294,7 +325,7 @@ def _job_script(config: ClusterConfig, family: str) -> str:
         f"output_root={output_dir}",
         f"seed={execution['seed']}",
         f"logging.project={COMET_PROJECT_NAME}",
-        f"logging.experiment_name={COMET_EXPERIMENT_NAME}",
+        f"logging.experiment_name={experiment_name}",
         f"logging.workspace={COMET_WORKSPACE_NAME}",
     ]
     return shlex.join(python_args)
@@ -384,7 +415,11 @@ def validate_job_payload(payload: Mapping[str, Any]) -> None:
     # The script necessarily selects a family.  All remaining scheduler-visible
     # metadata must stay family/dataset agnostic, apart from the fixed approved
     # namespace embedded verbatim in JOB_DESC and public Comet settings.
-    metadata = {key: value for key, value in payload.items() if key != "script"}
+    metadata = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"script", "job_desc", "base_image"}
+    }
     for text in _walk_strings(metadata):
         lowered = text.lower()
         if any(token in lowered for token in _FORBIDDEN_METADATA_TOKENS):
@@ -413,20 +448,21 @@ def validate_job_payload(payload: Mapping[str, Any]) -> None:
     family = family_argument.removeprefix("pilot_model=")
     if family not in APPROVED_FAMILIES:
         raise ClusterConfigError("job script selects an unapproved model family")
+    experiment_name = _experiment_name_for_family(family)
     expected_arguments = [
         f"pilot_model={family}",
         f"data.root={DATA_ROOT}",
         f"output_root={OUTPUT_ROOT}/{family}",
         "seed=0",
         f"logging.project={COMET_PROJECT_NAME}",
-        f"logging.experiment_name={COMET_EXPERIMENT_NAME}",
+        f"logging.experiment_name={experiment_name}",
         f"logging.workspace={COMET_WORKSPACE_NAME}",
     ]
     if command[1:] != expected_arguments:
         raise ClusterConfigError("job script Hydra overrides differ from the allowlist")
     if f"logging.project={COMET_PROJECT_NAME}" not in script:
         raise ClusterConfigError("job script must pin the approved Comet project")
-    if f"logging.experiment_name={COMET_EXPERIMENT_NAME}" not in script:
+    if f"logging.experiment_name={experiment_name}" not in script:
         raise ClusterConfigError(
             "job script must pin the approved Comet experiment name"
         )
@@ -436,10 +472,24 @@ def validate_job_payload(payload: Mapping[str, Any]) -> None:
         raise ClusterConfigError("job script must not handle Comet environment values")
 
 
-def plan_jobs(config: ClusterConfig) -> tuple[PlannedJob, ...]:
+def _selected_families(family: str | None) -> tuple[str, ...]:
+    if family is None:
+        return APPROVED_FAMILIES
+    if family not in APPROVED_FAMILIES:
+        raise ClusterConfigError(f"unapproved pilot family: {family!r}")
+    return (family,)
+
+
+def plan_jobs(
+    config: ClusterConfig, family: str | None = None
+) -> tuple[PlannedJob, ...]:
     return tuple(
-        PlannedJob(family=family, payload=build_job_payload(config, family))
-        for family in APPROVED_FAMILIES
+        PlannedJob(
+            family=selected,
+            experiment_name=_experiment_name_for_family(selected),
+            payload=build_job_payload(config, selected),
+        )
+        for selected in _selected_families(family)
     )
 
 
@@ -475,10 +525,12 @@ def _validated_submission_name(job: Any, response: Any) -> str:
     return name
 
 
-def submit_jobs(config: ClusterConfig) -> tuple[str, ...]:
-    """Submit both jobs only after all local and payload checks pass."""
+def submit_jobs(
+    config: ClusterConfig, family: str | None = None
+) -> tuple[str, ...]:
+    """Submit the selected jobs only after all local and payload checks pass."""
 
-    jobs = plan_jobs(config)
+    jobs = plan_jobs(config, family)
     _validate_runtime_secret_file(str(config.execution["comet_config_file"]))
     client_lib = importlib.import_module("client_lib")
     scheduler_jobs: list[Any] = []
@@ -511,7 +563,11 @@ def _dry_run_document(jobs: Sequence[PlannedJob]) -> str:
         "schema_version": 1,
         "mode": "dry-run",
         "jobs": [
-            {"family": planned.family, "payload": dict(planned.payload)}
+            {
+                "family": planned.family,
+                "experiment_name": planned.experiment_name,
+                "payload": dict(planned.payload),
+            }
             for planned in jobs
         ],
     }
@@ -534,6 +590,11 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=_default_config_path())
     parser.add_argument(
+        "--family",
+        choices=APPROVED_FAMILIES,
+        help="plan or submit only one approved family (default: both)",
+    )
+    parser.add_argument(
         "--submit",
         action="store_true",
         help="submit after validation (default: print a secret-free dry run)",
@@ -544,15 +605,19 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     config = load_cluster_config(args.config)
+    selected_families = _selected_families(args.family)
     if args.submit:
-        job_names = submit_jobs(config)
+        job_names = submit_jobs(config, args.family)
         print(
             OmegaConf.to_yaml(
                 OmegaConf.create(
                     {
                         "status": "submitted",
                         "project": COMET_PROJECT_NAME,
-                        "experiment_name": COMET_EXPERIMENT_NAME,
+                        "experiment_names": {
+                            family: _experiment_name_for_family(family)
+                            for family in selected_families
+                        },
                         "job_names": list(job_names),
                     }
                 ),
@@ -562,7 +627,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             end="",
         )
     else:
-        print(_dry_run_document(plan_jobs(config)), end="")
+        print(_dry_run_document(plan_jobs(config, args.family)), end="")
     return 0
 
 

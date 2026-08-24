@@ -1,5 +1,6 @@
 name: diffusion
 family: diffusion
+experiment_name: lid-generalization-e8-suite-diffusion-seed-${seed}
 readout: full
 selection_prefer: smaller
 

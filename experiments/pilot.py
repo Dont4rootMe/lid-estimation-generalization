@@ -44,7 +44,6 @@ from utils.provenance import sha256_file
 
 
 PROJECT_NAME = "lid-generalization"
-EXPERIMENT_NAME = "ent-block-diffusion-eval"
 WORKSPACE_NAME = "dont4rootme"
 PILOT_DATASETS = (
     "e8_gaussian4_pca",
@@ -56,6 +55,11 @@ _FAMILY_FOR_ARTIFACTS = {
     "diffusion": "gaussian_diffusion",
     "gaussian_diffusion": "gaussian_diffusion",
     "rectified_flow": "rectified_flow",
+}
+_EXPERIMENT_NAME_STEM = {
+    "diffusion": "lid-generalization-e8-suite-diffusion",
+    "gaussian_diffusion": "lid-generalization-e8-suite-diffusion",
+    "rectified_flow": "lid-generalization-e8-suite-rectified-flow-matching",
 }
 _TRAINING_FIELDS = {
     "seed",
@@ -128,10 +132,15 @@ def compose_pilot_config(
 ) -> DictConfig:
     """Compose the pilot exclusively from Hydra YAML files."""
 
-    project_root = repository_root() if root is None else Path(root)
+    if root is None:
+        from experiments.cli import _default_config_dir
+
+        config_dir = _default_config_dir()
+    else:
+        config_dir = Path(root) / "configs"
     with initialize_config_dir(
         version_base="1.3",
-        config_dir=str((project_root / "configs").resolve()),
+        config_dir=str(config_dir.resolve()),
     ):
         config = compose(config_name="pilot", overrides=list(overrides))
     OmegaConf.set_struct(config, True)
@@ -209,13 +218,12 @@ def validate_pilot_config(
         value.get("schema_version"), bool
     ):
         raise PilotConfigError("pilot schema_version must be 1")
-    required_identity = {
-        "project": PROJECT_NAME,
-        "experiment_name": EXPERIMENT_NAME,
-    }
-    for field, expected in required_identity.items():
-        if value.get(field) != expected:
-            raise PilotConfigError(f"{field} must be exactly {expected!r}")
+    if value.get("project") != PROJECT_NAME:
+        raise PilotConfigError(f"project must be exactly {PROJECT_NAME!r}")
+    if not isinstance(value.get("experiment_name"), str) or not value[
+        "experiment_name"
+    ]:
+        raise PilotConfigError("experiment_name must be a non-empty string")
     if _contains_secret_field(value):
         raise PilotConfigError(
             "credentials are forbidden in Hydra config; use environment variables"
@@ -300,6 +308,7 @@ def validate_pilot_config(
         {
             "name",
             "family",
+            "experiment_name",
             "readout",
             "selection_prefer",
             "training",
@@ -315,6 +324,16 @@ def validate_pilot_config(
         )
     if not isinstance(model.get("name"), str) or not model["name"]:
         raise PilotConfigError("pilot_model.name must be non-empty")
+    expected_experiment_name = f"{_EXPERIMENT_NAME_STEM[family]}-seed-{seed}"
+    if model.get("experiment_name") != expected_experiment_name:
+        raise PilotConfigError(
+            "pilot_model.experiment_name must be exactly "
+            f"{expected_experiment_name!r} for family {family!r}"
+        )
+    if value["experiment_name"] != model["experiment_name"]:
+        raise PilotConfigError(
+            "experiment_name must equal pilot_model.experiment_name"
+        )
     if model.get("readout") not in {"full", "response"}:
         raise PilotConfigError("pilot_model.readout must be 'full' or 'response'")
     if model.get("selection_prefer") not in {"smaller", "larger"}:
@@ -356,11 +375,14 @@ def validate_pilot_config(
     )
     if logging.get("backend") not in {"none", "comet"}:
         raise PilotConfigError("logging.backend must be 'none' or 'comet'")
-    for field, expected in required_identity.items():
-        if logging.get(field) != expected:
-            raise PilotConfigError(
-                f"logging.{field} must be exactly {expected!r}"
-            )
+    if logging.get("project") != PROJECT_NAME:
+        raise PilotConfigError(
+            f"logging.project must be exactly {PROJECT_NAME!r}"
+        )
+    if logging.get("experiment_name") != value["experiment_name"]:
+        raise PilotConfigError(
+            "logging.experiment_name must equal experiment_name"
+        )
     if logging.get("workspace") != WORKSPACE_NAME:
         raise PilotConfigError(
             f"logging.workspace must be exactly {WORKSPACE_NAME!r}"
@@ -556,6 +578,7 @@ def _emit(
     callback: LogCallback | None,
     event: str,
     *,
+    experiment_name: str,
     family: str,
     dataset: str | None = None,
     **payload: Any,
@@ -564,7 +587,7 @@ def _emit(
         return
     record: dict[str, Any] = {
         "project": PROJECT_NAME,
-        "experiment_name": EXPERIMENT_NAME,
+        "experiment_name": experiment_name,
         "family": family,
     }
     if dataset is not None:
@@ -783,6 +806,7 @@ def _run_dataset(
     model = config["pilot_model"]
     evaluation = config["evaluation"]
     family = str(model["family"])
+    experiment_name = str(config["experiment_name"])
     train = _flatten_features(splits["train"])
     validation = _flatten_features(splits["val"])
     test = _flatten_features(splits["test"])
@@ -803,6 +827,7 @@ def _run_dataset(
         _emit(
             log_callback,
             f"dataset.{name}.training.epoch",
+            experiment_name=experiment_name,
             family=family,
             dataset=name,
             **trainer_payload,
@@ -811,6 +836,7 @@ def _run_dataset(
     _emit(
         log_callback,
         f"dataset.{name}.started",
+        experiment_name=experiment_name,
         family=family,
         dataset=name,
     )
@@ -914,7 +940,7 @@ def _run_dataset(
     training_config = {
         "schema_version": 1,
         "project": PROJECT_NAME,
-        "experiment_name": EXPERIMENT_NAME,
+        "experiment_name": experiment_name,
         "model": dict(model),
         "dataset": {
             "name": name,
@@ -947,7 +973,7 @@ def _run_dataset(
     summary = {
         "schema_version": 1,
         "project": PROJECT_NAME,
-        "experiment_name": EXPERIMENT_NAME,
+        "experiment_name": experiment_name,
         "dataset": name,
         "representation": "dataset",
         "model": _training_result_record(trained),
@@ -963,6 +989,7 @@ def _run_dataset(
     _emit(
         log_callback,
         f"dataset.{name}.completed",
+        experiment_name=experiment_name,
         family=family,
         dataset=name,
         selected_scale=float(scales[selected_index]),
@@ -996,10 +1023,11 @@ def run_pilot(
     input_sha = _input_identity(input_record)
     config_sha = sha256_bytes(canonical_json(config).encode("utf-8"))
     source_sha = hash_declared_sources(project_root)
+    experiment_name = str(config["experiment_name"])
     identity = {
         "schema_version": 1,
         "project": PROJECT_NAME,
-        "experiment_name": EXPERIMENT_NAME,
+        "experiment_name": experiment_name,
         "family": config["pilot_model"]["family"],
         "config_sha256": config_sha,
         "source_tree_sha256": source_sha,
@@ -1028,7 +1056,13 @@ def run_pilot(
         raise RuntimeError(f"pilot work directory already exists: {work_dir}")
     work_dir.mkdir()
     _write_yaml(work_dir / "resolved_config.yaml", config)
-    _emit(log_callback, "experiment.started", family=family, run_id=run_id)
+    _emit(
+        log_callback,
+        "experiment.started",
+        experiment_name=experiment_name,
+        family=family,
+        run_id=run_id,
+    )
     summaries: dict[str, Any] = {}
     for name in PILOT_DATASETS:
         summaries[name] = _run_dataset(
@@ -1044,7 +1078,7 @@ def run_pilot(
     aggregate = {
         "schema_version": 1,
         "project": PROJECT_NAME,
-        "experiment_name": EXPERIMENT_NAME,
+        "experiment_name": experiment_name,
         "run_id": run_id,
         "family": family,
         "selection_uses_lid_targets": False,
@@ -1059,7 +1093,7 @@ def run_pilot(
     manifest = {
         "schema_version": PILOT_MANIFEST_SCHEMA_VERSION,
         "project": PROJECT_NAME,
-        "experiment_name": EXPERIMENT_NAME,
+        "experiment_name": experiment_name,
         "run_id": run_id,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "family": family,
@@ -1091,6 +1125,7 @@ def run_pilot(
     _emit(
         log_callback,
         "experiment.completed",
+        experiment_name=experiment_name,
         family=family,
         run_id=run_id,
         macro_validation=aggregate["macro_validation"],
@@ -1158,13 +1193,8 @@ def validate_pilot_experiment(
         )
     if manifest.get("schema_version") != PILOT_MANIFEST_SCHEMA_VERSION:
         errors.append("unsupported pilot manifest schema_version")
-    required_identity = {
-        "project": PROJECT_NAME,
-        "experiment_name": EXPERIMENT_NAME,
-    }
-    for field, expected in required_identity.items():
-        if manifest.get(field) != expected:
-            errors.append(f"manifest.{field} is not {expected!r}")
+    if manifest.get("project") != PROJECT_NAME:
+        errors.append(f"manifest.project is not {PROJECT_NAME!r}")
     if manifest.get("selection_uses_lid_targets") is not False:
         errors.append("manifest must attest target-free scale selection")
 
@@ -1176,14 +1206,22 @@ def validate_pilot_experiment(
         errors.append(f"invalid resolved_config.yaml: {exc}")
         resolved = None
     if resolved is not None:
+        experiment_name = resolved["experiment_name"]
+        family = resolved["pilot_model"]["family"]
+        if manifest.get("experiment_name") != experiment_name:
+            errors.append(
+                "manifest.experiment_name does not match resolved_config.yaml"
+            )
+        if manifest.get("family") != family:
+            errors.append("manifest.family does not match resolved_config.yaml")
         actual_config_sha = sha256_bytes(canonical_json(resolved).encode("utf-8"))
         if manifest.get("config_sha256") != actual_config_sha:
             errors.append("config_sha256 does not match resolved_config.yaml")
         identity = {
             "schema_version": 1,
             "project": PROJECT_NAME,
-            "experiment_name": EXPERIMENT_NAME,
-            "family": resolved["pilot_model"]["family"],
+            "experiment_name": experiment_name,
+            "family": family,
             "config_sha256": actual_config_sha,
             "source_tree_sha256": manifest.get("source_tree_sha256"),
             "input_sha256": manifest.get("input_sha256"),
@@ -1258,6 +1296,7 @@ def _logging_callback(config: Mapping[str, Any]) -> tuple[LogCallback | None, Ca
             "Comet logging is configured but experiments.comet_logging is unavailable"
         ) from exc
     return create_comet_callback(
+        experiment_name=str(config["logging"]["experiment_name"]),
         tags=(str(config["pilot_model"]["family"]),)
     )
 
@@ -1292,7 +1331,6 @@ if __name__ == "__main__":
 __all__ = [
     "PILOT_DATASETS",
     "PROJECT_NAME",
-    "EXPERIMENT_NAME",
     "PilotConfigError",
     "compose_pilot_config",
     "run_pilot",

@@ -13,7 +13,6 @@ import yaml
 
 import experiments.pilot as pilot_module
 from experiments.pilot import (
-    EXPERIMENT_NAME,
     PILOT_DATASETS,
     PROJECT_NAME,
     PilotConfigError,
@@ -27,6 +26,12 @@ from utils.provenance import sha256_file
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+EXPERIMENT_NAMES = {
+    "diffusion": "lid-generalization-e8-suite-diffusion-seed-137",
+    "rectified_flow": (
+        "lid-generalization-e8-suite-rectified-flow-matching-seed-137"
+    ),
+}
 
 
 @dataclass
@@ -171,6 +176,7 @@ def test_pilot_trains_three_models_and_seals_all_metrics(
     tmp_path: Path, family: str
 ) -> None:
     config = _fixture_config(tmp_path, family=family)
+    experiment_name = EXPERIMENT_NAMES[family]
     logger = _RecordingLogger()
     run_dir = run_pilot(
         config,
@@ -202,7 +208,7 @@ def test_pilot_trains_three_models_and_seals_all_metrics(
     )
     assert all(payload["project"] == PROJECT_NAME for _, payload in logger.events)
     assert all(
-        payload["experiment_name"] == EXPERIMENT_NAME
+        payload["experiment_name"] == experiment_name
         for _, payload in logger.events
     )
     assert {path.name for path, _ in logger.assets} == {
@@ -220,12 +226,20 @@ def test_pilot_trains_three_models_and_seals_all_metrics(
         "resolved_config.yaml": True,
     }
     summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["experiment_name"] == experiment_name
     assert tuple(summary["datasets"]) == PILOT_DATASETS
     assert summary["selection_uses_lid_targets"] is False
     assert set(summary["macro_validation"]) >= {"mean_mae", "mean_rmse"}
     assert set(summary["macro_test"]) >= {"mean_mae", "mean_rmse"}
 
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["experiment_name"] == experiment_name
+    resolved = yaml.safe_load(
+        (run_dir / "resolved_config.yaml").read_text(encoding="utf-8")
+    )
+    assert resolved["experiment_name"] == experiment_name
+    assert resolved["pilot_model"]["experiment_name"] == experiment_name
+    assert resolved["logging"]["experiment_name"] == experiment_name
     spaghetti_overrides = manifest["inputs"]["datasets"]["e8_spaghetti_pca"][
         "applied_overrides"
     ]
@@ -281,6 +295,11 @@ def test_pilot_trains_three_models_and_seals_all_metrics(
         ):
             assert (cell / filename).is_file()
         cell_summary = json.loads((cell / "summary.json").read_text(encoding="utf-8"))
+        assert cell_summary["experiment_name"] == experiment_name
+        training_config = yaml.safe_load(
+            (cell / "training.yaml").read_text(encoding="utf-8")
+        )
+        assert training_config["experiment_name"] == experiment_name
         assert cell_summary["selection_uses_lid_targets"] is False
         assert cell_summary["scale_selection"]["uses_ground_truth"] is False
         assert cell_summary["validation"]["mae"] < 0.2
@@ -459,6 +478,31 @@ def test_manifest_detects_raw_prediction_tampering(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("family", "experiment_name"), EXPERIMENT_NAMES.items()
+)
+def test_hydra_model_group_is_the_experiment_name_source(
+    family: str, experiment_name: str
+) -> None:
+    config = validate_pilot_config(
+        compose_pilot_config([f"pilot_model={family}"], root=REPOSITORY_ROOT)
+    )
+    assert config["pilot_model"]["experiment_name"] == experiment_name
+    assert config["experiment_name"] == experiment_name
+    assert config["logging"]["experiment_name"] == experiment_name
+
+
+@pytest.mark.parametrize("family", ["diffusion", "rectified_flow"])
+def test_experiment_name_tracks_seed_override(family: str) -> None:
+    config = validate_pilot_config(
+        compose_pilot_config(
+            [f"pilot_model={family}", "seed=23"], root=REPOSITORY_ROOT
+        )
+    )
+    assert config["experiment_name"].endswith("-seed-23")
+    assert config["pilot_model"]["experiment_name"] == config["experiment_name"]
+
+
 def test_pilot_config_rejects_dataset_or_project_drift() -> None:
     base = validate_pilot_config(compose_pilot_config(root=REPOSITORY_ROOT))
     wrong_project = OmegaConf.create({**base, "project": "some-other-project"})
@@ -468,20 +512,30 @@ def test_pilot_config_rejects_dataset_or_project_drift() -> None:
     wrong_experiment = OmegaConf.create(
         {**base, "experiment_name": PROJECT_NAME}
     )
-    with pytest.raises(PilotConfigError, match="experiment_name must be exactly"):
+    with pytest.raises(
+        PilotConfigError,
+        match="experiment_name must equal pilot_model.experiment_name",
+    ):
         validate_pilot_config(wrong_experiment)
 
     wrong_logging_project = OmegaConf.create(base)
-    wrong_logging_project.logging.project = EXPERIMENT_NAME
+    wrong_logging_project.logging.project = base["experiment_name"]
     with pytest.raises(PilotConfigError, match="logging.project must be exactly"):
         validate_pilot_config(wrong_logging_project)
 
     wrong_logging_experiment = OmegaConf.create(base)
     wrong_logging_experiment.logging.experiment_name = PROJECT_NAME
     with pytest.raises(
-        PilotConfigError, match="logging.experiment_name must be exactly"
+        PilotConfigError, match="logging.experiment_name must equal"
     ):
         validate_pilot_config(wrong_logging_experiment)
+
+    wrong_model_experiment = OmegaConf.create(base)
+    wrong_model_experiment.pilot_model.experiment_name = "normalizing-flow"
+    with pytest.raises(
+        PilotConfigError, match="pilot_model.experiment_name must be exactly"
+    ):
+        validate_pilot_config(wrong_model_experiment)
 
     wrong_datasets = OmegaConf.create(base)
     wrong_datasets.data.names = list(reversed(PILOT_DATASETS))

@@ -29,6 +29,12 @@ from experiments.cluster_submit import (
 
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "configs" / "cluster" / "shared_a100.yaml"
+EXPERIMENT_NAMES = {
+    "diffusion": "lid-generalization-e8-suite-diffusion-seed-0",
+    "rectified_flow": (
+        "lid-generalization-e8-suite-rectified-flow-matching-seed-0"
+    ),
+}
 
 
 def _config() -> ClusterConfig:
@@ -38,10 +44,14 @@ def _config() -> ClusterConfig:
 def test_planned_jobs_pin_all_scheduler_fair_use_metadata() -> None:
     jobs = plan_jobs(_config())
     assert tuple(job.family for job in jobs) == APPROVED_FAMILIES
+    assert {job.family: job.experiment_name for job in jobs} == EXPERIMENT_NAMES
     assert len(jobs) == 2
     for job in jobs:
         payload = job.payload
         assert payload["job_desc"] == JOB_DESC
+        assert payload["job_desc"] == (
+            "echimbulatov | ent-block-diffusion-eval #ID0137 #rnd"
+        )
         assert payload["queue_name"] == "shared"
         assert payload["priority_class"] == "shared-medium"
         assert payload["region"] == "A100-MT"
@@ -63,9 +73,7 @@ def test_payload_has_no_serialized_secret_or_family_scheduler_metadata() -> None
         assert payload["env_variables"]["COMET_PROJECT_NAME"] == (
             "lid-generalization"
         )
-        assert payload["env_variables"]["COMET_EXPERIMENT_NAME"] == (
-            "ent-block-diffusion-eval"
-        )
+        assert "COMET_EXPERIMENT_NAME" not in payload["env_variables"]
         assert payload["env_variables"]["COMET_WORKSPACE"] == "dont4rootme"
         assert payload["env_variables"]["COMET_CONFIG"] == (
             "/home/jovyan/.comet.config"
@@ -73,20 +81,17 @@ def test_payload_has_no_serialized_secret_or_family_scheduler_metadata() -> None
         metadata_text = repr(
             {key: value for key, value in payload.items() if key != "script"}
         )
-        # ``diffusion`` occurs only inside the mandated project namespace and
-        # the pre-approved base-image identifier; neither encodes this run's
-        # selected family.
+        # The fixed legacy job description and base-image identifier are not
+        # the selected Comet experiment name.
         metadata_text = metadata_text.replace(JOB_DESC, "")
         metadata_text = metadata_text.replace(
             str(payload["base_image"]), ""
-        ).replace("ent-block-diffusion-eval", "").replace(
-            "lid-generalization", ""
-        )
+        ).replace("lid-generalization", "")
         assert planned.family not in metadata_text
         assert f"pilot_model={planned.family}" in payload["script"]
         assert "logging.project=lid-generalization" in payload["script"]
         assert (
-            "logging.experiment_name=ent-block-diffusion-eval"
+            f"logging.experiment_name={EXPERIMENT_NAMES[planned.family]}"
             in payload["script"]
         )
         assert "logging.workspace=dont4rootme" in payload["script"]
@@ -131,10 +136,22 @@ def test_payload_tampering_fails_closed(field: str, value: object) -> None:
         validate_job_payload(payload)
 
 
-def test_model_or_dataset_identity_in_env_metadata_is_rejected() -> None:
+@pytest.mark.parametrize(
+    "identity", ["diffusion", "rectified_flow", "rectified-flow-matching"]
+)
+def test_model_or_dataset_identity_in_env_metadata_is_rejected(
+    identity: str,
+) -> None:
     payload = build_job_payload(_config(), "diffusion")
-    payload["env_variables"]["RUN_KIND"] = "rectified_flow"
+    payload["env_variables"]["RUN_KIND"] = identity
     with pytest.raises(ClusterConfigError, match="model/dataset identity"):
+        validate_job_payload(payload)
+
+
+def test_global_comet_experiment_environment_is_rejected() -> None:
+    payload = build_job_payload(_config(), "diffusion")
+    payload["env_variables"]["COMET_EXPERIMENT_NAME"] = "diffusion"
+    with pytest.raises(ClusterConfigError, match="Hydra owns the name"):
         validate_job_payload(payload)
 
 
@@ -166,6 +183,26 @@ def test_unapproved_family_is_rejected() -> None:
         build_job_payload(_config(), "normalizing_flow")
 
 
+def test_cross_family_experiment_name_is_rejected() -> None:
+    payload = build_job_payload(_config(), "diffusion")
+    payload["script"] = payload["script"].replace(
+        "logging.experiment_name=lid-generalization-e8-suite-diffusion-seed-0",
+        "logging.experiment_name=lid-generalization-e8-suite-rectified-flow-matching-seed-0",
+    )
+    with pytest.raises(ClusterConfigError, match="Hydra overrides"):
+        validate_job_payload(payload)
+
+
+def test_single_family_plan_is_exactly_one_rectified_flow_job() -> None:
+    jobs = plan_jobs(_config(), "rectified_flow")
+    assert len(jobs) == 1
+    assert jobs[0].family == "rectified_flow"
+    assert jobs[0].experiment_name == (
+        "lid-generalization-e8-suite-rectified-flow-matching-seed-0"
+    )
+    assert jobs[0].payload["job_desc"] == JOB_DESC
+
+
 def test_dry_run_is_default_and_does_not_import_client_lib(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -182,6 +219,22 @@ def test_dry_run_is_default_and_does_not_import_client_lib(
     assert "mode: dry-run" in output
     assert output.count(JOB_DESC) == 2
     assert "must-not-be-here" not in output
+
+
+def test_dry_run_can_select_only_rectified_flow(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(
+        ["--config", str(CONFIG), "--family", "rectified_flow"]
+    ) == 0
+    output = capsys.readouterr().out
+    assert output.count(JOB_DESC) == 1
+    assert "family: rectified_flow" in output
+    assert (
+        "experiment_name: lid-generalization-e8-suite-rectified-flow-matching-seed-0"
+        in output
+    )
+    assert "pilot_model=diffusion" not in output
 
 
 def test_submit_constructs_exactly_two_jobs_after_mode_check(
@@ -348,13 +401,45 @@ def test_submit_cli_prints_only_safe_acknowledged_job_names(
 ) -> None:
     monkeypatch.setattr(
         "experiments.cluster_submit.submit_jobs",
-        lambda config: ("lm-mpi-job-one", "lm-mpi-job-two"),
+        lambda config, family=None: ("lm-mpi-job-one", "lm-mpi-job-two"),
     )
     assert main(["--config", str(CONFIG), "--submit"]) == 0
     output = capsys.readouterr().out
     assert "status: submitted" in output
     assert "project: lid-generalization" in output
-    assert "experiment_name: ent-block-diffusion-eval" in output
+    assert "diffusion: lid-generalization-e8-suite-diffusion-seed-0" in output
+    assert (
+        "rectified_flow: lid-generalization-e8-suite-rectified-flow-matching-seed-0"
+        in output
+    )
     assert "lm-mpi-job-one" in output
     assert "lm-mpi-job-two" in output
     assert "COMET_API_KEY" not in output
+
+
+def test_submit_cli_forwards_single_family_selector(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    selected: list[str | None] = []
+
+    def fake_submit(config: ClusterConfig, family: str | None = None) -> tuple[str, ...]:
+        selected.append(family)
+        return ("lm-mpi-job-rf",)
+
+    monkeypatch.setattr("experiments.cluster_submit.submit_jobs", fake_submit)
+    assert main(
+        [
+            "--config",
+            str(CONFIG),
+            "--family",
+            "rectified_flow",
+            "--submit",
+        ]
+    ) == 0
+    output = capsys.readouterr().out
+    assert selected == ["rectified_flow"]
+    assert (
+        "rectified_flow: lid-generalization-e8-suite-rectified-flow-matching-seed-0"
+        in output
+    )
+    assert "diffusion: diffusion" not in output

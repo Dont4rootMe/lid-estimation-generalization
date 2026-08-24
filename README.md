@@ -69,14 +69,26 @@ python -m experiments.cluster_submit \
 # Реальная отправка с сервера из окружения block-diff
 python -m experiments.cluster_submit \
   --config configs/cluster/shared_a100.yaml --submit
+
+# Отправка только rectified-flow job (например, для безопасного resubmit)
+python -m experiments.cluster_submit \
+  --config configs/cluster/shared_a100.yaml \
+  --family rectified_flow --submit
 ```
 
-Launcher fail-closed фиксирует ровно две jobs по одной GPU, `queue_name=shared`,
+Launcher fail-closed по умолчанию фиксирует ровно две jobs по одной GPU (или одну
+явно выбранную через `--family`), `queue_name=shared`,
 `priority_class=shared-medium` и literal job description
-`echimbulatov | ent-block-diffusion-eval #ID0137 #rnd`. Comet использует новый
-project `lid-generalization` в workspace `dont4rootme` и создаёт в нём по одному
-experiment с именем `ent-block-diffusion-eval` на model family; training и
-validation series разделены по dataset. API key читает сам Comet SDK из
+`echimbulatov | ent-block-diffusion-eval #ID0137 #rnd`. Это неизменяемый
+scheduler-only идентификатор, а не имя Comet experiment. Comet использует project
+`lid-generalization` в workspace `dont4rootme` и создаёт полностью описательные
+имена `lid-generalization-e8-suite-diffusion-seed-0` и
+`lid-generalization-e8-suite-rectified-flow-matching-seed-0`. Источник этих имён
+— соответствующие Hydra YAML в `configs/pilot_model/`; resolved config, summary
+и manifest закрепляют то же имя. Для следующих model families действует тот же
+шаблон: `lid-generalization-e8-suite-normalizing-flow-seed-0` и
+`lid-generalization-e8-suite-schrodinger-bridge-seed-0`. Training и validation
+series разделены по dataset. API key читает сам Comet SDK из
 mode-0600 `/home/jovyan/.comet.config`, выбранного публичной переменной
 `COMET_CONFIG`; credential не попадает в Hydra YAML, scheduler payload, dry-run
 или manifests.
