@@ -1,9 +1,9 @@
 """Small, secret-safe Comet adapter for pilot training runs.
 
 The API key is deliberately never accepted as a function argument or config
-field.  ``comet_ml`` reads it from ``COMET_API_KEY`` in the process
-environment.  This keeps the credential out of Hydra's resolved config,
-scheduler payloads, manifests and dry-run output.
+field.  ``comet_ml`` reads it from the mode-0600 file selected by the public
+``COMET_CONFIG`` path.  This keeps the credential out of Hydra's resolved
+config, scheduler payloads, manifests and dry-run output.
 """
 
 from __future__ import annotations
@@ -14,12 +14,17 @@ import json
 import math
 import os
 from pathlib import Path
+import stat
 from typing import Any, Callable, Protocol
 
 
 COMET_PROJECT_NAME = "lid-generalization"
 COMET_EXPERIMENT_NAME = "ent-block-diffusion-eval"
+COMET_WORKSPACE_NAME = "dont4rootme"
 COMET_API_KEY_ENV = "COMET_API_KEY"
+COMET_CONFIG_ENV = "COMET_CONFIG"
+COMET_CONFIG_PATH = "/home/jovyan/.comet.config"
+COMET_WORKSPACE_ENV = "COMET_WORKSPACE"
 _FORBIDDEN_KEY_PARTS = ("api_key", "apikey", "password", "secret", "token")
 
 
@@ -52,34 +57,55 @@ class _CometExperiment(Protocol):
 def require_comet_environment(
     environ: Mapping[str, str] | None = None,
 ) -> None:
-    """Validate the process environment without returning or copying the key."""
+    """Validate public SDK routing without returning or copying the key.
+
+    Production also verifies that the selected credential file is private.  An
+    injected mapping is used by unit tests and is never treated as a filesystem
+    capability.
+    """
 
     source = os.environ if environ is None else environ
-    if not source.get(COMET_API_KEY_ENV, "").strip():
-        raise CometConfigurationError(
-            f"{COMET_API_KEY_ENV} must be set in the job environment"
-        )
     required_names = {
+        COMET_CONFIG_ENV: COMET_CONFIG_PATH,
+        COMET_WORKSPACE_ENV: COMET_WORKSPACE_NAME,
         "COMET_PROJECT_NAME": COMET_PROJECT_NAME,
         "COMET_EXPERIMENT_NAME": COMET_EXPERIMENT_NAME,
     }
     for variable, expected in required_names.items():
         configured = source.get(variable)
-        if configured is not None and configured != expected:
+        if configured != expected:
             raise CometConfigurationError(
                 f"{variable} must be exactly {expected!r}"
+            )
+    if environ is None:
+        config_path = Path(COMET_CONFIG_PATH)
+        try:
+            mode = config_path.stat().st_mode
+        except FileNotFoundError as error:
+            raise CometConfigurationError(
+                f"private Comet config does not exist: {config_path}"
+            ) from error
+        if not stat.S_ISREG(mode):
+            raise CometConfigurationError(
+                "private Comet config path must be a regular file"
+            )
+        if stat.S_IMODE(mode) & 0o077:
+            raise CometConfigurationError(
+                "private Comet config must have mode 0600 or stricter"
             )
 
 
 def safe_scheduler_environment() -> dict[str, str]:
     """Return public Comet settings suitable for ``client_lib.Job``.
 
-    In particular, this function never reads or returns ``COMET_API_KEY``.
-    The submitted script must obtain that variable from a private runtime
-    source (the cluster launcher sources a mode-0600 file on shared storage).
+    In particular, this function never reads or returns ``COMET_API_KEY``.  It
+    exposes only the path to the private runtime file so the Comet SDK can read
+    the credential itself.
     """
 
     return {
+        COMET_CONFIG_ENV: COMET_CONFIG_PATH,
+        COMET_WORKSPACE_ENV: COMET_WORKSPACE_NAME,
         "COMET_PROJECT_NAME": COMET_PROJECT_NAME,
         "COMET_EXPERIMENT_NAME": COMET_EXPERIMENT_NAME,
         "COMET_MODE": "online",
@@ -195,7 +221,10 @@ def create_comet_event_logger(
         if not isinstance(tag, str) or not tag.strip():
             raise CometConfigurationError("Comet tags must be non-empty strings")
     comet_ml = importlib.import_module("comet_ml")
-    experiment = comet_ml.Experiment(project_name=COMET_PROJECT_NAME)
+    experiment = comet_ml.Experiment(
+        project_name=COMET_PROJECT_NAME,
+        workspace=COMET_WORKSPACE_NAME,
+    )
     experiment.set_name(COMET_EXPERIMENT_NAME)
     experiment.add_tag(COMET_EXPERIMENT_NAME)
     for tag in tags:
@@ -219,8 +248,12 @@ def create_comet_callback(
 
 __all__ = [
     "COMET_API_KEY_ENV",
+    "COMET_CONFIG_ENV",
+    "COMET_CONFIG_PATH",
     "COMET_EXPERIMENT_NAME",
     "COMET_PROJECT_NAME",
+    "COMET_WORKSPACE_ENV",
+    "COMET_WORKSPACE_NAME",
     "CometConfigurationError",
     "CometEventLogger",
     "create_comet_callback",

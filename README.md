@@ -25,7 +25,7 @@ uv run lid-benchmarks-data extract \
   --destination data/lid_benchmarks_exact
 
 # Три независимые learned-модели на E8 Gaussian/Spaghetti/Sphere в одном
-# Comet experiment на family. COMET_API_KEY читается только из environment.
+# Comet experiment на family; SDK читает credential из private config.
 uv run python -m experiments.pilot pilot_model=diffusion
 uv run python -m experiments.pilot pilot_model=rectified_flow
 
@@ -74,11 +74,12 @@ python -m experiments.cluster_submit \
 Launcher fail-closed фиксирует ровно две jobs по одной GPU, `queue_name=shared`,
 `priority_class=shared-medium` и literal job description
 `echimbulatov | ent-block-diffusion-eval #ID0137 #rnd`. Comet использует новый
-project `lid-generalization` и создаёт в нём по одному experiment с именем
-`ent-block-diffusion-eval` на model family; training и validation series
-разделены по dataset.
-API key читается только во время исполнения из mode-0600 Comet config и не
-попадает в Hydra YAML, scheduler environment, dry-run или manifests.
+project `lid-generalization` в workspace `dont4rootme` и создаёт в нём по одному
+experiment с именем `ent-block-diffusion-eval` на model family; training и
+validation series разделены по dataset. API key читает сам Comet SDK из
+mode-0600 `/home/jovyan/.comet.config`, выбранного публичной переменной
+`COMET_CONFIG`; credential не попадает в Hydra YAML, scheduler payload, dry-run
+или manifests.
 
 Каждый запуск получает каталог вида
 `artifacts/hydra/<experiment>/<date>/<time-with-microseconds>/`. Hydra сохраняет

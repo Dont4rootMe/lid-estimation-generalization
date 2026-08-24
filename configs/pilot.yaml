@@ -31,6 +31,7 @@ logging:
   backend: comet
   project: lid-generalization
   experiment_name: ent-block-diffusion-eval
+  workspace: dont4rootme
 
 hydra:
   job:

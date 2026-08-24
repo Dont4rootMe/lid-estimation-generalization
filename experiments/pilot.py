@@ -45,6 +45,7 @@ from utils.provenance import sha256_file
 
 PROJECT_NAME = "lid-generalization"
 EXPERIMENT_NAME = "ent-block-diffusion-eval"
+WORKSPACE_NAME = "dont4rootme"
 PILOT_DATASETS = (
     "e8_gaussian4_pca",
     "e8_spaghetti_pca",
@@ -349,7 +350,9 @@ def validate_pilot_config(
     if not isinstance(logging, dict):
         raise PilotConfigError("logging must be a mapping")
     _reject_unknown(
-        logging, {"backend", "project", "experiment_name"}, field="logging"
+        logging,
+        {"backend", "project", "experiment_name", "workspace"},
+        field="logging",
     )
     if logging.get("backend") not in {"none", "comet"}:
         raise PilotConfigError("logging.backend must be 'none' or 'comet'")
@@ -358,6 +361,10 @@ def validate_pilot_config(
             raise PilotConfigError(
                 f"logging.{field} must be exactly {expected!r}"
             )
+    if logging.get("workspace") != WORKSPACE_NAME:
+        raise PilotConfigError(
+            f"logging.workspace must be exactly {WORKSPACE_NAME!r}"
+        )
     return value
 
 

@@ -12,6 +12,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import importlib
 from pathlib import Path, PurePosixPath
+import re
 import shlex
 import stat
 import sys
@@ -21,8 +22,11 @@ from omegaconf import OmegaConf
 
 from experiments.comet_logging import (
     COMET_API_KEY_ENV,
+    COMET_CONFIG_ENV,
+    COMET_CONFIG_PATH,
     COMET_EXPERIMENT_NAME,
     COMET_PROJECT_NAME,
+    COMET_WORKSPACE_NAME,
     safe_scheduler_environment,
 )
 
@@ -38,6 +42,15 @@ N_GPUS = 1
 INSTANCE_TYPE = "a100.1gpu"
 CUBLAS_WORKSPACE_CONFIG = ":4096:8"
 APPROVED_FAMILIES = ("diffusion", "rectified_flow")
+REPO_ROOT = (
+    "/home/jovyan/echimbulatov/fork_afedorov/constant_repos/"
+    "lid-estimation-generalization"
+)
+BLOCK_DIFF_PYTHON = "/home/jovyan/.mlspace/envs/block-diff/bin/python"
+PILOT_MODULE = "experiments.pilot"
+DATA_ROOT = f"{REPO_ROOT}/data/lid_benchmarks_exact/benchmarks"
+OUTPUT_ROOT = f"{REPO_ROOT}/artifacts/pilot"
+_SAFE_SCRIPT = re.compile(r"[A-Za-z0-9_@%+=:,./ -]+\Z")
 
 _SCHEDULER_FIELDS = frozenset(
     {
@@ -56,8 +69,6 @@ _SCHEDULER_FIELDS = frozenset(
 _EXECUTION_FIELDS = frozenset(
     {
         "repo_root",
-        "conda_init",
-        "conda_env",
         "python",
         "module",
         "data_root",
@@ -169,6 +180,9 @@ def _validate_environment(value: Mapping[str, Any]) -> dict[str, str | int]:
         raise ClusterConfigError(
             f"environment.MLS_JOB_REGION_NAME must be {REGION!r}"
         )
+    for key in ("PROJECT_ROOT", "PYTHONPATH"):
+        if result.get(key) != REPO_ROOT:
+            raise ClusterConfigError(f"environment.{key} must be {REPO_ROOT!r}")
     return result
 
 
@@ -199,22 +213,26 @@ def _validate_execution(value: Mapping[str, Any]) -> dict[str, Any]:
     result = dict(value)
     for key in (
         "repo_root",
-        "conda_init",
         "python",
         "data_root",
         "output_dir",
         "comet_config_file",
     ):
         result[key] = _absolute_posix_path(value.get(key), path=f"execution.{key}")
-    if value.get("conda_env") != "block-diff":
-        raise ClusterConfigError("execution.conda_env must be exactly 'block-diff'")
-    if value.get("module") != "experiments.pilot":
-        raise ClusterConfigError(
-            "execution.module must be exactly 'experiments.pilot'"
-        )
+    exact = {
+        "repo_root": REPO_ROOT,
+        "python": BLOCK_DIFF_PYTHON,
+        "module": PILOT_MODULE,
+        "data_root": DATA_ROOT,
+        "output_dir": OUTPUT_ROOT,
+        "comet_config_file": COMET_CONFIG_PATH,
+    }
+    for key, expected in exact.items():
+        if result.get(key) != expected:
+            raise ClusterConfigError(f"execution.{key} must be exactly {expected!r}")
     seed = value.get("seed")
-    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
-        raise ClusterConfigError("execution.seed must be a non-negative integer")
+    if seed != 0 or isinstance(seed, bool):
+        raise ClusterConfigError("execution.seed must be exactly 0")
     families = value.get("families")
     if not isinstance(families, list) or tuple(families) != APPROVED_FAMILIES:
         raise ClusterConfigError(
@@ -247,6 +265,14 @@ def load_cluster_config(path: str | Path) -> ClusterConfig:
         raise ClusterConfigError(
             "environment.PROJECT_ROOT must equal execution.repo_root"
         )
+    if environment.get("PYTHONPATH") != execution["repo_root"]:
+        raise ClusterConfigError(
+            "environment.PYTHONPATH must equal execution.repo_root"
+        )
+    if environment.get(COMET_CONFIG_ENV) != execution["comet_config_file"]:
+        raise ClusterConfigError(
+            f"environment.{COMET_CONFIG_ENV} must equal execution.comet_config_file"
+        )
     return ClusterConfig(
         scheduler=scheduler,
         execution=execution,
@@ -257,23 +283,6 @@ def load_cluster_config(path: str | Path) -> ClusterConfig:
 def _job_script(config: ClusterConfig, family: str) -> str:
     execution = config.execution
     output_dir = str(PurePosixPath(str(execution["output_dir"])) / family)
-    # The mode-0600 INI file stays on shared storage.  Only its path and this
-    # parser are serialized; the credential itself is placed in the job's
-    # process environment at runtime and is never part of Job.env_variables.
-    comet_key_reader = (
-        "import configparser,os,sys; "
-        "p=configparser.ConfigParser(); p.read(sys.argv[1]); "
-        "v=p.get('comet','api_key',fallback='').strip(); "
-        "sys.exit('missing Comet api_key') if not v else os.write(1,v.encode())"
-    )
-    comet_key_command = shlex.join(
-        (
-            str(execution["python"]),
-            "-c",
-            comet_key_reader,
-            str(execution["comet_config_file"]),
-        )
-    )
     python_args = [
         str(execution["python"]),
         "-m",
@@ -284,18 +293,9 @@ def _job_script(config: ClusterConfig, family: str) -> str:
         f"seed={execution['seed']}",
         f"logging.project={COMET_PROJECT_NAME}",
         f"logging.experiment_name={COMET_EXPERIMENT_NAME}",
+        f"logging.workspace={COMET_WORKSPACE_NAME}",
     ]
-    return "\n".join(
-        (
-            "set -euo pipefail",
-            f"source {shlex.quote(str(execution['conda_init']))}",
-            f"conda activate {shlex.quote(str(execution['conda_env']))}",
-            f"COMET_API_KEY=$({comet_key_command})",
-            "export COMET_API_KEY",
-            f"cd {shlex.quote(str(execution['repo_root']))}",
-            f"exec {shlex.join(python_args)}",
-        )
-    )
+    return shlex.join(python_args)
 
 
 def build_job_payload(config: ClusterConfig, family: str) -> dict[str, Any]:
@@ -391,18 +391,47 @@ def validate_job_payload(payload: Mapping[str, Any]) -> None:
             )
 
     script = payload.get("script")
-    if not isinstance(script, str) or "set -euo pipefail" not in script:
-        raise ClusterConfigError("job script must be fail-closed")
+    if not isinstance(script, str) or not script:
+        raise ClusterConfigError("job script must be a non-empty string")
+    if not _SAFE_SCRIPT.fullmatch(script):
+        raise ClusterConfigError(
+            "job script must be one safe command without shell operators"
+        )
+    command = shlex.split(script)
+    expected_prefix = [BLOCK_DIFF_PYTHON, "-m", PILOT_MODULE]
+    if command[:3] != expected_prefix:
+        raise ClusterConfigError(
+            "job script must directly invoke experiments.pilot with block-diff Python"
+        )
+    if len(command) != 10:
+        raise ClusterConfigError("job script must contain exactly seven Hydra overrides")
+    family_argument = command[3]
+    if not family_argument.startswith("pilot_model="):
+        raise ClusterConfigError("job script must select one approved model family")
+    family = family_argument.removeprefix("pilot_model=")
+    if family not in APPROVED_FAMILIES:
+        raise ClusterConfigError("job script selects an unapproved model family")
+    expected_arguments = [
+        f"pilot_model={family}",
+        f"data.root={DATA_ROOT}",
+        f"output_root={OUTPUT_ROOT}/{family}",
+        "seed=0",
+        f"logging.project={COMET_PROJECT_NAME}",
+        f"logging.experiment_name={COMET_EXPERIMENT_NAME}",
+        f"logging.workspace={COMET_WORKSPACE_NAME}",
+    ]
+    if command[3:] != expected_arguments:
+        raise ClusterConfigError("job script Hydra overrides differ from the allowlist")
     if f"logging.project={COMET_PROJECT_NAME}" not in script:
         raise ClusterConfigError("job script must pin the approved Comet project")
     if f"logging.experiment_name={COMET_EXPERIMENT_NAME}" not in script:
         raise ClusterConfigError(
             "job script must pin the approved Comet experiment name"
         )
-    if "export COMET_API_KEY=" in script:
-        raise ClusterConfigError("job script must not contain a literal Comet key")
-    if "COMET_API_KEY=$(" not in script or "export COMET_API_KEY" not in script:
-        raise ClusterConfigError("job script must export the runtime-only Comet key")
+    if f"logging.workspace={COMET_WORKSPACE_NAME}" not in script:
+        raise ClusterConfigError("job script must pin the approved Comet workspace")
+    if "COMET_" in script:
+        raise ClusterConfigError("job script must not handle Comet environment values")
 
 
 def plan_jobs(config: ClusterConfig) -> tuple[PlannedJob, ...]:

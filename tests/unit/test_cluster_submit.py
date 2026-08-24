@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import importlib
 from pathlib import Path
+import re
 import sys
 import types
 
@@ -64,6 +65,10 @@ def test_payload_has_no_serialized_secret_or_family_scheduler_metadata() -> None
         assert payload["env_variables"]["COMET_EXPERIMENT_NAME"] == (
             "ent-block-diffusion-eval"
         )
+        assert payload["env_variables"]["COMET_WORKSPACE"] == "dont4rootme"
+        assert payload["env_variables"]["COMET_CONFIG"] == (
+            "/home/jovyan/.comet.config"
+        )
         metadata_text = repr(
             {key: value for key, value in payload.items() if key != "script"}
         )
@@ -83,10 +88,26 @@ def test_payload_has_no_serialized_secret_or_family_scheduler_metadata() -> None
             "logging.experiment_name=ent-block-diffusion-eval"
             in payload["script"]
         )
-        assert "conda activate block-diff" in payload["script"]
-        assert "COMET_API_KEY=$(" in payload["script"]
+        assert "logging.workspace=dont4rootme" in payload["script"]
+        assert payload["script"].startswith(
+            "/home/jovyan/.mlspace/envs/block-diff/bin/python -m experiments.pilot "
+        )
+        assert "\n" not in payload["script"]
+        assert not re.search(r"[$;&|`<>()]", payload["script"])
+        assert "COMET_" not in payload["script"]
         assert " output_root=" in payload["script"]
         assert " output_dir=" not in payload["script"]
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    ["\nwhoami", ";whoami", " && whoami", " $(whoami)", " | whoami"],
+)
+def test_script_shell_syntax_is_rejected(suffix: str) -> None:
+    payload = build_job_payload(_config(), "diffusion")
+    payload["script"] += suffix
+    with pytest.raises(ClusterConfigError, match="safe command"):
+        validate_job_payload(payload)
 
 
 @pytest.mark.parametrize(

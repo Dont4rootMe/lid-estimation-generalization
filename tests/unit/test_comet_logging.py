@@ -7,8 +7,10 @@ from typing import Any
 import pytest
 
 from experiments.comet_logging import (
+    COMET_CONFIG_PATH,
     COMET_EXPERIMENT_NAME,
     COMET_PROJECT_NAME,
+    COMET_WORKSPACE_NAME,
     CometConfigurationError,
     create_comet_callback,
     create_comet_event_logger,
@@ -64,30 +66,32 @@ def test_public_scheduler_environment_is_fixed_and_secret_free(
     assert "COMET_API_KEY" not in environment
     assert environment["COMET_PROJECT_NAME"] == COMET_PROJECT_NAME
     assert environment["COMET_EXPERIMENT_NAME"] == COMET_EXPERIMENT_NAME
+    assert environment["COMET_WORKSPACE"] == COMET_WORKSPACE_NAME
+    assert environment["COMET_CONFIG"] == COMET_CONFIG_PATH
     assert "do-not-copy" not in repr(environment)
 
 
 def test_comet_environment_is_required_and_namespace_is_exact() -> None:
-    with pytest.raises(CometConfigurationError, match="COMET_API_KEY"):
+    with pytest.raises(CometConfigurationError, match="COMET_CONFIG"):
         require_comet_environment({})
     with pytest.raises(CometConfigurationError, match="COMET_PROJECT_NAME"):
         require_comet_environment(
-            {"COMET_API_KEY": "present", "COMET_PROJECT_NAME": "wrong"}
+            {
+                **safe_scheduler_environment(),
+                "COMET_PROJECT_NAME": "wrong",
+            }
         )
-    require_comet_environment(
-        {
-            "COMET_API_KEY": "present",
-            "COMET_PROJECT_NAME": COMET_PROJECT_NAME,
-            "COMET_EXPERIMENT_NAME": COMET_EXPERIMENT_NAME,
-        }
-    )
+    require_comet_environment(safe_scheduler_environment())
     with pytest.raises(CometConfigurationError, match="COMET_EXPERIMENT_NAME"):
         require_comet_environment(
             {
-                "COMET_API_KEY": "present",
-                "COMET_PROJECT_NAME": COMET_PROJECT_NAME,
+                **safe_scheduler_environment(),
                 "COMET_EXPERIMENT_NAME": COMET_PROJECT_NAME,
             }
+        )
+    with pytest.raises(CometConfigurationError, match="COMET_WORKSPACE"):
+        require_comet_environment(
+            {**safe_scheduler_environment(), "COMET_WORKSPACE": "wrong"}
         )
 
 
@@ -99,11 +103,13 @@ def test_factory_never_passes_api_key_to_comet_sdk(
         sys.modules, "comet_ml", types.SimpleNamespace(Experiment=FakeExperiment)
     )
     logger = create_comet_event_logger(
-        tags=("diffusion",), environ={"COMET_API_KEY": "super-secret"}
+        tags=("diffusion",), environ=safe_scheduler_environment()
     )
     experiment = FakeExperiment.instances[-1]
-    assert experiment.kwargs == {"project_name": COMET_PROJECT_NAME}
-    assert "super-secret" not in repr(experiment.__dict__)
+    assert experiment.kwargs == {
+        "project_name": COMET_PROJECT_NAME,
+        "workspace": COMET_WORKSPACE_NAME,
+    }
     assert experiment.names == [COMET_EXPERIMENT_NAME]
     assert experiment.tags == [COMET_EXPERIMENT_NAME, "diffusion"]
     logger.end()
@@ -118,7 +124,7 @@ def test_production_callback_factory_returns_callback_and_close(
         sys.modules, "comet_ml", types.SimpleNamespace(Experiment=FakeExperiment)
     )
     callback, close = create_comet_callback(
-        tags=("diffusion",), environ={"COMET_API_KEY": "super-secret"}
+        tags=("diffusion",), environ=safe_scheduler_environment()
     )
     callback("training", {"step": 1, "loss": 0.75})
     close()
@@ -135,7 +141,7 @@ def test_event_callback_logs_nested_metrics_and_parameters(
         sys.modules, "comet_ml", types.SimpleNamespace(Experiment=FakeExperiment)
     )
     logger = create_comet_event_logger(
-        environ={"COMET_API_KEY": "super-secret"}
+        environ=safe_scheduler_environment()
     )
     logger(
         "validation",
@@ -162,7 +168,7 @@ def test_event_callback_rejects_secret_like_fields(
         sys.modules, "comet_ml", types.SimpleNamespace(Experiment=FakeExperiment)
     )
     logger = create_comet_event_logger(
-        environ={"COMET_API_KEY": "super-secret"}
+        environ=safe_scheduler_environment()
     )
     with pytest.raises(CometConfigurationError, match="secret-like field"):
         logger("training", {"metadata": {"access_token": "do-not-log"}})
