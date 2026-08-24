@@ -1,10 +1,11 @@
 """Train and evaluate one generative-model family on the three E8 datasets.
 
 One pilot run owns three independently trained models: one for Gaussian4, one
-for Spaghetti and one for Sphere4.  The validation LID labels are deliberately
-kept out of both training and scale selection.  They are read only after the
-label-free plateau selector has chosen a scale and are then used, together with
-the test labels, to report auditable metrics.
+for Spaghetti and one for Sphere4.  A deterministic subset of the upstream
+training split is held out from optimizer batches.  After training, its LID
+targets select the best prediction scale/time.  That index is frozen before
+the benchmark validation and test splits are evaluated, so neither validation
+nor test labels can influence model-scale selection.
 
 The public :func:`run_pilot` function accepts injectable training, prediction
 and logging callables.  Production uses :mod:`models.training`; tests can use a
@@ -13,22 +14,23 @@ small deterministic implementation without weakening the artifact contract.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, is_dataclass
-from datetime import datetime, timezone
+import hashlib
 import json
 import math
 import os
-from pathlib import Path, PurePosixPath
 import sys
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import asdict, dataclass, is_dataclass
+from datetime import UTC, datetime
+from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
 import hydra
 import numpy as np
 import numpy.typing as npt
+import yaml
 from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig, OmegaConf
-import yaml
 
 from datasets.registry import DatasetRegistry, LoadedSplit, load_dataset, load_registry
 from experiments.metrics import known_lid_metrics
@@ -39,9 +41,7 @@ from experiments.run_manifest import (
     sha256_bytes,
     sha256_path,
 )
-from models.oracle import select_stable_scale
 from utils.provenance import sha256_file
-
 
 PROJECT_NAME = "lid-generalization"
 WORKSPACE_NAME = "dont4rootme"
@@ -50,18 +50,34 @@ PILOT_DATASETS = (
     "e8_spaghetti_pca",
     "e8_sphere4_pca",
 )
-PILOT_MANIFEST_SCHEMA_VERSION = 1
+PILOT_MANIFEST_SCHEMA_VERSION = 3
+TRAIN_SELECTION_PROTOCOL = "held_out_source_train_supervised_v1"
+FROZEN_EVALUATION_PROTOCOL = "single_train_selected_scale_v1"
 _FAMILY_FOR_ARTIFACTS = {
     "diffusion": "gaussian_diffusion",
     "gaussian_diffusion": "gaussian_diffusion",
     "rectified_flow": "rectified_flow",
+    "scale_conditioned_nf": "scale_conditioned_normalizing_flow",
+    "schrodinger_bridge": "brownian_schrodinger_bridge",
 }
 _EXPERIMENT_NAME_STEM = {
-    "diffusion": "lid-generalization-e8-suite-diffusion",
-    "gaussian_diffusion": "lid-generalization-e8-suite-diffusion",
-    "rectified_flow": "lid-generalization-e8-suite-rectified-flow-matching",
+    "diffusion": ("lid-generalization-e8-suite-diffusion-train-mae-scale-selection"),
+    "gaussian_diffusion": (
+        "lid-generalization-e8-suite-diffusion-train-mae-scale-selection"
+    ),
+    "rectified_flow": (
+        "lid-generalization-e8-suite-rectified-flow-matching-train-mae-time-selection"
+    ),
+    "scale_conditioned_nf": (
+        "lid-generalization-e8-suite-scale-conditioned-normalizing-flow-"
+        "train-mae-scale-selection"
+    ),
+    "schrodinger_bridge": (
+        "lid-generalization-e8-suite-brownian-schrodinger-bridge-"
+        "train-mae-time-selection"
+    ),
 }
-_TRAINING_FIELDS = {
+_COMMON_TRAINING_FIELDS = {
     "seed",
     "device",
     "epochs",
@@ -69,26 +85,60 @@ _TRAINING_FIELDS = {
     "learning_rate",
     "weight_decay",
     "hidden_dim",
-    "depth",
     "time_embedding_dim",
     "validation_interval",
     "early_stopping_patience",
     "gradient_clip_norm",
     "num_workers",
     "deterministic",
-    "sigma_min",
-    "sigma_max",
-    "time_min",
-    "time_max",
     "fourier_features",
     "max_condition_frequency",
     "dropout",
     "normalize",
     "normalization_epsilon",
 }
+_FAMILY_TRAINING_FIELDS = {
+    "diffusion": {"depth", "sigma_min", "sigma_max"},
+    "gaussian_diffusion": {"depth", "sigma_min", "sigma_max"},
+    "rectified_flow": {"depth", "time_min", "time_max"},
+    # NF integration owns these exact likelihood-path and architecture fields.
+    "scale_conditioned_nf": {
+        "num_coupling_layers",
+        "conditioner_depth",
+        "log_scale_limit",
+        "epsilon_min",
+        "epsilon_max",
+    },
+    "schrodinger_bridge": {
+        "depth",
+        "bridge_construction",
+        "bridge_reference_process",
+        "bridge_initial_marginal",
+        "bridge_terminal_marginal",
+        "bridge_factor_f",
+        "bridge_factor_g",
+        "bridge_conditioning",
+        "bridge_diffusivity",
+        "bridge_terminal_time",
+        "bridge_tau_min",
+        "bridge_tau_max",
+    },
+}
 
 FloatArray = npt.NDArray[np.float64]
 LogCallback = Callable[[str, Mapping[str, Any]], None]
+
+
+@dataclass(frozen=True)
+class TrainSelectionPartition:
+    """Disjoint optimizer/selector views of the canonical source train split."""
+
+    fit_indices: npt.NDArray[np.int64]
+    selection_indices: npt.NDArray[np.int64]
+    fit_features: npt.NDArray[Any]
+    selection_features: npt.NDArray[Any]
+    selection_target: FloatArray
+    record: Mapping[str, Any]
 
 
 class TrainFunction(Protocol):
@@ -157,9 +207,7 @@ def _resolved_mapping(config: DictConfig | Mapping[str, Any]) -> dict[str, Any]:
     return value
 
 
-def _reject_unknown(
-    value: Mapping[str, Any], allowed: set[str], *, field: str
-) -> None:
+def _reject_unknown(value: Mapping[str, Any], allowed: set[str], *, field: str) -> None:
     unknown = set(value) - allowed
     if unknown:
         raise PilotConfigError(f"unknown {field} fields: {sorted(unknown)}")
@@ -220,9 +268,10 @@ def validate_pilot_config(
         raise PilotConfigError("pilot schema_version must be 1")
     if value.get("project") != PROJECT_NAME:
         raise PilotConfigError(f"project must be exactly {PROJECT_NAME!r}")
-    if not isinstance(value.get("experiment_name"), str) or not value[
-        "experiment_name"
-    ]:
+    if (
+        not isinstance(value.get("experiment_name"), str)
+        or not value["experiment_name"]
+    ):
         raise PilotConfigError("experiment_name must be a non-empty string")
     if _contains_secret_field(value):
         raise PilotConfigError(
@@ -244,11 +293,7 @@ def validate_pilot_config(
     if not isinstance(data.get("root"), str) or not data["root"]:
         raise PilotConfigError("data.root must be a non-empty path string")
     registry = data.get("registry")
-    if (
-        not isinstance(registry, str)
-        or not registry.endswith(".yaml")
-        or not registry
-    ):
+    if not isinstance(registry, str) or not registry.endswith(".yaml") or not registry:
         raise PilotConfigError("data.registry must name a .yaml file")
     if data.get("representation") != "dataset":
         raise PilotConfigError("pilot representation must be exactly 'dataset'")
@@ -284,22 +329,51 @@ def validate_pilot_config(
     elif trace_probes not in {0, None}:
         raise PilotConfigError("exact divergence requires trace_probes: 0")
     trace_seed = evaluation.get("trace_seed")
-    if isinstance(trace_seed, bool) or not isinstance(trace_seed, int) or trace_seed < 0:
+    if (
+        isinstance(trace_seed, bool)
+        or not isinstance(trace_seed, int)
+        or trace_seed < 0
+    ):
         raise PilotConfigError("evaluation.trace_seed must be non-negative")
     selection = evaluation.get("selection")
     if not isinstance(selection, dict):
         raise PilotConfigError("evaluation.selection must be a mapping")
     _reject_unknown(
         selection,
-        {"window", "min_valid_fraction"},
+        {
+            "source_split",
+            "subset_size",
+            "seed",
+            "criterion",
+            "tie_tolerance",
+            "tie_break",
+        },
         field="evaluation.selection",
     )
-    window = _positive_int(selection.get("window"), field="selection.window")
-    min_fraction = selection.get("min_valid_fraction")
-    if isinstance(min_fraction, bool) or not isinstance(min_fraction, (int, float)):
-        raise PilotConfigError("selection.min_valid_fraction must be numeric")
-    if not math.isfinite(float(min_fraction)) or not 0 < float(min_fraction) <= 1:
-        raise PilotConfigError("selection.min_valid_fraction must lie in (0, 1]")
+    if selection.get("source_split") != "train":
+        raise PilotConfigError("selection.source_split must be exactly 'train'")
+    _positive_int(selection.get("subset_size"), field="selection.subset_size")
+    selection_seed = selection.get("seed")
+    if (
+        isinstance(selection_seed, bool)
+        or not isinstance(selection_seed, int)
+        or not 0 <= selection_seed < 2**64
+    ):
+        raise PilotConfigError("selection.seed must be an integer in [0, 2**64)")
+    if selection.get("criterion") != "mae":
+        raise PilotConfigError("selection.criterion must be exactly 'mae'")
+    tie_tolerance = selection.get("tie_tolerance")
+    if (
+        isinstance(tie_tolerance, bool)
+        or not isinstance(tie_tolerance, (int, float))
+        or not math.isfinite(float(tie_tolerance))
+        or float(tie_tolerance) < 0.0
+    ):
+        raise PilotConfigError(
+            "selection.tie_tolerance must be a finite non-negative number"
+        )
+    if selection.get("tie_break") not in {"smaller", "larger"}:
+        raise PilotConfigError("selection.tie_break must be 'smaller' or 'larger'")
     model = value.get("pilot_model")
     if not isinstance(model, dict):
         raise PilotConfigError("pilot_model must be a mapping")
@@ -311,6 +385,8 @@ def validate_pilot_config(
             "experiment_name",
             "readout",
             "selection_prefer",
+            "derivative_backend",
+            "trace_probes",
             "training",
             "scales",
         },
@@ -319,8 +395,8 @@ def validate_pilot_config(
     family = model.get("family")
     if family not in _FAMILY_FOR_ARTIFACTS:
         raise PilotConfigError(
-            "pilot_model.family must be diffusion/gaussian_diffusion or "
-            "rectified_flow"
+            "pilot_model.family must be diffusion/gaussian_diffusion, "
+            "rectified_flow, scale_conditioned_nf, or schrodinger_bridge"
         )
     if not isinstance(model.get("name"), str) or not model["name"]:
         raise PilotConfigError("pilot_model.name must be non-empty")
@@ -331,30 +407,129 @@ def validate_pilot_config(
             f"{expected_experiment_name!r} for family {family!r}"
         )
     if value["experiment_name"] != model["experiment_name"]:
+        raise PilotConfigError("experiment_name must equal pilot_model.experiment_name")
+    allowed_readouts = (
+        {"fixed_likelihood"}
+        if family == "scale_conditioned_nf"
+        else {"full", "response"}
+    )
+    if model.get("readout") not in allowed_readouts:
         raise PilotConfigError(
-            "experiment_name must equal pilot_model.experiment_name"
+            f"pilot_model.readout must be one of {sorted(allowed_readouts)!r} "
+            f"for family {family!r}"
         )
-    if model.get("readout") not in {"full", "response"}:
-        raise PilotConfigError("pilot_model.readout must be 'full' or 'response'")
     if model.get("selection_prefer") not in {"smaller", "larger"}:
         raise PilotConfigError(
             "pilot_model.selection_prefer must be 'smaller' or 'larger'"
         )
+    expected_derivative = (
+        ("exact", 0) if family == "scale_conditioned_nf" else ("hutchinson", 16)
+    )
+    model_trace_probes = model.get("trace_probes")
+    actual_derivative = (model.get("derivative_backend"), model_trace_probes)
+    if isinstance(model_trace_probes, bool) or not isinstance(model_trace_probes, int):
+        raise PilotConfigError("pilot_model.trace_probes must be an integer")
+    if actual_derivative != expected_derivative:
+        raise PilotConfigError(
+            "pilot_model derivative contract must be exactly "
+            f"backend={expected_derivative[0]!r}, probes={expected_derivative[1]} "
+            f"for family {family!r}"
+        )
+    if (
+        evaluation["divergence_backend"] != model["derivative_backend"]
+        or evaluation["trace_probes"] != model["trace_probes"]
+    ):
+        raise PilotConfigError(
+            "evaluation derivative settings must resolve from pilot_model"
+        )
+    if selection["tie_break"] != model["selection_prefer"]:
+        raise PilotConfigError(
+            "selection.tie_break must equal pilot_model.selection_prefer"
+        )
     if not isinstance(model.get("training"), dict) or not model["training"]:
         raise PilotConfigError("pilot_model.training must be a non-empty mapping")
-    _reject_unknown(
-        model["training"], _TRAINING_FIELDS, field="pilot_model.training"
+    expected_training_fields = (
+        _COMMON_TRAINING_FIELDS | _FAMILY_TRAINING_FIELDS[str(family)]
     )
-    missing_training_fields = _TRAINING_FIELDS - set(model["training"])
+    _reject_unknown(
+        model["training"], expected_training_fields, field="pilot_model.training"
+    )
+    missing_training_fields = expected_training_fields - set(model["training"])
     if missing_training_fields:
         raise PilotConfigError(
-            "missing pilot_model.training fields: "
-            f"{sorted(missing_training_fields)}"
+            f"missing pilot_model.training fields: {sorted(missing_training_fields)}"
         )
+    if family == "scale_conditioned_nf":
+        nf_training = model["training"]
+        if nf_training["dropout"] != 0.0:
+            raise PilotConfigError(
+                "scale-conditioned NF requires training.dropout to be exactly 0"
+            )
+        for field in ("num_coupling_layers", "conditioner_depth"):
+            raw = nf_training[field]
+            if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+                raise PilotConfigError(
+                    f"pilot_model.training.{field} must be a positive integer"
+                )
+        for field in ("log_scale_limit", "epsilon_min", "epsilon_max"):
+            raw = nf_training[field]
+            if (
+                isinstance(raw, bool)
+                or not isinstance(raw, (int, float))
+                or not math.isfinite(float(raw))
+                or float(raw) <= 0.0
+            ):
+                raise PilotConfigError(
+                    f"pilot_model.training.{field} must be finite and positive"
+                )
+        if not float(nf_training["epsilon_min"]) < float(nf_training["epsilon_max"]):
+            raise PilotConfigError(
+                "NF epsilon bounds must satisfy epsilon_min < epsilon_max"
+            )
+    if family == "schrodinger_bridge":
+        bridge_training = model["training"]
+        exact_bridge_contract = {
+            "bridge_construction": "terminal-data-lebesgue-factor-v1",
+            "bridge_reference_process": "brownian-motion",
+            "bridge_initial_marginal": "gaussian-convolution-of-terminal-data",
+            "bridge_terminal_marginal": "dataset-terminal-law",
+            "bridge_factor_f": "lebesgue-measure",
+            "bridge_factor_g": "dataset-terminal-law",
+            "bridge_conditioning": "time-to-go-tau",
+        }
+        for field, expected in exact_bridge_contract.items():
+            if bridge_training.get(field) != expected:
+                raise PilotConfigError(
+                    f"pilot_model.training.{field} must be exactly {expected!r}"
+                )
+        diffusivity = bridge_training["bridge_diffusivity"]
+        terminal_time = bridge_training["bridge_terminal_time"]
+        tau_min = bridge_training["bridge_tau_min"]
+        tau_max = bridge_training["bridge_tau_max"]
+        for field, raw in (
+            ("bridge_diffusivity", diffusivity),
+            ("bridge_terminal_time", terminal_time),
+            ("bridge_tau_min", tau_min),
+            ("bridge_tau_max", tau_max),
+        ):
+            if (
+                isinstance(raw, bool)
+                or not isinstance(raw, (int, float))
+                or not math.isfinite(float(raw))
+                or float(raw) <= 0
+            ):
+                raise PilotConfigError(
+                    f"pilot_model.training.{field} must be finite and positive"
+                )
+        if not 0 < float(tau_min) < float(tau_max) <= float(terminal_time):
+            raise PilotConfigError(
+                "bridge tau bounds must satisfy "
+                "0 < bridge_tau_min < bridge_tau_max <= bridge_terminal_time"
+            )
     scales = np.asarray(model.get("scales"), dtype=np.float64)
     if (
         scales.ndim != 1
-        or scales.size < 2 * window + 1
+        or scales.size < 2
         or not np.isfinite(scales).all()
         or np.any(scales <= 0)
         or np.unique(scales).size != scales.size
@@ -364,6 +539,20 @@ def validate_pilot_config(
         )
     if family == "rectified_flow" and np.any(scales >= 1):
         raise PilotConfigError("rectified-flow scales must lie strictly in (0, 1)")
+    if family == "scale_conditioned_nf":
+        epsilon_min = float(model["training"]["epsilon_min"])
+        epsilon_max = float(model["training"]["epsilon_max"])
+        if np.any(scales < epsilon_min) or np.any(scales > epsilon_max):
+            raise PilotConfigError(
+                "NF epsilon scales must lie inside training epsilon bounds"
+            )
+    if family == "schrodinger_bridge":
+        tau_min = float(model["training"]["bridge_tau_min"])
+        tau_max = float(model["training"]["bridge_tau_max"])
+        if np.any(scales < tau_min) or np.any(scales > tau_max):
+            raise PilotConfigError(
+                "Schrodinger-bridge tau scales must lie inside training tau bounds"
+            )
 
     logging = value.get("logging")
     if not isinstance(logging, dict):
@@ -376,17 +565,11 @@ def validate_pilot_config(
     if logging.get("backend") not in {"none", "comet"}:
         raise PilotConfigError("logging.backend must be 'none' or 'comet'")
     if logging.get("project") != PROJECT_NAME:
-        raise PilotConfigError(
-            f"logging.project must be exactly {PROJECT_NAME!r}"
-        )
+        raise PilotConfigError(f"logging.project must be exactly {PROJECT_NAME!r}")
     if logging.get("experiment_name") != value["experiment_name"]:
-        raise PilotConfigError(
-            "logging.experiment_name must equal experiment_name"
-        )
+        raise PilotConfigError("logging.experiment_name must equal experiment_name")
     if logging.get("workspace") != WORKSPACE_NAME:
-        raise PilotConfigError(
-            f"logging.workspace must be exactly {WORKSPACE_NAME!r}"
-        )
+        raise PilotConfigError(f"logging.workspace must be exactly {WORKSPACE_NAME!r}")
     return value
 
 
@@ -518,7 +701,9 @@ def _applied_override_records(
 
 def _load_inputs(
     *, root: Path, config: Mapping[str, Any]
-) -> tuple[DatasetRegistry, Path, Path, dict[str, Mapping[str, LoadedSplit]], dict[str, Any]]:
+) -> tuple[
+    DatasetRegistry, Path, Path, dict[str, Mapping[str, LoadedSplit]], dict[str, Any]
+]:
     data = config["data"]
     registry_path = _resolve_path(root, str(data["registry"]))
     benchmark_root = _resolve_path(root, str(data["root"]))
@@ -530,6 +715,10 @@ def _load_inputs(
             spec = registry[name]
         except KeyError as exc:
             raise PilotConfigError(f"registry has no pilot dataset {name!r}") from exc
+        if "lid" not in spec.required_artifacts:
+            raise PilotConfigError(
+                f"pilot dataset {name!r} must declare train/val/test LID targets"
+            )
         splits = load_dataset(
             benchmark_root,
             spec,
@@ -540,8 +729,6 @@ def _load_inputs(
             raise PilotConfigError(
                 f"pilot dataset {name!r} must expose train/val/test in that order"
             )
-        if any(splits[split].lid is None for split in ("val", "test")):
-            raise PilotConfigError(f"pilot dataset {name!r} needs val/test LID labels")
         source_files = _source_file_records(splits, benchmark_root=benchmark_root)
         training_key = "train/dataset.npy"
         if training_key not in source_files:
@@ -596,9 +783,7 @@ def _emit(
     callback(event, record)
 
 
-def _log_asset(
-    callback: LogCallback | None, path: Path, *, name: str
-) -> bool:
+def _log_asset(callback: LogCallback | None, path: Path, *, name: str) -> bool:
     """Upload a final artifact when the callback exposes the Comet asset API."""
 
     if callback is None:
@@ -620,31 +805,55 @@ def _prediction_curve(
     model: Mapping[str, Any],
     evaluation: Mapping[str, Any],
 ) -> FloatArray:
-    columns: list[FloatArray] = []
-    n_samples = int(np.asarray(query).shape[0])
-    for scale in scales:
-        prediction = np.ravel(
-            np.asarray(
-                predict_fn(
-                    trained,
-                    query,
-                    float(scale),
-                    family=family,
-                    readout=str(model["readout"]),
-                    divergence_backend=str(evaluation["divergence_backend"]),
-                    trace_probes=int(evaluation.get("trace_probes") or 0),
-                    trace_seed=int(evaluation["trace_seed"]),
-                    batch_size=int(evaluation["batch_size"]),
-                ),
-                dtype=np.float64,
-            )
+    columns = [
+        _prediction_at_scale(
+            predict_fn=predict_fn,
+            trained=trained,
+            query=query,
+            scale=float(scale),
+            family=family,
+            model=model,
+            evaluation=evaluation,
         )
-        if prediction.shape != (n_samples,):
-            raise ValueError(
-                f"predict_lid returned {prediction.shape}, expected {(n_samples,)}"
-            )
-        columns.append(prediction)
+        for scale in scales
+    ]
     return np.ascontiguousarray(np.column_stack(columns), dtype=np.float64)
+
+
+def _prediction_at_scale(
+    *,
+    predict_fn: PredictFunction,
+    trained: Any,
+    query: npt.ArrayLike,
+    scale: float,
+    family: str,
+    model: Mapping[str, Any],
+    evaluation: Mapping[str, Any],
+) -> FloatArray:
+    """Evaluate exactly one declared model scale and preserve row cardinality."""
+
+    n_samples = int(np.asarray(query).shape[0])
+    prediction = np.ravel(
+        np.asarray(
+            predict_fn(
+                trained,
+                query,
+                float(scale),
+                family=family,
+                readout=str(model["readout"]),
+                divergence_backend=str(evaluation["divergence_backend"]),
+                trace_probes=int(evaluation.get("trace_probes") or 0),
+                trace_seed=int(evaluation["trace_seed"]),
+                batch_size=int(evaluation["batch_size"]),
+            ),
+            dtype=np.float64,
+        )
+    )
+    if prediction.shape != (n_samples,):
+        raise ValueError(
+            f"predict_lid returned {prediction.shape}, expected {(n_samples,)}"
+        )
+    return np.ascontiguousarray(prediction, dtype=np.float64)
 
 
 def _require_all_finite(value: npt.ArrayLike, *, label: str) -> None:
@@ -661,15 +870,173 @@ def _require_all_finite(value: npt.ArrayLike, *, label: str) -> None:
     )
 
 
+def _array_sha256(value: npt.ArrayLike) -> str:
+    """Hash array semantics as well as bytes, independent of ``.npy`` headers."""
+
+    array = np.ascontiguousarray(np.asarray(value))
+    header = canonical_json(
+        {"dtype": array.dtype.str, "shape": [int(size) for size in array.shape]}
+    ).encode("utf-8")
+    digest = hashlib.sha256()
+    digest.update(len(header).to_bytes(8, "big"))
+    digest.update(header)
+    digest.update(memoryview(array).cast("B"))
+    return digest.hexdigest()
+
+
+def _deterministic_selection_indices(
+    n_samples: int, *, subset_size: int, seed: int
+) -> npt.NDArray[np.int64]:
+    """Select rows by a versioned SplitMix64 rank, not library RNG behavior."""
+
+    if subset_size <= 0 or subset_size >= n_samples:
+        raise PilotConfigError(
+            "selection.subset_size must be positive and strictly smaller than "
+            f"the source train split ({n_samples}); got {subset_size}"
+        )
+    indices = np.arange(n_samples, dtype=np.uint64)
+    with np.errstate(over="ignore"):
+        mixed = indices + np.uint64(seed) + np.uint64(0x9E3779B97F4A7C15)
+        mixed = (mixed ^ (mixed >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+        mixed = (mixed ^ (mixed >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+        mixed ^= mixed >> np.uint64(31)
+    # Stable ordering makes the index itself the deterministic secondary key
+    # in the astronomically unlikely event of a 64-bit key collision.
+    ranked = np.argsort(mixed, kind="stable")[:subset_size]
+    return np.sort(ranked.astype(np.int64, copy=False))
+
+
+def _partition_source_train(
+    train: npt.ArrayLike,
+    train_target: npt.ArrayLike,
+    *,
+    selection: Mapping[str, Any],
+) -> TrainSelectionPartition:
+    """Create a target-bearing selector subset disjoint from optimizer rows."""
+
+    features = np.asarray(train)
+    target = np.ravel(np.asarray(train_target, dtype=np.float64))
+    if features.ndim != 2 or features.shape[0] != target.shape[0]:
+        raise PilotConfigError(
+            "source train features and LID targets must have equal sample counts"
+        )
+    _require_all_finite(features, label="source train features")
+    _require_all_finite(target, label="source train target")
+    selection_indices = _deterministic_selection_indices(
+        int(features.shape[0]),
+        subset_size=int(selection["subset_size"]),
+        seed=int(selection["seed"]),
+    )
+    fit_mask = np.ones(features.shape[0], dtype=bool)
+    fit_mask[selection_indices] = False
+    fit_indices = np.flatnonzero(fit_mask).astype(np.int64, copy=False)
+    fit_features = np.ascontiguousarray(features[fit_indices])
+    selection_features = np.ascontiguousarray(features[selection_indices])
+    selection_target = np.ascontiguousarray(target[selection_indices])
+    if np.intersect1d(fit_indices, selection_indices).size:
+        raise AssertionError("optimizer and train-selection indices overlap")
+    record: dict[str, Any] = {
+        "schema_version": 1,
+        "protocol": TRAIN_SELECTION_PROTOCOL,
+        "source_split": "train",
+        "index_algorithm": "splitmix64_rank_v1",
+        "seed": int(selection["seed"]),
+        "n_source_train": int(features.shape[0]),
+        "n_optimizer_fit": int(fit_indices.size),
+        "n_train_selection": int(selection_indices.size),
+        "optimizer_overlap_count": 0,
+        "fit_indices_sha256": _array_sha256(fit_indices),
+        "selection_indices_sha256": _array_sha256(selection_indices),
+        "fit_features_sha256": _array_sha256(fit_features),
+        "selection_features_sha256": _array_sha256(selection_features),
+        "selection_target_sha256": _array_sha256(selection_target),
+    }
+    record["partition_sha256"] = sha256_bytes(canonical_json(record).encode("utf-8"))
+    return TrainSelectionPartition(
+        fit_indices=fit_indices,
+        selection_indices=selection_indices,
+        fit_features=fit_features,
+        selection_features=selection_features,
+        selection_target=selection_target,
+        record=record,
+    )
+
+
+def _select_by_train_targets(
+    *,
+    scales: FloatArray,
+    curve: FloatArray,
+    target: FloatArray,
+    criterion: str,
+    tie_tolerance: float,
+    tie_break: str,
+) -> tuple[int, dict[str, Any]]:
+    """Select one frozen candidate using only held-out source-train targets."""
+
+    if criterion != "mae":
+        raise ValueError("only the declared train-selection criterion 'mae' is valid")
+    if tie_break not in {"smaller", "larger"}:
+        raise ValueError("tie_break must be 'smaller' or 'larger'")
+    scale_array = np.ravel(np.asarray(scales, dtype=np.float64))
+    prediction_curve = np.asarray(curve, dtype=np.float64)
+    truth = np.ravel(np.asarray(target, dtype=np.float64))
+    if prediction_curve.shape != (truth.size, scale_array.size):
+        raise ValueError(
+            "train-selection curve shape must be "
+            f"{(truth.size, scale_array.size)}, got {prediction_curve.shape}"
+        )
+    _require_all_finite(prediction_curve, label="train-selection prediction curve")
+    _require_all_finite(truth, label="train-selection target")
+    candidate_metrics = [
+        known_lid_metrics(prediction_curve[:, index], truth)
+        for index in range(scale_array.size)
+    ]
+    scores = np.asarray(
+        [float(metrics[criterion]) for metrics in candidate_metrics],
+        dtype=np.float64,
+    )
+    best_score = float(scores.min())
+    effective_tolerance = max(
+        float(tie_tolerance),
+        32.0 * np.finfo(np.float64).eps * max(1.0, abs(best_score)),
+    )
+    tied = np.flatnonzero(np.abs(scores - best_score) <= effective_tolerance)
+    tied_scales = scale_array[tied]
+    tied_position = int(np.argmin(tied_scales))
+    if tie_break == "larger":
+        tied_position = int(np.argmax(tied_scales))
+    selected_index = int(tied[tied_position])
+    diagnostics: dict[str, Any] = {
+        "schema_version": 1,
+        "method": TRAIN_SELECTION_PROTOCOL,
+        "criterion": criterion,
+        "uses_ground_truth": True,
+        "ground_truth_split": "train_selection",
+        "uses_validation_ground_truth": False,
+        "uses_test_ground_truth": False,
+        "selected_index": selected_index,
+        "selected_scale": float(scale_array[selected_index]),
+        "selected_score": float(scores[selected_index]),
+        "criterion_scores": [float(value) for value in scores],
+        "candidate_metrics": candidate_metrics,
+        "configured_tie_tolerance": float(tie_tolerance),
+        "effective_tie_tolerance": effective_tolerance,
+        "tied_indices": [int(value) for value in tied],
+        "tie_break": tie_break,
+        "prefer": tie_break,
+    }
+    return selected_index, diagnostics
+
+
 def _selection_coordinate(
     scales: FloatArray, *, family: str
 ) -> tuple[FloatArray, str, str, str]:
-    """Return the coordinate in which plateau stability is measured.
+    """Return the physical coordinate associated with each model parameter.
 
     Rectified-flow networks are evaluated at time ``t``, while the Gaussian
-    channel scale in the endpoint identity is ``lambda = (1 - t) / t``.  The
-    selector must therefore differentiate the validation curve with respect to
-    log-lambda, not log-t.  Diffusion already uses its native noise scale.
+    channel scale in the endpoint identity is ``lambda = (1 - t) / t``.
+    Supervised selection is performed directly over candidate model indices;
+    this coordinate is retained as a diagnostic, not as an optimization input.
     """
 
     if family == "rectified_flow":
@@ -679,6 +1046,20 @@ def _selection_coordinate(
             "lambda",
             "(1 - t) / t",
             "t",
+        )
+    if family == "scale_conditioned_nf":
+        return (
+            np.ascontiguousarray(np.log(scales), dtype=np.float64),
+            "log_epsilon",
+            "log(epsilon)",
+            "epsilon",
+        )
+    if family == "schrodinger_bridge":
+        return (
+            scales.copy(),
+            "tau",
+            "T - t",
+            "tau",
         )
     return scales.copy(), "sigma", "sigma", "sigma"
 
@@ -694,15 +1075,13 @@ def _reported_selection_diagnostics(
     model_scale_name: str,
     coordinate_prefer: str,
     model_scale_prefer: str,
+    model_training: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Make the selector coordinate and original model parameter unambiguous."""
 
     result = dict(diagnostics)
     selected_coordinate = float(coordinates[selected_index])
     selected_model_scale = float(scales[selected_index])
-    # ``select_stable_scale`` calls its input a scale.  Preserve that value in
-    # the explicit coordinate record, then expose the actual network parameter
-    # under the long-standing ``selected_scale`` field.
     result["selection_coordinate"] = {
         "name": coordinate_name,
         "formula": coordinate_formula,
@@ -720,6 +1099,16 @@ def _reported_selection_diagnostics(
     result["selected_scale"] = selected_model_scale
     if model_scale_name == "t":
         result["selected_t"] = selected_model_scale
+        result["selected_delta_t"] = 1.0 - selected_model_scale
+    elif model_scale_name == "epsilon":
+        result["selected_epsilon"] = selected_model_scale
+        result["selected_log_epsilon"] = selected_coordinate
+    elif model_scale_name == "tau":
+        terminal_time = float(model_training["bridge_terminal_time"])
+        diffusivity = float(model_training["bridge_diffusivity"])
+        result["selected_tau"] = selected_model_scale
+        result["selected_t"] = terminal_time - selected_model_scale
+        result["selected_sigma"] = math.sqrt(diffusivity * selected_model_scale)
     return result
 
 
@@ -729,15 +1118,16 @@ def _training_result_record(result: Any) -> dict[str, Any]:
         "best_epoch": getattr(result, "best_epoch", None),
         "best_validation_loss": getattr(result, "best_validation_loss", None),
         "metrics": getattr(result, "metrics", {}),
+        "model_contract": getattr(result, "model_contract", {}),
         "internal_preprocessing": getattr(result, "preprocessing", {}),
-        "internal_preprocessing_sha256": getattr(
-            result, "preprocessing_sha256", None
-        ),
+        "internal_preprocessing_sha256": getattr(result, "preprocessing_sha256", None),
     }
     return _strict_json_value(fields)
 
 
-def _macro_metrics(dataset_summaries: Mapping[str, Any], split: str) -> dict[str, float]:
+def _macro_metrics(
+    dataset_summaries: Mapping[str, Any], split: str
+) -> dict[str, float]:
     metric_names = ("mae", "rmse", "bias", "median_absolute_error")
     result: dict[str, float] = {}
     for metric in metric_names:
@@ -773,9 +1163,7 @@ def _portable_output_inventory(root: Path) -> dict[str, dict[str, str | int]]:
     return dict(sorted(records.items()))
 
 
-def _artifact_registry(
-    *, run_dir: Path, datasets: Mapping[str, Any]
-) -> dict[str, Any]:
+def _artifact_registry(*, run_dir: Path, datasets: Mapping[str, Any]) -> dict[str, Any]:
     artifacts: dict[str, Any] = {}
     for name, record in datasets.items():
         cell_dir = run_dir / "datasets" / name
@@ -807,11 +1195,13 @@ def _run_dataset(
     evaluation = config["evaluation"]
     family = str(model["family"])
     experiment_name = str(config["experiment_name"])
-    train = _flatten_features(splits["train"])
-    validation = _flatten_features(splits["val"])
-    test = _flatten_features(splits["test"])
-    validation_target = np.ravel(np.asarray(splits["val"].lid, dtype=np.float64))
-    test_target = np.ravel(np.asarray(splits["test"].lid, dtype=np.float64))
+    source_train = _flatten_features(splits["train"])
+    train_target = np.ravel(np.asarray(splits["train"].lid, dtype=np.float64))
+    partition = _partition_source_train(
+        source_train,
+        train_target,
+        selection=evaluation["selection"],
+    )
     cell_dir = run_dir / "datasets" / name
     cell_dir.mkdir(parents=True)
     checkpoint_path = cell_dir / "checkpoint.pt"
@@ -842,8 +1232,8 @@ def _run_dataset(
     )
     trained = train_fn(
         family,
-        train,
-        validation,
+        partition.fit_features,
+        partition.selection_features,
         dict(model["training"]),
         checkpoint_path,
         training_log if log_callback is not None else None,
@@ -852,8 +1242,13 @@ def _run_dataset(
         raise RuntimeError(f"trainer did not write a checkpoint: {checkpoint_path}")
     declared_checkpoint_sha = getattr(trained, "checkpoint_sha256", None)
     checkpoint_sha = sha256_path(checkpoint_path)
-    if declared_checkpoint_sha is not None and declared_checkpoint_sha != checkpoint_sha:
-        raise RuntimeError("TrainingResult checkpoint SHA does not match checkpoint file")
+    if (
+        declared_checkpoint_sha is not None
+        and declared_checkpoint_sha != checkpoint_sha
+    ):
+        raise RuntimeError(
+            "TrainingResult checkpoint SHA does not match checkpoint file"
+        )
     actual_family = getattr(trained, "family", None)
     if actual_family != _FAMILY_FOR_ARTIFACTS[family]:
         raise RuntimeError(
@@ -862,16 +1257,16 @@ def _run_dataset(
         )
 
     scales = np.asarray(model["scales"], dtype=np.float64)
-    validation_curve = _prediction_curve(
+    train_selection_curve = _prediction_curve(
         predict_fn=predict_fn,
         trained=trained,
-        query=validation,
+        query=partition.selection_features,
         scales=scales,
         family=family,
         model=model,
         evaluation=evaluation,
     )
-    _require_all_finite(validation_curve, label="validation prediction curve")
+    _require_all_finite(train_selection_curve, label="train-selection prediction curve")
     selection = evaluation["selection"]
     (
         selection_coordinates,
@@ -882,15 +1277,14 @@ def _run_dataset(
     model_scale_prefer = str(model["selection_prefer"])
     coordinate_prefer = model_scale_prefer
     if family == "rectified_flow":
-        coordinate_prefer = (
-            "smaller" if model_scale_prefer == "larger" else "larger"
-        )
-    selected_index, raw_selection_diagnostics = select_stable_scale(
-        selection_coordinates,
-        validation_curve,
-        window=int(selection["window"]),
-        min_valid_fraction=float(selection["min_valid_fraction"]),
-        prefer=coordinate_prefer,  # type: ignore[arg-type]
+        coordinate_prefer = "smaller" if model_scale_prefer == "larger" else "larger"
+    selected_index, raw_selection_diagnostics = _select_by_train_targets(
+        scales=scales,
+        curve=train_selection_curve,
+        target=partition.selection_target,
+        criterion=str(selection["criterion"]),
+        tie_tolerance=float(selection["tie_tolerance"]),
+        tie_break=str(selection["tie_break"]),
     )
     selection_diagnostics = _reported_selection_diagnostics(
         raw_selection_diagnostics,
@@ -902,30 +1296,68 @@ def _run_dataset(
         model_scale_name=model_scale_name,
         coordinate_prefer=coordinate_prefer,
         model_scale_prefer=model_scale_prefer,
+        model_training=model["training"],
     )
-    # Test inference happens only after label-free selection has completed.
-    test_curve = _prediction_curve(
+    selection_diagnostics["partition"] = dict(partition.record)
+    train_selection_prediction = train_selection_curve[:, selected_index]
+    _require_all_finite(
+        train_selection_prediction, label="selected train-selection prediction"
+    )
+    train_selection_metrics = known_lid_metrics(
+        train_selection_prediction, partition.selection_target
+    )
+    _emit(
+        log_callback,
+        f"dataset.{name}.selection.frozen",
+        experiment_name=experiment_name,
+        family=family,
+        dataset=name,
+        selected_index=selected_index,
+        selected_scale=float(scales[selected_index]),
+        selection_target_split="train_selection",
+        selection_criterion=str(selection["criterion"]),
+        scale_selection=selection_diagnostics,
+        train_selection=train_selection_metrics,
+        partition=partition.record,
+    )
+    # The selected index is immutable before either benchmark evaluation split
+    # is touched. Even their feature/target arrays are intentionally resolved
+    # below this boundary. Each split is evaluated exactly once at the frozen
+    # scale; retrospective validation/test curves are outside the primary run.
+    selected_scale = float(scales[selected_index])
+    validation = _flatten_features(splits["val"])
+    validation_target = np.ravel(np.asarray(splits["val"].lid, dtype=np.float64))
+    validation_prediction = _prediction_at_scale(
         predict_fn=predict_fn,
         trained=trained,
-        query=test,
-        scales=scales,
+        query=validation,
+        scale=selected_scale,
         family=family,
         model=model,
         evaluation=evaluation,
     )
-    _require_all_finite(test_curve, label="test prediction curve")
-    validation_prediction = validation_curve[:, selected_index]
-    test_prediction = test_curve[:, selected_index]
-    _require_all_finite(
-        validation_prediction, label="selected validation prediction"
-    )
-    _require_all_finite(test_prediction, label="selected test prediction")
+    _require_all_finite(validation_prediction, label="validation prediction")
     validation_metrics = known_lid_metrics(validation_prediction, validation_target)
+    test = _flatten_features(splits["test"])
+    test_target = np.ravel(np.asarray(splits["test"].lid, dtype=np.float64))
+    test_prediction = _prediction_at_scale(
+        predict_fn=predict_fn,
+        trained=trained,
+        query=test,
+        scale=selected_scale,
+        family=family,
+        model=model,
+        evaluation=evaluation,
+    )
+    _require_all_finite(test_prediction, label="test prediction")
     test_metrics = known_lid_metrics(test_prediction, test_target)
 
     _save_npy(cell_dir / "scales.npy", scales)
-    _save_npy(cell_dir / "validation_curve.npy", validation_curve)
-    _save_npy(cell_dir / "test_curve.npy", test_curve)
+    _save_npy(cell_dir / "train_fit_indices.npy", partition.fit_indices)
+    _save_npy(cell_dir / "train_selection_indices.npy", partition.selection_indices)
+    _save_npy(cell_dir / "train_selection_curve.npy", train_selection_curve)
+    _save_npy(cell_dir / "train_selection_prediction.npy", train_selection_prediction)
+    _save_npy(cell_dir / "train_selection_target.npy", partition.selection_target)
     _save_npy(cell_dir / "validation_prediction.npy", validation_prediction)
     _save_npy(cell_dir / "test_prediction.npy", test_prediction)
     _save_npy(cell_dir / "validation_target.npy", validation_target)
@@ -934,9 +1366,7 @@ def _run_dataset(
     _write_json(cell_dir / "training_history.json", history)
 
     preprocessing_spec = {"kind": "identity"}
-    preprocessing_sha = sha256_bytes(
-        canonical_json(preprocessing_spec).encode("utf-8")
-    )
+    preprocessing_sha = sha256_bytes(canonical_json(preprocessing_spec).encode("utf-8"))
     training_config = {
         "schema_version": 1,
         "project": PROJECT_NAME,
@@ -946,6 +1376,7 @@ def _run_dataset(
             "name": name,
             "representation": "dataset",
             "feature_shape": input_record["feature_shape"],
+            "train_partition": dict(partition.record),
         },
         "preprocessing": {
             "external": preprocessing_spec,
@@ -963,9 +1394,7 @@ def _run_dataset(
             "model_seed": int(config["seed"]),
             "dataset_name": name,
             "representation": "dataset",
-            "training_dataset_sha256": input_record[
-                "training_dataset_sha256"
-            ],
+            "training_dataset_sha256": input_record["training_dataset_sha256"],
             "preprocessing_sha256": preprocessing_sha,
         },
     }
@@ -980,8 +1409,22 @@ def _run_dataset(
         "checkpoint_sha256": checkpoint_sha,
         "training_dataset_sha256": input_record["training_dataset_sha256"],
         "preprocessing_sha256": preprocessing_sha,
-        "selection_uses_lid_targets": False,
+        "selection_protocol": TRAIN_SELECTION_PROTOCOL,
+        "selection_target_split": "train_selection",
+        "selection_uses_lid_targets": True,
+        "selection_uses_validation_targets": False,
+        "selection_uses_test_targets": False,
+        "evaluation_protocol": FROZEN_EVALUATION_PROTOCOL,
+        "frozen_evaluation": {
+            "schema_version": 1,
+            "selected_index": selected_index,
+            "selected_scale": selected_scale,
+            "validation_candidate_count": 1,
+            "test_candidate_count": 1,
+            "retrospective_curves_saved": False,
+        },
         "scale_selection": selection_diagnostics,
+        "train_selection": train_selection_metrics,
         "validation": validation_metrics,
         "test": test_metrics,
     }
@@ -1041,7 +1484,6 @@ def run_pilot(
     selected_output = selected_output.resolve()
     family = str(config["pilot_model"]["family"])
     final_dir = selected_output / f"{family}__{run_id}"
-    manifest_path = final_dir / "manifest.json"
     if final_dir.exists():
         errors = validate_pilot_experiment(final_dir)
         if errors:
@@ -1081,8 +1523,15 @@ def run_pilot(
         "experiment_name": experiment_name,
         "run_id": run_id,
         "family": family,
-        "selection_uses_lid_targets": False,
+        "selection_protocol": TRAIN_SELECTION_PROTOCOL,
+        "selection_target_split": "train_selection",
+        "selection_uses_lid_targets": True,
+        "selection_uses_validation_targets": False,
+        "selection_uses_test_targets": False,
+        "evaluation_protocol": FROZEN_EVALUATION_PROTOCOL,
+        "retrospective_evaluation_curves_saved": False,
         "datasets": summaries,
+        "macro_train_selection": _macro_metrics(summaries, "train_selection"),
         "macro_validation": _macro_metrics(summaries, "validation"),
         "macro_test": _macro_metrics(summaries, "test"),
     }
@@ -1095,14 +1544,20 @@ def run_pilot(
         "project": PROJECT_NAME,
         "experiment_name": experiment_name,
         "run_id": run_id,
-        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "created_at_utc": datetime.now(UTC).isoformat(),
         "family": family,
         "config_sha256": config_sha,
         "source_tree_sha256": source_sha,
         "input_sha256": input_sha,
         "inputs": input_record,
         "environment": environment_state(),
-        "selection_uses_lid_targets": False,
+        "selection_protocol": TRAIN_SELECTION_PROTOCOL,
+        "selection_target_split": "train_selection",
+        "selection_uses_lid_targets": True,
+        "selection_uses_validation_targets": False,
+        "selection_uses_test_targets": False,
+        "evaluation_protocol": FROZEN_EVALUATION_PROTOCOL,
+        "retrospective_evaluation_curves_saved": False,
         "outputs": outputs,
     }
     _write_json(work_dir / "manifest.json", manifest)
@@ -1128,6 +1583,7 @@ def run_pilot(
         experiment_name=experiment_name,
         family=family,
         run_id=run_id,
+        macro_train_selection=aggregate["macro_train_selection"],
         macro_validation=aggregate["macro_validation"],
         macro_test=aggregate["macro_test"],
         shared_filesystem_run_dir=str(final_dir),
@@ -1150,6 +1606,267 @@ def _safe_relative_path(value: Any) -> str | None:
     ):
         return None
     return value
+
+
+def _load_numeric_output(path: Path) -> np.ndarray:
+    value = np.load(path, allow_pickle=False)
+    if not isinstance(value, np.ndarray) or not np.issubdtype(value.dtype, np.number):
+        raise ValueError(f"{path.name} must contain a numeric numpy array")
+    return value
+
+
+def _validate_selection_cell(
+    *,
+    directory: Path,
+    dataset_name: str,
+    config: Mapping[str, Any],
+    source_train: npt.ArrayLike | None = None,
+    source_train_target: npt.ArrayLike | None = None,
+) -> tuple[list[str], dict[str, Any] | None]:
+    """Recompute a cell's selected index, predictions, metrics, and partition."""
+
+    cell = directory / "datasets" / dataset_name
+    errors: list[str] = []
+    try:
+        summary_value = json.loads((cell / "summary.json").read_text("utf-8"))
+        if not isinstance(summary_value, dict):
+            raise TypeError("summary.json must contain a mapping")
+        summary: dict[str, Any] = summary_value
+        training_value = yaml.safe_load((cell / "training.yaml").read_text("utf-8"))
+        if not isinstance(training_value, dict):
+            raise TypeError("training.yaml must contain a mapping")
+        arrays = {
+            name: _load_numeric_output(cell / f"{name}.npy")
+            for name in (
+                "scales",
+                "train_fit_indices",
+                "train_selection_indices",
+                "train_selection_curve",
+                "train_selection_prediction",
+                "train_selection_target",
+                "validation_prediction",
+                "validation_target",
+                "test_prediction",
+                "test_target",
+            )
+        }
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+        yaml.YAMLError,
+    ) as exc:
+        return [f"{dataset_name}: invalid selection artifact: {exc}"], None
+
+    for forbidden_name in ("validation_curve.npy", "test_curve.npy"):
+        if (cell / forbidden_name).exists():
+            errors.append(
+                f"{dataset_name}: retrospective evaluation artifact is forbidden: "
+                f"{forbidden_name}"
+            )
+
+    model = config["pilot_model"]
+    evaluation = config["evaluation"]
+    selection = evaluation["selection"]
+    scales = np.ravel(np.asarray(arrays["scales"], dtype=np.float64))
+    configured_scales = np.asarray(model["scales"], dtype=np.float64)
+    if not np.array_equal(scales, configured_scales):
+        errors.append(f"{dataset_name}: scales.npy differs from resolved Hydra config")
+
+    fit_indices = np.asarray(arrays["train_fit_indices"])
+    selection_indices = np.asarray(arrays["train_selection_indices"])
+    if fit_indices.ndim != 1 or not np.issubdtype(fit_indices.dtype, np.integer):
+        errors.append(f"{dataset_name}: train_fit_indices.npy must be integer rank-1")
+    if selection_indices.ndim != 1 or not np.issubdtype(
+        selection_indices.dtype, np.integer
+    ):
+        errors.append(
+            f"{dataset_name}: train_selection_indices.npy must be integer rank-1"
+        )
+    n_source = int(
+        summary.get("scale_selection", {})
+        .get("partition", {})
+        .get("n_source_train", -1)
+    )
+    if n_source > 0 and fit_indices.ndim == selection_indices.ndim == 1:
+        expected_selection = _deterministic_selection_indices(
+            n_source,
+            subset_size=int(selection["subset_size"]),
+            seed=int(selection["seed"]),
+        )
+        expected_fit = np.setdiff1d(
+            np.arange(n_source, dtype=np.int64),
+            expected_selection,
+            assume_unique=True,
+        )
+        if not np.array_equal(selection_indices, expected_selection):
+            errors.append(
+                f"{dataset_name}: train-selection indices are not reproducible"
+            )
+        if not np.array_equal(fit_indices, expected_fit):
+            errors.append(
+                f"{dataset_name}: optimizer-fit indices are not the complement"
+            )
+
+    partition = summary.get("scale_selection", {}).get("partition")
+    if not isinstance(partition, dict):
+        errors.append(f"{dataset_name}: missing scale_selection.partition")
+        partition = {}
+    else:
+        recorded_partition_sha = partition.get("partition_sha256")
+        unhashed_partition = {
+            key: value for key, value in partition.items() if key != "partition_sha256"
+        }
+        expected_partition_sha = sha256_bytes(
+            canonical_json(unhashed_partition).encode("utf-8")
+        )
+        if recorded_partition_sha != expected_partition_sha:
+            errors.append(f"{dataset_name}: train partition SHA is inconsistent")
+        if partition.get("fit_indices_sha256") != _array_sha256(fit_indices):
+            errors.append(f"{dataset_name}: fit-indices SHA is inconsistent")
+        if partition.get("selection_indices_sha256") != _array_sha256(
+            selection_indices
+        ):
+            errors.append(f"{dataset_name}: selection-indices SHA is inconsistent")
+        if partition.get("selection_target_sha256") != _array_sha256(
+            arrays["train_selection_target"]
+        ):
+            errors.append(f"{dataset_name}: train-selection target SHA is inconsistent")
+        training_partition = training_value.get("dataset", {}).get("train_partition")
+        if training_partition != partition:
+            errors.append(
+                f"{dataset_name}: training.yaml train partition differs from summary"
+            )
+
+    if source_train is not None and source_train_target is not None:
+        try:
+            expected_partition = _partition_source_train(
+                source_train,
+                source_train_target,
+                selection=selection,
+            )
+        except (
+            AssertionError,
+            FloatingPointError,
+            PilotConfigError,
+            ValueError,
+        ) as exc:
+            errors.append(f"{dataset_name}: cannot reconstruct train partition: {exc}")
+        else:
+            if dict(expected_partition.record) != partition:
+                errors.append(
+                    f"{dataset_name}: train partition differs from source data"
+                )
+
+    selection_curve = np.asarray(arrays["train_selection_curve"], dtype=np.float64)
+    selection_target = np.ravel(
+        np.asarray(arrays["train_selection_target"], dtype=np.float64)
+    )
+    try:
+        selected_index, raw_diagnostics = _select_by_train_targets(
+            scales=scales,
+            curve=selection_curve,
+            target=selection_target,
+            criterion=str(selection["criterion"]),
+            tie_tolerance=float(selection["tie_tolerance"]),
+            tie_break=str(selection["tie_break"]),
+        )
+        coordinates, coordinate_name, coordinate_formula, model_scale_name = (
+            _selection_coordinate(scales, family=str(model["family"]))
+        )
+        model_prefer = str(model["selection_prefer"])
+        coordinate_prefer = model_prefer
+        if model["family"] == "rectified_flow":
+            coordinate_prefer = "smaller" if model_prefer == "larger" else "larger"
+        expected_diagnostics = _reported_selection_diagnostics(
+            raw_diagnostics,
+            scales=scales,
+            coordinates=coordinates,
+            selected_index=selected_index,
+            coordinate_name=coordinate_name,
+            coordinate_formula=coordinate_formula,
+            model_scale_name=model_scale_name,
+            coordinate_prefer=coordinate_prefer,
+            model_scale_prefer=model_prefer,
+            model_training=model["training"],
+        )
+        expected_diagnostics["partition"] = partition
+        if canonical_json(summary.get("scale_selection")) != canonical_json(
+            expected_diagnostics
+        ):
+            errors.append(
+                f"{dataset_name}: scale-selection diagnostics do not recompute"
+            )
+    except (FloatingPointError, KeyError, TypeError, ValueError) as exc:
+        errors.append(f"{dataset_name}: cannot recompute scale selection: {exc}")
+        selected_index = -1
+
+    if 0 <= selected_index < scales.size:
+        train_prediction = np.ravel(
+            np.asarray(arrays["train_selection_prediction"], dtype=np.float64)
+        )
+        if selection_curve.ndim != 2 or selection_curve.shape != (
+            selection_target.size,
+            scales.size,
+        ):
+            errors.append(f"{dataset_name}: invalid train_selection curve shape")
+        elif not np.array_equal(train_prediction, selection_curve[:, selected_index]):
+            errors.append(
+                f"{dataset_name}: train_selection prediction is not the frozen "
+                "curve column"
+            )
+        else:
+            metric = known_lid_metrics(train_prediction, selection_target)
+            if canonical_json(summary.get("train_selection")) != canonical_json(metric):
+                errors.append(
+                    f"{dataset_name}: train_selection metrics do not recompute"
+                )
+
+        expected_frozen_evaluation = {
+            "schema_version": 1,
+            "selected_index": selected_index,
+            "selected_scale": float(scales[selected_index]),
+            "validation_candidate_count": 1,
+            "test_candidate_count": 1,
+            "retrospective_curves_saved": False,
+        }
+        if summary.get("evaluation_protocol") != FROZEN_EVALUATION_PROTOCOL:
+            errors.append(f"{dataset_name}: invalid frozen evaluation protocol")
+        if canonical_json(summary.get("frozen_evaluation")) != canonical_json(
+            expected_frozen_evaluation
+        ):
+            errors.append(
+                f"{dataset_name}: frozen evaluation attestation does not recompute"
+            )
+
+        for split in ("validation", "test"):
+            prediction = np.ravel(
+                np.asarray(arrays[f"{split}_prediction"], dtype=np.float64)
+            )
+            target = np.ravel(np.asarray(arrays[f"{split}_target"], dtype=np.float64))
+            if prediction.shape != target.shape:
+                errors.append(f"{dataset_name}: invalid {split} prediction shape")
+                continue
+            if not np.isfinite(prediction).all() or not np.isfinite(target).all():
+                errors.append(f"{dataset_name}: non-finite {split} output")
+                continue
+            metric = known_lid_metrics(prediction, target)
+            if canonical_json(summary.get(split)) != canonical_json(metric):
+                errors.append(f"{dataset_name}: {split} metrics do not recompute")
+
+    expected_attestation = {
+        "selection_protocol": TRAIN_SELECTION_PROTOCOL,
+        "selection_target_split": "train_selection",
+        "selection_uses_lid_targets": True,
+        "selection_uses_validation_targets": False,
+        "selection_uses_test_targets": False,
+    }
+    for key, expected in expected_attestation.items():
+        if summary.get(key) != expected:
+            errors.append(f"{dataset_name}: invalid {key} attestation")
+    return errors, summary
 
 
 def validate_pilot_experiment(
@@ -1182,7 +1899,13 @@ def validate_pilot_experiment(
         "input_sha256",
         "inputs",
         "environment",
+        "selection_protocol",
+        "selection_target_split",
         "selection_uses_lid_targets",
+        "selection_uses_validation_targets",
+        "selection_uses_test_targets",
+        "evaluation_protocol",
+        "retrospective_evaluation_curves_saved",
         "outputs",
     }
     if set(manifest) != required:
@@ -1195,14 +1918,34 @@ def validate_pilot_experiment(
         errors.append("unsupported pilot manifest schema_version")
     if manifest.get("project") != PROJECT_NAME:
         errors.append(f"manifest.project is not {PROJECT_NAME!r}")
-    if manifest.get("selection_uses_lid_targets") is not False:
-        errors.append("manifest must attest target-free scale selection")
+    if manifest.get("selection_protocol") != TRAIN_SELECTION_PROTOCOL:
+        errors.append("manifest has an unsupported train-selection protocol")
+    if manifest.get("selection_target_split") != "train_selection":
+        errors.append("manifest selection target must be train_selection")
+    if manifest.get("selection_uses_lid_targets") is not True:
+        errors.append("manifest must attest supervised train-target selection")
+    if manifest.get("selection_uses_validation_targets") is not False:
+        errors.append("manifest must attest no validation-target selection")
+    if manifest.get("selection_uses_test_targets") is not False:
+        errors.append("manifest must attest no test-target selection")
+    if manifest.get("evaluation_protocol") != FROZEN_EVALUATION_PROTOCOL:
+        errors.append("manifest has an unsupported frozen evaluation protocol")
+    if manifest.get("retrospective_evaluation_curves_saved") is not False:
+        errors.append("manifest must forbid retrospective evaluation curves")
 
     resolved_path = directory / "resolved_config.yaml"
     try:
         resolved = yaml.safe_load(resolved_path.read_text(encoding="utf-8"))
         resolved = validate_pilot_config(resolved)
-    except Exception as exc:
+    except (
+        KeyError,
+        OSError,
+        PilotConfigError,
+        TypeError,
+        UnicodeError,
+        ValueError,
+        yaml.YAMLError,
+    ) as exc:
         errors.append(f"invalid resolved_config.yaml: {exc}")
         resolved = None
     if resolved is not None:
@@ -1230,6 +1973,7 @@ def validate_pilot_experiment(
         if manifest.get("run_id") != expected_run_id:
             errors.append("run_id is inconsistent with scientific identity")
 
+    verified_loaded: Mapping[str, Mapping[str, LoadedSplit]] | None = None
     inputs = manifest.get("inputs")
     if not isinstance(inputs, dict):
         errors.append("manifest.inputs must be a mapping")
@@ -1241,8 +1985,12 @@ def validate_pilot_experiment(
             benchmark_root = _resolve_path(project_root, resolved["data"]["root"])
             registry_record = inputs.get("registry")
             if isinstance(registry_record, Mapping):
-                registry_path = _resolve_path(project_root, resolved["data"]["registry"])
-                if not registry_path.is_file() or sha256_path(registry_path) != registry_record.get("sha256"):
+                registry_path = _resolve_path(
+                    project_root, resolved["data"]["registry"]
+                )
+                if not registry_path.is_file() or sha256_path(
+                    registry_path
+                ) != registry_record.get("sha256"):
                     errors.append("registry input changed or is missing")
             dataset_records = inputs.get("datasets")
             if isinstance(dataset_records, Mapping):
@@ -1256,15 +2004,89 @@ def validate_pilot_experiment(
                         continue
                     for record in source_files.values():
                         if not isinstance(record, Mapping):
-                            errors.append(f"invalid source file record for {dataset_name}")
+                            errors.append(
+                                f"invalid source file record for {dataset_name}"
+                            )
                             continue
                         relative = _safe_relative_path(record.get("path"))
                         if relative is None:
                             errors.append(f"unsafe source path for {dataset_name}")
                             continue
                         path = benchmark_root / relative
-                        if not path.is_file() or sha256_path(path) != record.get("sha256"):
-                            errors.append(f"dataset input changed or missing: {relative}")
+                        if not path.is_file() or sha256_path(path) != record.get(
+                            "sha256"
+                        ):
+                            errors.append(
+                                f"dataset input changed or missing: {relative}"
+                            )
+            try:
+                _, _, _, reconstructed_loaded, reconstructed_inputs = _load_inputs(
+                    root=project_root, config=resolved
+                )
+            except (KeyError, OSError, PilotConfigError, TypeError, ValueError) as exc:
+                errors.append(f"cannot reconstruct pilot inputs: {exc}")
+            else:
+                verified_loaded = reconstructed_loaded
+                if reconstructed_inputs != inputs:
+                    errors.append(
+                        "manifest inputs differ from reconstructed source inputs"
+                    )
+
+    cell_summaries: dict[str, Any] = {}
+    if resolved is not None:
+        for dataset_name in PILOT_DATASETS:
+            source_train: npt.ArrayLike | None = None
+            source_train_target: npt.ArrayLike | None = None
+            if verified_loaded is not None:
+                source_split = verified_loaded[dataset_name]["train"]
+                source_train = _flatten_features(source_split)
+                source_train_target = source_split.lid
+            cell_errors, cell_summary = _validate_selection_cell(
+                directory=directory,
+                dataset_name=dataset_name,
+                config=resolved,
+                source_train=source_train,
+                source_train_target=source_train_target,
+            )
+            errors.extend(cell_errors)
+            if cell_summary is not None:
+                cell_summaries[dataset_name] = cell_summary
+        try:
+            aggregate_value = json.loads(
+                (directory / "summary.json").read_text(encoding="utf-8")
+            )
+            if not isinstance(aggregate_value, dict):
+                raise TypeError("summary.json must contain a mapping")
+        except (
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            errors.append(f"invalid aggregate summary.json: {exc}")
+        else:
+            if aggregate_value.get("datasets") != cell_summaries:
+                errors.append("aggregate datasets differ from per-dataset summaries")
+            for split, field in (
+                ("train_selection", "macro_train_selection"),
+                ("validation", "macro_validation"),
+                ("test", "macro_test"),
+            ):
+                expected_macro = _macro_metrics(cell_summaries, split)
+                if aggregate_value.get(field) != expected_macro:
+                    errors.append(f"{field} does not recompute from dataset summaries")
+            for key, expected in {
+                "selection_protocol": TRAIN_SELECTION_PROTOCOL,
+                "selection_target_split": "train_selection",
+                "selection_uses_lid_targets": True,
+                "selection_uses_validation_targets": False,
+                "selection_uses_test_targets": False,
+                "evaluation_protocol": FROZEN_EVALUATION_PROTOCOL,
+                "retrospective_evaluation_curves_saved": False,
+            }.items():
+                if aggregate_value.get(key) != expected:
+                    errors.append(f"aggregate summary has invalid {key}")
 
     recorded_outputs = manifest.get("outputs")
     if not isinstance(recorded_outputs, dict):
@@ -1284,7 +2106,9 @@ def validate_pilot_experiment(
     return errors
 
 
-def _logging_callback(config: Mapping[str, Any]) -> tuple[LogCallback | None, Callable[[], None]]:
+def _logging_callback(
+    config: Mapping[str, Any],
+) -> tuple[LogCallback | None, Callable[[], None]]:
     """Create the optional external logger without ever accepting a key in YAML."""
 
     if config["logging"]["backend"] == "none":
@@ -1297,7 +2121,7 @@ def _logging_callback(config: Mapping[str, Any]) -> tuple[LogCallback | None, Ca
         ) from exc
     return create_comet_callback(
         experiment_name=str(config["logging"]["experiment_name"]),
-        tags=(str(config["pilot_model"]["family"]),)
+        tags=(str(config["pilot_model"]["family"]),),
     )
 
 

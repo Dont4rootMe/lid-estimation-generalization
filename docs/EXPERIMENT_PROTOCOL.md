@@ -44,16 +44,23 @@ Arrows. Поэтому stratified error-vs-radius/edge/position plots **не** �
 выравнивания строк и regression tests; до этого подтверждаемыми остаются
 перечисленные выше метрики.
 
-## Scale selection without leakage
+## Train-only scale/time selection without validation leakage
 
-- A declared geometric scale grid is evaluated on validation.
-- Primary scale uses a target-free stability rule on adjacent log-scales.
-- Ties resolve toward the scientifically declared endpoint: smaller model-space
-  `sigma` for diffusion and larger `t` (toward `t -> 1`) for rectified flow.
-- The full validation and test scale curves are stored.
-- Test ground truth and test MAE are never consulted.
-- `best_test_mae` may be reported only as an explicitly labelled, non-primary
-  retrospective diagnostic to compare with the benchmark paper's procedure.
+- The canonical source train split is deterministically partitioned into
+  disjoint optimizer-fit and train-selection subsets.
+- The train-selection subset is never used in optimizer batches; it may monitor
+  target-free training loss, then its LID targets select the minimum-MAE
+  scale/time after training.
+- Ties resolve by the family-specific Hydra policy. The chosen candidate index
+  is frozen before validation or test features/targets are accessed.
+- The full train-selection curve is stored. Validation and test each execute
+  exactly one inference at the frozen train-selected scale/time; no
+  retrospective validation/test curve is part of the primary run.
+- Split indices, targets, the train-selection curve, frozen predictions,
+  diagnostics, and their hashes are sealed in the output manifest. The
+  validator recomputes the partition, winning index, selected train column, and
+  all reported metrics, and rejects validation/test curve artifacts.
+- Validation/test targets and their MAE are never consulted for selection.
 
 ## Randomness
 
@@ -70,7 +77,8 @@ config и связываются с результатом через его SHA
 - 100% requested matrix coverage, no silently skipped cells;
 - 100% finite target inputs; finite prediction fraction reported and at least
   the declared threshold;
-- validation scale chosen without target array access;
+- scale/time chosen only from held-out source-train targets, with zero optimizer
+  overlap and no validation/test target access before the index is frozen;
 - output checksum verification succeeds;
 - model checkpoint/config SHA present for learned cells;
 - canonical exact archive and regenerated fallback never aggregated together;

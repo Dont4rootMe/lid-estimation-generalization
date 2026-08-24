@@ -1,8 +1,10 @@
 name: rectified_flow
 family: rectified_flow
-experiment_name: lid-generalization-e8-suite-rectified-flow-matching-seed-${seed}
+experiment_name: lid-generalization-e8-suite-rectified-flow-matching-train-mae-time-selection-seed-${seed}
 readout: full
 selection_prefer: larger
+derivative_backend: hutchinson
+trace_probes: 16
 
 training:
   seed: ${seed}
@@ -19,8 +21,6 @@ training:
   gradient_clip_norm: 1.0
   num_workers: 4
   deterministic: true
-  sigma_min: 0.01
-  sigma_max: 1.0
   time_min: 0.001
   time_max: 0.999
   fourier_features: 32

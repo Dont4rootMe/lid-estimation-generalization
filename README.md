@@ -49,20 +49,26 @@ uv run lid-estimation preprocessing=scalar_affine \
   preprocessing.scale=0.5 preprocessing.offset=-1.0
 ```
 
-## GPU pilot: diffusion и rectified flow
+## GPU pilot: четыре обучаемых model family
 
 Первый обучаемый pilot закреплён на трёх full-data representations:
 `e8_gaussian4_pca`, `e8_spaghetti_pca`, `e8_sphere4_pca`. Один запуск семейства
-последовательно обучает три независимых checkpoint, выбирает scale по
-target-free validation stability, затем сохраняет полные validation/test curves,
-pointwise predictions, targets, метрики, training history и sealed manifest.
+последовательно обучает три независимых checkpoint. Исходный train
+детерминированно делится на optimizer-fit и непересекающийся train-selection
+holdout. После обучения scale/time выбирается по минимальному train-selection
+MAE; индекс замораживается до первого обращения к benchmark validation/test.
+Сохраняется полная train-selection curve, а validation и test вычисляются ровно
+один раз в замороженной точке. Также сохраняются индексы разбиения, pointwise
+predictions, targets, метрики, training history и sealed manifest.
 
 ```bash
 # Локальная проверка Hydra-конфига без GPU
 python -m experiments.pilot --cfg job pilot_model=diffusion
 python -m experiments.pilot --cfg job pilot_model=rectified_flow
+python -m experiments.pilot --cfg job pilot_model=scale_conditioned_nf
+python -m experiments.pilot --cfg job pilot_model=schrodinger_bridge
 
-# Secret-free dry run двух scheduler payloads
+# Secret-free dry run четырёх scheduler payloads
 python -m experiments.cluster_submit \
   --config configs/cluster/shared_a100.yaml
 
@@ -76,19 +82,22 @@ python -m experiments.cluster_submit \
   --family rectified_flow --submit
 ```
 
-Launcher fail-closed по умолчанию фиксирует ровно две jobs по одной GPU (или одну
+Launcher fail-closed по умолчанию фиксирует ровно четыре jobs по одной GPU (или одну
 явно выбранную через `--family`), `queue_name=shared`,
 `priority_class=shared-medium` и literal job description
 `echimbulatov | ent-block-diffusion-eval #ID0137 #rnd`. Это неизменяемый
 scheduler-only идентификатор, а не имя Comet experiment. Comet использует project
 `lid-generalization` в workspace `dont4rootme` и создаёт полностью описательные
-имена `lid-generalization-e8-suite-diffusion-seed-0` и
-`lid-generalization-e8-suite-rectified-flow-matching-seed-0`. Источник этих имён
+имена:
+`lid-generalization-e8-suite-diffusion-train-mae-scale-selection-seed-0` и
+`lid-generalization-e8-suite-rectified-flow-matching-train-mae-time-selection-seed-0`,
+`lid-generalization-e8-suite-scale-conditioned-normalizing-flow-train-mae-scale-selection-seed-0`
+и
+`lid-generalization-e8-suite-brownian-schrodinger-bridge-train-mae-time-selection-seed-0`.
+Источник этих имён
 — соответствующие Hydra YAML в `configs/pilot_model/`; resolved config, summary
-и manifest закрепляют то же имя. Для следующих model families действует тот же
-шаблон: `lid-generalization-e8-suite-normalizing-flow-seed-0` и
-`lid-generalization-e8-suite-schrodinger-bridge-seed-0`. Training и validation
-series разделены по dataset. API key читает сам Comet SDK из
+и manifest закрепляют то же имя. Training и validation series разделены по
+dataset. API key читает сам Comet SDK из
 mode-0600 `/home/jovyan/.comet.config`, выбранного публичной переменной
 `COMET_CONFIG`; credential не попадает в Hydra YAML, scheduler payload, dry-run
 или manifests.
@@ -100,13 +109,14 @@ resolved `config.yaml`, `overrides.yaml`, `hydra.yaml` и лог; проверя
 prediction/manifest artifacts лежат рядом в `results/`.
 
 Standalone pilot сохраняет отдельный checkpoint для каждого из трёх datasets,
-полные pointwise validation/test curves, выбранные predictions и targets,
-training history/config, per-dataset и macro metrics. Корневые
+полную pointwise train-selection curve, single-scale validation/test predictions
+и targets, training history/config, per-dataset и macro metrics. Корневые
 `resolved_config.yaml`, `summary.json`, `artifact_registry.yaml` и
 `manifest.json` хэшируют полный output; первые три итоговых файла также
-прикрепляются к Comet. Scale выбирается по validation curves без доступа к LID
-labels: к меньшему `sigma` для diffusion и к endpoint `t -> 1` для rectified
-flow при равной stability.
+прикрепляются к Comet. Scale/time выбирается только по LID targets
+детерминированного train-selection holdout. При равном MAE tie-break идёт к
+меньшему `sigma` для diffusion и к endpoint `t -> 1` для rectified flow.
+Validation и test targets не участвуют в выборе.
 
 ## Структура
 

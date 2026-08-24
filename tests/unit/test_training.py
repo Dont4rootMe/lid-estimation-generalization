@@ -1,22 +1,35 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
-
 torch = pytest.importorskip("torch")
-from torch import nn  # noqa: E402
+from torch import nn
 
-from models.neural_fields import (  # noqa: E402
+from models.neural_fields import (
     NeuralFieldConfig,
     ScaleConditionedNeuralField,
     exact_divergence,
     hutchinson_divergence,
 )
-from models.training import (  # noqa: E402
+from models.normalizing_flow import (
+    NF_DENSITY_CONTRACT,
+    ScaleConditionedRealNVP,
+)
+from models.schrodinger_bridge import (
+    CANONICAL_BRIDGE_CONDITIONING,
+    CANONICAL_BRIDGE_CONSTRUCTION,
+    CANONICAL_FACTOR_F,
+    CANONICAL_FACTOR_G,
+    CANONICAL_INITIAL_MARGINAL,
+    CANONICAL_REFERENCE_PROCESS,
+    CANONICAL_TERMINAL_MARGINAL,
+)
+from models.training import (
     EpochMetrics,
     TrainingConfig,
     TrainingResult,
@@ -41,8 +54,43 @@ def _tiny_config(seed: int = 7) -> TrainingConfig:
         gradient_clip_norm=1.0,
         sigma_min=0.1,
         sigma_max=0.5,
+        time_min=0.1,
+        time_max=0.5,
         fourier_features=4,
         max_condition_frequency=10.0,
+    )
+
+
+def _tiny_bridge_config(seed: int = 7) -> TrainingConfig:
+    return replace(
+        _tiny_config(seed),
+        bridge_construction=CANONICAL_BRIDGE_CONSTRUCTION,
+        bridge_reference_process=CANONICAL_REFERENCE_PROCESS,
+        bridge_initial_marginal=CANONICAL_INITIAL_MARGINAL,
+        bridge_terminal_marginal=CANONICAL_TERMINAL_MARGINAL,
+        bridge_factor_f=CANONICAL_FACTOR_F,
+        bridge_factor_g=CANONICAL_FACTOR_G,
+        bridge_conditioning=CANONICAL_BRIDGE_CONDITIONING,
+        bridge_diffusivity=1.0,
+        bridge_terminal_time=1.0,
+        bridge_tau_min=0.1,
+        bridge_tau_max=0.5,
+    )
+
+
+def _tiny_nf_config(seed: int = 7) -> TrainingConfig:
+    return replace(
+        _tiny_config(seed),
+        depth=None,
+        sigma_min=None,
+        sigma_max=None,
+        time_min=None,
+        time_max=None,
+        num_coupling_layers=2,
+        conditioner_depth=1,
+        log_scale_limit=1.25,
+        epsilon_min=0.1,
+        epsilon_max=0.5,
     )
 
 
@@ -75,28 +123,25 @@ def test_exact_and_hutchinson_divergence_match_diagonal_reference() -> None:
     inputs = torch.randn(6, 2, 2)
     expected = torch.full((6,), 6.0)
     exact = exact_divergence(field, inputs, 0.5)
-    estimate_a = hutchinson_divergence(
-        field, inputs, 0.5, num_probes=3, seed=19
-    )
-    estimate_b = hutchinson_divergence(
-        field, inputs, 0.5, num_probes=3, seed=19
-    )
+    estimate_a = hutchinson_divergence(field, inputs, 0.5, num_probes=3, seed=19)
+    estimate_b = hutchinson_divergence(field, inputs, 0.5, num_probes=3, seed=19)
     torch.testing.assert_close(exact, expected)
     torch.testing.assert_close(estimate_a, expected)
     torch.testing.assert_close(estimate_b, estimate_a)
 
 
-@pytest.mark.parametrize("family", ["diffusion", "rectified_flow"])
-def test_train_model_writes_loadable_checkpoint_for_both_families(
+@pytest.mark.parametrize(
+    "family", ["diffusion", "rectified_flow", "schrodinger_bridge"]
+)
+def test_train_model_writes_loadable_checkpoint_for_all_field_families(
     family: str, tmp_path: Path
 ) -> None:
     rng = np.random.default_rng(42)
     train = rng.normal(size=(24, 3)).astype(np.float32)
     validation = rng.normal(size=(12, 3)).astype(np.float32)
     checkpoint = tmp_path / family / "model.ckpt"
-    result = train_model(
-        family, train, validation, _tiny_config(), checkpoint
-    )
+    config = _tiny_bridge_config() if family == "schrodinger_bridge" else _tiny_config()
+    result = train_model(family, train, validation, config, checkpoint)
 
     assert checkpoint.is_file()
     assert len(result.checkpoint_sha256) == 64
@@ -107,6 +152,7 @@ def test_train_model_writes_loadable_checkpoint_for_both_families(
 
     loaded = load_checkpoint(checkpoint)
     assert loaded.family == result.family
+    assert loaded.history == result.history
     assert loaded.preprocessing_sha256 == result.preprocessing_sha256
     assert loaded.checkpoint_sha256 == result.checkpoint_sha256
     for name, value in result.model.state_dict().items():
@@ -137,6 +183,126 @@ def test_same_seed_reproduces_history_and_weights(tmp_path: Path) -> None:
     assert first.history == second.history
     for name, value in first.model.state_dict().items():
         torch.testing.assert_close(value, second.model.state_dict()[name])
+
+
+def test_scale_conditioned_nf_trains_loads_and_predicts_exact_fixed_likelihood(
+    tmp_path: Path,
+) -> None:
+    rng = np.random.default_rng(54)
+    train = rng.normal(size=(24, 3)).astype(np.float32)
+    validation = rng.normal(size=(12, 3)).astype(np.float32)
+    checkpoint = tmp_path / "scale-conditioned-nf.ckpt"
+    result = train_model(
+        "scale_conditioned_nf",
+        train,
+        validation,
+        _tiny_nf_config(),
+        checkpoint,
+    )
+
+    assert result.family == "scale_conditioned_normalizing_flow"
+    assert isinstance(result.model, ScaleConditionedRealNVP)
+    assert result.model.config.num_coupling_layers == 2
+    assert result.model.config.conditioner_depth == 1
+    assert result.model.config.log_scale_limit == pytest.approx(1.25)
+    assert result.config.depth is None
+    assert result.config.sigma_min is None
+    assert result.config.time_min is None
+    assert result.model_contract == {
+        **dict(NF_DENSITY_CONTRACT),
+        "epsilon_min": 0.1,
+        "epsilon_max": 0.5,
+    }
+
+    loaded = load_checkpoint(checkpoint)
+    assert isinstance(loaded.model, ScaleConditionedRealNVP)
+    assert loaded.model_contract == result.model_contract
+    for name, value in result.model.state_dict().items():
+        torch.testing.assert_close(value.cpu(), loaded.model.state_dict()[name].cpu())
+    lid = predict_lid(
+        loaded,
+        validation[:5],
+        0.2,
+        readout="fixed_likelihood",
+        divergence_backend="exact",
+        trace_probes=0,
+        batch_size=2,
+    )
+    assert lid.shape == (5,)
+    assert np.isfinite(lid).all()
+
+
+def test_scale_conditioned_nf_requires_complete_explicit_config() -> None:
+    with pytest.raises(ValueError, match="complete block"):
+        replace(_tiny_config(), num_coupling_layers=2)
+    with pytest.raises(ValueError, match="epsilon bounds"):
+        replace(
+            _tiny_nf_config(),
+            epsilon_min=0.5,
+            epsilon_max=0.1,
+        )
+    with pytest.raises(ValueError, match="dropout.*exactly 0"):
+        replace(_tiny_nf_config(), dropout=0.1)
+
+
+def test_scale_conditioned_nf_predictor_rejects_wrong_readout_contract(
+    tmp_path: Path,
+) -> None:
+    rng = np.random.default_rng(55)
+    train = rng.normal(size=(12, 2)).astype(np.float32)
+    result = train_model(
+        "scale_conditioned_nf",
+        train,
+        train[:6],
+        replace(_tiny_nf_config(), epochs=1),
+        tmp_path / "nf.ckpt",
+    )
+    with pytest.raises(ValueError, match="fixed_likelihood"):
+        predict_lid(
+            result,
+            train[:2],
+            0.2,
+            readout="full",
+            divergence_backend="exact",
+            trace_probes=0,
+        )
+    with pytest.raises(ValueError, match="exact autograd"):
+        predict_lid(
+            result,
+            train[:2],
+            0.2,
+            readout="fixed_likelihood",
+            divergence_backend="hutchinson",
+        )
+    with pytest.raises(ValueError, match="training interval"):
+        predict_lid(
+            result,
+            train[:2],
+            0.05,
+            readout="fixed_likelihood",
+            divergence_backend="exact",
+            trace_probes=0,
+        )
+
+
+def test_scale_conditioned_nf_checkpoint_rejects_contract_tampering(
+    tmp_path: Path,
+) -> None:
+    rng = np.random.default_rng(56)
+    train = rng.normal(size=(12, 2)).astype(np.float32)
+    checkpoint = tmp_path / "nf.ckpt"
+    train_model(
+        "scale_conditioned_nf",
+        train,
+        train[:6],
+        replace(_tiny_nf_config(), epochs=1),
+        checkpoint,
+    )
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    payload["model_contract"]["readout"] = "untrusted-replacement"
+    torch.save(payload, checkpoint)
+    with pytest.raises(ValueError, match="model_contract mismatch"):
+        load_checkpoint(checkpoint)
 
 
 def test_diffusion_denoiser_is_converted_to_score_for_readout() -> None:

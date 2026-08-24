@@ -1,23 +1,23 @@
 from __future__ import annotations
 
-from dataclasses import replace
 import importlib
-from pathlib import Path
 import re
 import sys
 import types
+from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
 from experiments.cluster_submit import (
     APPROVED_FAMILIES,
     CUBLAS_WORKSPACE_CONFIG,
-    ClusterConfig,
-    ClusterConfigError,
-    ClusterSubmissionError,
     INSTANCE_TYPE,
     JOB_DESC,
     PILOT_ENTRYPOINT,
+    ClusterConfig,
+    ClusterConfigError,
+    ClusterSubmissionError,
     build_job_payload,
     load_cluster_config,
     main,
@@ -26,13 +26,23 @@ from experiments.cluster_submit import (
     validate_job_payload,
 )
 
-
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "configs" / "cluster" / "shared_a100.yaml"
 EXPERIMENT_NAMES = {
-    "diffusion": "lid-generalization-e8-suite-diffusion-seed-0",
+    "diffusion": (
+        "lid-generalization-e8-suite-diffusion-train-mae-scale-selection-seed-0"
+    ),
     "rectified_flow": (
-        "lid-generalization-e8-suite-rectified-flow-matching-seed-0"
+        "lid-generalization-e8-suite-rectified-flow-matching-"
+        "train-mae-time-selection-seed-0"
+    ),
+    "scale_conditioned_nf": (
+        "lid-generalization-e8-suite-scale-conditioned-normalizing-flow-"
+        "train-mae-scale-selection-seed-0"
+    ),
+    "schrodinger_bridge": (
+        "lid-generalization-e8-suite-brownian-schrodinger-bridge-"
+        "train-mae-time-selection-seed-0"
     ),
 }
 
@@ -45,7 +55,7 @@ def test_planned_jobs_pin_all_scheduler_fair_use_metadata() -> None:
     jobs = plan_jobs(_config())
     assert tuple(job.family for job in jobs) == APPROVED_FAMILIES
     assert {job.family: job.experiment_name for job in jobs} == EXPERIMENT_NAMES
-    assert len(jobs) == 2
+    assert len(jobs) == 4
     for job in jobs:
         payload = job.payload
         assert payload["job_desc"] == JOB_DESC
@@ -70,9 +80,7 @@ def test_payload_has_no_serialized_secret_or_family_scheduler_metadata() -> None
     for planned in plan_jobs(_config()):
         payload = planned.payload
         assert "COMET_API_KEY" not in payload["env_variables"]
-        assert payload["env_variables"]["COMET_PROJECT_NAME"] == (
-            "lid-generalization"
-        )
+        assert payload["env_variables"]["COMET_PROJECT_NAME"] == ("lid-generalization")
         assert "COMET_EXPERIMENT_NAME" not in payload["env_variables"]
         assert payload["env_variables"]["COMET_WORKSPACE"] == "dont4rootme"
         assert payload["env_variables"]["COMET_CONFIG"] == (
@@ -84,9 +92,9 @@ def test_payload_has_no_serialized_secret_or_family_scheduler_metadata() -> None
         # The fixed legacy job description and base-image identifier are not
         # the selected Comet experiment name.
         metadata_text = metadata_text.replace(JOB_DESC, "")
-        metadata_text = metadata_text.replace(
-            str(payload["base_image"]), ""
-        ).replace("lid-generalization", "")
+        metadata_text = metadata_text.replace(str(payload["base_image"]), "").replace(
+            "lid-generalization", ""
+        )
         assert planned.family not in metadata_text
         assert f"pilot_model={planned.family}" in payload["script"]
         assert "logging.project=lid-generalization" in payload["script"]
@@ -95,9 +103,7 @@ def test_payload_has_no_serialized_secret_or_family_scheduler_metadata() -> None
             in payload["script"]
         )
         assert "logging.workspace=dont4rootme" in payload["script"]
-        assert payload["script"].startswith(
-            f"{PILOT_ENTRYPOINT} "
-        )
+        assert payload["script"].startswith(f"{PILOT_ENTRYPOINT} ")
         assert "\n" not in payload["script"]
         assert not re.search(r"[$;&|`<>()]", payload["script"])
         assert "COMET_" not in payload["script"]
@@ -137,7 +143,14 @@ def test_payload_tampering_fails_closed(field: str, value: object) -> None:
 
 
 @pytest.mark.parametrize(
-    "identity", ["diffusion", "rectified_flow", "rectified-flow-matching"]
+    "identity",
+    [
+        "diffusion",
+        "rectified_flow",
+        "rectified-flow-matching",
+        "scale_conditioned_nf",
+        "schrodinger_bridge",
+    ],
 )
 def test_model_or_dataset_identity_in_env_metadata_is_rejected(
     identity: str,
@@ -186,8 +199,8 @@ def test_unapproved_family_is_rejected() -> None:
 def test_cross_family_experiment_name_is_rejected() -> None:
     payload = build_job_payload(_config(), "diffusion")
     payload["script"] = payload["script"].replace(
-        "logging.experiment_name=lid-generalization-e8-suite-diffusion-seed-0",
-        "logging.experiment_name=lid-generalization-e8-suite-rectified-flow-matching-seed-0",
+        f"logging.experiment_name={EXPERIMENT_NAMES['diffusion']}",
+        f"logging.experiment_name={EXPERIMENT_NAMES['rectified_flow']}",
     )
     with pytest.raises(ClusterConfigError, match="Hydra overrides"):
         validate_job_payload(payload)
@@ -197,9 +210,7 @@ def test_single_family_plan_is_exactly_one_rectified_flow_job() -> None:
     jobs = plan_jobs(_config(), "rectified_flow")
     assert len(jobs) == 1
     assert jobs[0].family == "rectified_flow"
-    assert jobs[0].experiment_name == (
-        "lid-generalization-e8-suite-rectified-flow-matching-seed-0"
-    )
+    assert jobs[0].experiment_name == EXPERIMENT_NAMES["rectified_flow"]
     assert jobs[0].payload["job_desc"] == JOB_DESC
 
 
@@ -217,27 +228,22 @@ def test_dry_run_is_default_and_does_not_import_client_lib(
     assert main(["--config", str(CONFIG)]) == 0
     output = capsys.readouterr().out
     assert "mode: dry-run" in output
-    assert output.count(JOB_DESC) == 2
+    assert output.count(JOB_DESC) == 4
     assert "must-not-be-here" not in output
 
 
 def test_dry_run_can_select_only_rectified_flow(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert main(
-        ["--config", str(CONFIG), "--family", "rectified_flow"]
-    ) == 0
+    assert main(["--config", str(CONFIG), "--family", "rectified_flow"]) == 0
     output = capsys.readouterr().out
     assert output.count(JOB_DESC) == 1
     assert "family: rectified_flow" in output
-    assert (
-        "experiment_name: lid-generalization-e8-suite-rectified-flow-matching-seed-0"
-        in output
-    )
+    assert f"experiment_name: {EXPERIMENT_NAMES['rectified_flow']}" in output
     assert "pilot_model=diffusion" not in output
 
 
-def test_submit_constructs_exactly_two_jobs_after_mode_check(
+def test_submit_constructs_exactly_four_jobs_after_mode_check(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     private_config = tmp_path / ".comet.config"
@@ -269,13 +275,11 @@ def test_submit_constructs_exactly_two_jobs_after_mode_check(
 
     monkeypatch.setitem(sys.modules, "client_lib", types.SimpleNamespace(Job=FakeJob))
     job_names = submit_jobs(config)
-    assert len(job_names) == len(submitted) == len(constructed) == 2
-    assert job_names == ("lm-mpi-job-safe-1", "lm-mpi-job-safe-2")
+    assert len(job_names) == len(submitted) == len(constructed) == 4
+    assert job_names == tuple(f"lm-mpi-job-safe-{index}" for index in range(1, 5))
     assert {payload["job_desc"] for payload in constructed} == {JOB_DESC}
     assert {payload["queue_name"] for payload in constructed} == {"shared"}
-    assert {payload["priority_class"] for payload in constructed} == {
-        "shared-medium"
-    }
+    assert {payload["priority_class"] for payload in constructed} == {"shared-medium"}
 
 
 def test_submit_rejects_readable_by_group_secret_file(tmp_path: Path) -> None:
@@ -317,9 +321,7 @@ def test_submit_rejects_client_error_return_without_claiming_success(
         def submit(self) -> str:
             return "Error 400: rejected"
 
-    monkeypatch.setitem(
-        sys.modules, "client_lib", types.SimpleNamespace(Job=FailedJob)
-    )
+    monkeypatch.setitem(sys.modules, "client_lib", types.SimpleNamespace(Job=FailedJob))
     with pytest.raises(ClusterSubmissionError) as caught:
         submit_jobs(config)
     assert caught.value.accepted_job_names == ()
@@ -401,19 +403,18 @@ def test_submit_cli_prints_only_safe_acknowledged_job_names(
 ) -> None:
     monkeypatch.setattr(
         "experiments.cluster_submit.submit_jobs",
-        lambda config, family=None: ("lm-mpi-job-one", "lm-mpi-job-two"),
+        lambda config, family=None: tuple(
+            f"lm-mpi-job-{index}" for index in range(1, 5)
+        ),
     )
     assert main(["--config", str(CONFIG), "--submit"]) == 0
     output = capsys.readouterr().out
     assert "status: submitted" in output
     assert "project: lid-generalization" in output
-    assert "diffusion: lid-generalization-e8-suite-diffusion-seed-0" in output
-    assert (
-        "rectified_flow: lid-generalization-e8-suite-rectified-flow-matching-seed-0"
-        in output
-    )
-    assert "lm-mpi-job-one" in output
-    assert "lm-mpi-job-two" in output
+    for family, experiment_name in EXPERIMENT_NAMES.items():
+        assert f"{family}: {experiment_name}" in output
+    for index in range(1, 5):
+        assert f"lm-mpi-job-{index}" in output
     assert "COMET_API_KEY" not in output
 
 
@@ -422,24 +423,26 @@ def test_submit_cli_forwards_single_family_selector(
 ) -> None:
     selected: list[str | None] = []
 
-    def fake_submit(config: ClusterConfig, family: str | None = None) -> tuple[str, ...]:
+    def fake_submit(
+        config: ClusterConfig, family: str | None = None
+    ) -> tuple[str, ...]:
         selected.append(family)
         return ("lm-mpi-job-rf",)
 
     monkeypatch.setattr("experiments.cluster_submit.submit_jobs", fake_submit)
-    assert main(
-        [
-            "--config",
-            str(CONFIG),
-            "--family",
-            "rectified_flow",
-            "--submit",
-        ]
-    ) == 0
+    assert (
+        main(
+            [
+                "--config",
+                str(CONFIG),
+                "--family",
+                "rectified_flow",
+                "--submit",
+            ]
+        )
+        == 0
+    )
     output = capsys.readouterr().out
     assert selected == ["rectified_flow"]
-    assert (
-        "rectified_flow: lid-generalization-e8-suite-rectified-flow-matching-seed-0"
-        in output
-    )
+    assert f"rectified_flow: {EXPERIMENT_NAMES['rectified_flow']}" in output
     assert "diffusion: diffusion" not in output

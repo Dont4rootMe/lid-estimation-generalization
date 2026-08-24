@@ -1,9 +1,11 @@
-"""Deterministic training and inference for the pilot neural-field families.
+"""Deterministic training and inference for all trainable pilot families.
 
-Two objectives are implemented:
+Four objectives are implemented:
 
 * variance-exploding diffusion with an ``x0`` denoiser parameterization;
 * linear rectified-flow matching from Gaussian noise to the data.
+* an explicit generalized Brownian bridge with a terminal denoiser;
+* exact-likelihood scale-conditioned RealNVP on Gaussian-smoothed data.
 
 The diffusion denoiser is converted to a score only at inference time.  This
 keeps training and divergence estimation numerically stable while preserving
@@ -13,15 +15,15 @@ the denoising-score-matching identity
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass
 import hashlib
 import json
 import math
 import os
-from pathlib import Path
 import random
 import tempfile
+from collections.abc import Callable, Mapping
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
@@ -35,16 +37,38 @@ from models.neural_fields import (
     exact_divergence,
     hutchinson_divergence,
 )
+from models.normalizing_flow import (
+    NF_DENSITY_CONTRACT,
+    ConditionalFlowConfig,
+    ScaleConditionedRealNVP,
+    conditional_smoothed_nll,
+    fixed_point_lid,
+)
 from models.readouts import (
     diffusion_flipd,
     rectified_flow_full,
     rectified_flow_response,
+    sb_forward_full,
+    sb_forward_response,
+)
+from models.schrodinger_bridge import (
+    BrownianBridgeSpec,
+    brownian_bridge_contract,
+    brownian_sb_terminal_denoising_loss,
+    denoiser_to_forward_drift,
+    validate_time_to_go_bounds,
 )
 
-
-Family = Literal["gaussian_diffusion", "rectified_flow"]
+Family = Literal[
+    "gaussian_diffusion",
+    "rectified_flow",
+    "brownian_schrodinger_bridge",
+    "scale_conditioned_normalizing_flow",
+]
 LogCallback = Callable[[Mapping[str, float | int | bool | str]], None]
-CHECKPOINT_SCHEMA_VERSION = 1
+CHECKPOINT_SCHEMA_VERSION = 2
+LEGACY_CHECKPOINT_SCHEMA_VERSION = 1
+TrainableModel = ScaleConditionedNeuralField | ScaleConditionedRealNVP
 
 
 @dataclass(frozen=True)
@@ -64,29 +88,44 @@ class TrainingConfig:
     learning_rate: float = 1.0e-3
     weight_decay: float = 1.0e-4
     hidden_dim: int = 256
-    depth: int = 4
+    depth: int | None = None
     time_embedding_dim: int = 64
     validation_interval: int = 1
     early_stopping_patience: int | None = 20
     gradient_clip_norm: float | None = 1.0
     num_workers: int = 0
     deterministic: bool = True
-    sigma_min: float = 0.02
-    sigma_max: float = 1.0
-    time_min: float = 1.0e-3
-    time_max: float = 1.0 - 1.0e-3
+    sigma_min: float | None = None
+    sigma_max: float | None = None
+    time_min: float | None = None
+    time_max: float | None = None
     fourier_features: int = 32
     max_condition_frequency: float = 100.0
     dropout: float = 0.0
     normalize: bool = True
     normalization_epsilon: float = 1.0e-8
+    num_coupling_layers: int | None = None
+    conditioner_depth: int | None = None
+    log_scale_limit: float | None = None
+    epsilon_min: float | None = None
+    epsilon_max: float | None = None
+    bridge_construction: str | None = None
+    bridge_reference_process: str | None = None
+    bridge_initial_marginal: str | None = None
+    bridge_terminal_marginal: str | None = None
+    bridge_factor_f: str | None = None
+    bridge_factor_g: str | None = None
+    bridge_conditioning: str | None = None
+    bridge_diffusivity: float | None = None
+    bridge_terminal_time: float | None = None
+    bridge_tau_min: float | None = None
+    bridge_tau_max: float | None = None
 
     def __post_init__(self) -> None:
         integer_positive = {
             "epochs": self.epochs,
             "batch_size": self.batch_size,
             "hidden_dim": self.hidden_dim,
-            "depth": self.depth,
             "time_embedding_dim": self.time_embedding_dim,
             "validation_interval": self.validation_interval,
             "fourier_features": self.fourier_features,
@@ -94,6 +133,12 @@ class TrainingConfig:
         for name, value in integer_positive.items():
             if isinstance(value, bool) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if self.depth is not None and (
+            isinstance(self.depth, bool)
+            or not isinstance(self.depth, int)
+            or self.depth <= 0
+        ):
+            raise ValueError("depth must be null or a positive integer")
         if isinstance(self.seed, bool) or not 0 <= self.seed < 2**63:
             raise ValueError("seed must be an integer in [0, 2**63)")
         if not isinstance(self.device, str) or not self.device:
@@ -108,18 +153,27 @@ class TrainingConfig:
         ):
             raise ValueError("early_stopping_patience must be null or positive")
         if self.gradient_clip_norm is not None and (
-            not math.isfinite(self.gradient_clip_norm)
-            or self.gradient_clip_norm <= 0
+            not math.isfinite(self.gradient_clip_norm) or self.gradient_clip_norm <= 0
         ):
             raise ValueError("gradient_clip_norm must be null or positive")
         if isinstance(self.num_workers, bool) or self.num_workers < 0:
             raise ValueError("num_workers must be a non-negative integer")
         if not isinstance(self.deterministic, bool):
-            raise ValueError("deterministic must be boolean")
-        if not 0 < self.sigma_min < self.sigma_max:
-            raise ValueError("sigma_min and sigma_max must satisfy 0 < min < max")
-        if not 0 <= self.time_min < self.time_max <= 1:
-            raise ValueError("time bounds must satisfy 0 <= min < max <= 1")
+            raise TypeError("deterministic must be boolean")
+        sigma_values = (self.sigma_min, self.sigma_max)
+        if any(value is not None for value in sigma_values):
+            if any(value is None for value in sigma_values):
+                raise ValueError("sigma_min and sigma_max must be provided together")
+            assert self.sigma_min is not None and self.sigma_max is not None
+            if not 0 < self.sigma_min < self.sigma_max:
+                raise ValueError("sigma_min and sigma_max must satisfy 0 < min < max")
+        time_values = (self.time_min, self.time_max)
+        if any(value is not None for value in time_values):
+            if any(value is None for value in time_values):
+                raise ValueError("time_min and time_max must be provided together")
+            assert self.time_min is not None and self.time_max is not None
+            if not 0 <= self.time_min < self.time_max <= 1:
+                raise ValueError("time bounds must satisfy 0 <= min < max <= 1")
         if (
             not math.isfinite(self.max_condition_frequency)
             or self.max_condition_frequency < 1
@@ -128,22 +182,169 @@ class TrainingConfig:
         if not math.isfinite(self.dropout) or not 0 <= self.dropout < 1:
             raise ValueError("dropout must lie in [0, 1)")
         if not isinstance(self.normalize, bool):
-            raise ValueError("normalize must be boolean")
+            raise TypeError("normalize must be boolean")
         if (
             not math.isfinite(self.normalization_epsilon)
             or self.normalization_epsilon <= 0
         ):
             raise ValueError("normalization_epsilon must be finite and positive")
+        nf_values = (
+            self.num_coupling_layers,
+            self.conditioner_depth,
+            self.log_scale_limit,
+            self.epsilon_min,
+            self.epsilon_max,
+        )
+        if any(value is not None for value in nf_values):
+            if any(value is None for value in nf_values):
+                raise ValueError(
+                    "scale-conditioned NF settings must be provided as one "
+                    "complete block"
+                )
+            _nf_architecture_from_training_config(self, ambient_dim=2)
+        bridge_values = (
+            self.bridge_construction,
+            self.bridge_reference_process,
+            self.bridge_initial_marginal,
+            self.bridge_terminal_marginal,
+            self.bridge_factor_f,
+            self.bridge_factor_g,
+            self.bridge_conditioning,
+            self.bridge_diffusivity,
+            self.bridge_terminal_time,
+            self.bridge_tau_min,
+            self.bridge_tau_max,
+        )
+        if any(value is not None for value in bridge_values):
+            if any(value is None for value in bridge_values):
+                raise ValueError(
+                    "Schrodinger-bridge settings must be provided as one complete block"
+                )
+            spec = _bridge_spec_from_training_config(self)
+            assert self.bridge_tau_min is not None
+            assert self.bridge_tau_max is not None
+            validate_time_to_go_bounds(
+                minimum=float(self.bridge_tau_min),
+                maximum=float(self.bridge_tau_max),
+                spec=spec,
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> "TrainingConfig":
+    def from_mapping(cls, value: Mapping[str, Any]) -> TrainingConfig:
         unknown = set(value) - set(cls.__dataclass_fields__)
         if unknown:
             raise ValueError(f"unknown training settings: {sorted(unknown)}")
         return cls(**dict(value))
+
+
+def _bridge_spec_from_training_config(config: TrainingConfig) -> BrownianBridgeSpec:
+    """Require and validate the complete Hydra-declared bridge identity."""
+
+    fields = {
+        "construction": config.bridge_construction,
+        "reference_process": config.bridge_reference_process,
+        "initial_marginal": config.bridge_initial_marginal,
+        "terminal_marginal": config.bridge_terminal_marginal,
+        "factor_f": config.bridge_factor_f,
+        "factor_g": config.bridge_factor_g,
+        "conditioning": config.bridge_conditioning,
+        "diffusivity": config.bridge_diffusivity,
+        "terminal_time": config.bridge_terminal_time,
+    }
+    missing = [name for name, value in fields.items() if value is None]
+    if missing:
+        raise ValueError(
+            "brownian_schrodinger_bridge requires explicit Hydra settings: "
+            f"{sorted(missing)}"
+        )
+    return BrownianBridgeSpec(
+        construction=str(fields["construction"]),
+        reference_process=str(fields["reference_process"]),
+        initial_marginal=str(fields["initial_marginal"]),
+        terminal_marginal=str(fields["terminal_marginal"]),
+        factor_f=str(fields["factor_f"]),
+        factor_g=str(fields["factor_g"]),
+        conditioning=str(fields["conditioning"]),
+        diffusivity=float(fields["diffusivity"]),
+        terminal_time=float(fields["terminal_time"]),
+    )
+
+
+def _nf_architecture_from_training_config(
+    config: TrainingConfig, *, ambient_dim: int
+) -> ConditionalFlowConfig:
+    """Require the complete Hydra-declared conditional-flow architecture."""
+
+    fields = {
+        "num_coupling_layers": config.num_coupling_layers,
+        "conditioner_depth": config.conditioner_depth,
+        "log_scale_limit": config.log_scale_limit,
+        "epsilon_min": config.epsilon_min,
+        "epsilon_max": config.epsilon_max,
+    }
+    missing = [name for name, value in fields.items() if value is None]
+    if missing:
+        raise ValueError(
+            "scale_conditioned_normalizing_flow requires explicit Hydra settings: "
+            f"{sorted(missing)}"
+        )
+    epsilon_min = float(fields["epsilon_min"])
+    epsilon_max = float(fields["epsilon_max"])
+    for name in ("num_coupling_layers", "conditioner_depth"):
+        value = fields[name]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    if isinstance(fields["log_scale_limit"], bool) or not isinstance(
+        fields["log_scale_limit"], (int, float)
+    ):
+        raise TypeError("log_scale_limit must be numeric")
+    for name in ("epsilon_min", "epsilon_max"):
+        if isinstance(fields[name], bool) or not isinstance(fields[name], (int, float)):
+            raise TypeError(f"{name} must be numeric")
+    if not 0.0 < epsilon_min < epsilon_max:
+        raise ValueError("epsilon bounds must satisfy 0 < epsilon_min < epsilon_max")
+    if config.dropout != 0.0:
+        raise ValueError(
+            "scale-conditioned exact likelihood requires dropout to be exactly 0"
+        )
+    return ConditionalFlowConfig(
+        ambient_dim=ambient_dim,
+        hidden_dim=config.hidden_dim,
+        num_coupling_layers=fields["num_coupling_layers"],
+        conditioner_depth=fields["conditioner_depth"],
+        condition_dim=config.time_embedding_dim,
+        fourier_features=config.fourier_features,
+        max_condition_frequency=config.max_condition_frequency,
+        dropout=config.dropout,
+        log_scale_limit=float(fields["log_scale_limit"]),
+    )
+
+
+def _model_contract(family: Family, config: TrainingConfig) -> dict[str, Any]:
+    """Return the checkpointed scientific identity for one canonical family."""
+
+    if family == "scale_conditioned_normalizing_flow":
+        _nf_architecture_from_training_config(config, ambient_dim=2)
+        assert config.epsilon_min is not None
+        assert config.epsilon_max is not None
+        return {
+            **dict(NF_DENSITY_CONTRACT),
+            "epsilon_min": float(config.epsilon_min),
+            "epsilon_max": float(config.epsilon_max),
+        }
+    if family == "brownian_schrodinger_bridge":
+        spec = _bridge_spec_from_training_config(config)
+        if config.bridge_tau_min is None or config.bridge_tau_max is None:
+            raise ValueError("bridge model contract requires explicit tau bounds")
+        return brownian_bridge_contract(
+            spec,
+            tau_min=float(config.bridge_tau_min),
+            tau_max=float(config.bridge_tau_max),
+        )
+    return {"schema_version": 1, "family": family}
 
 
 @dataclass(frozen=True)
@@ -170,7 +371,7 @@ class FieldPrediction:
 @dataclass(frozen=True)
 class TrainingResult:
     family: Family
-    model: ScaleConditionedNeuralField
+    model: TrainableModel
     config: TrainingConfig
     history: tuple[EpochMetrics, ...]
     best_epoch: int
@@ -193,18 +394,30 @@ class TrainingResult:
             "final_validation_loss": final.validation_loss,
         }
 
+    @property
+    def model_contract(self) -> Mapping[str, Any]:
+        """Scientific identity of the trained likelihood/readout interface."""
+
+        return _model_contract(self.family, self.config)
+
 
 def _canonical_family(family: str) -> Family:
     aliases: dict[str, Family] = {
         "diffusion": "gaussian_diffusion",
         "gaussian_diffusion": "gaussian_diffusion",
         "rectified_flow": "rectified_flow",
+        "schrodinger_bridge": "brownian_schrodinger_bridge",
+        "brownian_schrodinger_bridge": "brownian_schrodinger_bridge",
+        "scale_conditioned_nf": "scale_conditioned_normalizing_flow",
+        "scale_conditioned_normalizing_flow": "scale_conditioned_normalizing_flow",
     }
     try:
         return aliases[str(family)]
     except KeyError as exc:
         raise ValueError(
-            "family must be diffusion, gaussian_diffusion, or rectified_flow"
+            "family must be diffusion, gaussian_diffusion, rectified_flow, "
+            "schrodinger_bridge, brownian_schrodinger_bridge, "
+            "scale_conditioned_nf, or scale_conditioned_normalizing_flow"
         ) from exc
 
 
@@ -241,8 +454,10 @@ def _flat_finite_data(value: Any, *, name: str) -> Tensor:
     tensor = torch.as_tensor(value)
     if tensor.ndim < 2 or tensor.shape[0] <= 0:
         raise ValueError(f"{name} must have shape (nonempty batch, ...)")
-    tensor = tensor.detach().to(device="cpu", dtype=torch.float32).reshape(
-        tensor.shape[0], -1
+    tensor = (
+        tensor.detach()
+        .to(device="cpu", dtype=torch.float32)
+        .reshape(tensor.shape[0], -1)
     )
     if tensor.shape[1] <= 0:
         raise ValueError(f"{name} has no feature dimensions")
@@ -383,6 +598,10 @@ def _objective(
     generator: torch.Generator,
 ) -> Tensor:
     if family == "gaussian_diffusion":
+        if config.sigma_min is None or config.sigma_max is None:
+            raise ValueError(
+                "gaussian_diffusion requires explicit sigma_min and sigma_max"
+            )
         return diffusion_ve_dsm_loss(
             model,
             batch,
@@ -390,13 +609,46 @@ def _objective(
             sigma_max=config.sigma_max,
             generator=generator,
         )
-    return rectified_flow_matching_loss(
-        model,
-        batch,
-        time_min=config.time_min,
-        time_max=config.time_max,
-        generator=generator,
-    )
+    if family == "rectified_flow":
+        if config.time_min is None or config.time_max is None:
+            raise ValueError("rectified_flow requires explicit time_min and time_max")
+        return rectified_flow_matching_loss(
+            model,
+            batch,
+            time_min=config.time_min,
+            time_max=config.time_max,
+            generator=generator,
+        )
+    if family == "scale_conditioned_normalizing_flow":
+        if not isinstance(model, ScaleConditionedRealNVP):
+            raise TypeError("scale-conditioned NF objective requires RealNVP")
+        _nf_architecture_from_training_config(
+            config, ambient_dim=model.config.ambient_dim
+        )
+        assert config.epsilon_min is not None
+        assert config.epsilon_max is not None
+        return conditional_smoothed_nll(
+            model,
+            batch,
+            epsilon_min=float(config.epsilon_min),
+            epsilon_max=float(config.epsilon_max),
+            generator=generator,
+        )
+    if family == "brownian_schrodinger_bridge":
+        spec = _bridge_spec_from_training_config(config)
+        if config.bridge_tau_min is None or config.bridge_tau_max is None:
+            raise ValueError(
+                "brownian_schrodinger_bridge requires explicit bridge_tau bounds"
+            )
+        return brownian_sb_terminal_denoising_loss(
+            model,
+            batch,
+            tau_min=float(config.bridge_tau_min),
+            tau_max=float(config.bridge_tau_max),
+            spec=spec,
+            generator=generator,
+        )
+    raise AssertionError(f"unhandled canonical family: {family}")
 
 
 def _validation_loss(
@@ -438,7 +690,7 @@ def _save_checkpoint(
     path: Path,
     *,
     family: Family,
-    model: ScaleConditionedNeuralField,
+    model: TrainableModel,
     config: TrainingConfig,
     history: tuple[EpochMetrics, ...],
     best_epoch: int,
@@ -453,6 +705,7 @@ def _save_checkpoint(
     payload: dict[str, Any] = {
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "family": family,
+        "model_contract": _model_contract(family, config),
         "architecture": model.config.to_dict(),
         "training_config": config.to_dict(),
         "model_state": _cpu_state_dict(model),
@@ -494,6 +747,20 @@ def train_model(
 
     canonical_family = _canonical_family(family)
     resolved_config = _coerce_config(config)
+    if canonical_family == "brownian_schrodinger_bridge":
+        bridge_spec = _bridge_spec_from_training_config(resolved_config)
+        if (
+            resolved_config.bridge_tau_min is None
+            or resolved_config.bridge_tau_max is None
+        ):
+            raise ValueError(
+                "brownian_schrodinger_bridge requires explicit bridge_tau bounds"
+            )
+        validate_time_to_go_bounds(
+            minimum=float(resolved_config.bridge_tau_min),
+            maximum=float(resolved_config.bridge_tau_max),
+            spec=bridge_spec,
+        )
     train_cpu = _flat_finite_data(train, name="train")
     validation_cpu = _flat_finite_data(validation, name="validation")
     if train_cpu.shape[1] != validation_cpu.shape[1]:
@@ -516,20 +783,33 @@ def train_model(
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
     try:
-        architecture = NeuralFieldConfig(
-            ambient_dim=train_cpu.shape[1],
-            hidden_dim=resolved_config.hidden_dim,
-            depth=resolved_config.depth,
-            condition_dim=resolved_config.time_embedding_dim,
-            fourier_features=resolved_config.fourier_features,
-            max_condition_frequency=resolved_config.max_condition_frequency,
-            dropout=resolved_config.dropout,
-            condition_transform=(
-                "log" if canonical_family == "gaussian_diffusion" else "linear"
-            ),
-        )
-        model = ScaleConditionedNeuralField(architecture).to(device)
-        setattr(model, "_lid_family", canonical_family)
+        if canonical_family == "scale_conditioned_normalizing_flow":
+            nf_architecture = _nf_architecture_from_training_config(
+                resolved_config, ambient_dim=train_cpu.shape[1]
+            )
+            model: TrainableModel = ScaleConditionedRealNVP(nf_architecture).to(device)
+        else:
+            if resolved_config.depth is None:
+                raise ValueError(
+                    f"{canonical_family} requires explicit neural-field depth"
+                )
+            field_architecture = NeuralFieldConfig(
+                ambient_dim=train_cpu.shape[1],
+                hidden_dim=resolved_config.hidden_dim,
+                depth=resolved_config.depth,
+                condition_dim=resolved_config.time_embedding_dim,
+                fourier_features=resolved_config.fourier_features,
+                max_condition_frequency=resolved_config.max_condition_frequency,
+                dropout=resolved_config.dropout,
+                condition_transform=(
+                    "log"
+                    if canonical_family
+                    in {"gaussian_diffusion", "brownian_schrodinger_bridge"}
+                    else "linear"
+                ),
+            )
+            model = ScaleConditionedNeuralField(field_architecture).to(device)
+        model._lid_family = canonical_family
         train_tensor = train_cpu.to(device)
         validation_tensor = validation_cpu.to(device)
         optimizer = torch.optim.AdamW(
@@ -601,9 +881,7 @@ def train_model(
                 seed=resolved_config.seed + 1_000_003,
             )
             if not math.isfinite(validation_loss):
-                raise FloatingPointError(
-                    f"non-finite validation loss at epoch {epoch}"
-                )
+                raise FloatingPointError(f"non-finite validation loss at epoch {epoch}")
             metric = EpochMetrics(
                 epoch=epoch,
                 train_loss=train_loss,
@@ -682,7 +960,7 @@ def load_checkpoint(
         raise FileNotFoundError(path)
     resolved_device = _resolve_device(device)
     payload = torch.load(path, map_location=resolved_device, weights_only=True)
-    required = {
+    legacy_required = {
         "schema_version",
         "family",
         "architecture",
@@ -693,16 +971,49 @@ def load_checkpoint(
         "best_validation_loss",
         "normalization",
     }
-    if not isinstance(payload, dict) or set(payload) != required:
-        raise ValueError("checkpoint schema mismatch")
-    if payload["schema_version"] != CHECKPOINT_SCHEMA_VERSION:
+    if not isinstance(payload, dict):
+        raise TypeError("checkpoint payload must be a mapping")
+    schema_version = payload.get("schema_version")
+    if schema_version == LEGACY_CHECKPOINT_SCHEMA_VERSION:
+        required = legacy_required
+    elif schema_version == CHECKPOINT_SCHEMA_VERSION:
+        required = legacy_required | {"model_contract"}
+    else:
         raise ValueError("unsupported checkpoint schema_version")
+    if set(payload) != required:
+        raise ValueError("checkpoint schema mismatch")
     family = _canonical_family(payload["family"])
-    architecture = NeuralFieldConfig.from_mapping(payload["architecture"])
+    if (
+        schema_version == LEGACY_CHECKPOINT_SCHEMA_VERSION
+        and family == "scale_conditioned_normalizing_flow"
+    ):
+        raise ValueError("scale-conditioned NF requires checkpoint schema_version 2")
     config = TrainingConfig.from_mapping(payload["training_config"])
-    model = ScaleConditionedNeuralField(architecture).to(resolved_device)
+    expected_contract = _model_contract(family, config)
+    if (
+        schema_version == CHECKPOINT_SCHEMA_VERSION
+        and payload["model_contract"] != expected_contract
+    ):
+        raise ValueError("checkpoint model_contract mismatch")
+    if family == "scale_conditioned_normalizing_flow":
+        flow_architecture = ConditionalFlowConfig.from_mapping(payload["architecture"])
+        declared_architecture = _nf_architecture_from_training_config(
+            config, ambient_dim=flow_architecture.ambient_dim
+        )
+        if declared_architecture != flow_architecture:
+            raise ValueError(
+                "checkpoint NF architecture does not match training_config"
+            )
+        model: TrainableModel = ScaleConditionedRealNVP(flow_architecture).to(
+            resolved_device
+        )
+        ambient_dim = flow_architecture.ambient_dim
+    else:
+        field_architecture = NeuralFieldConfig.from_mapping(payload["architecture"])
+        model = ScaleConditionedNeuralField(field_architecture).to(resolved_device)
+        ambient_dim = field_architecture.ambient_dim
     model.load_state_dict(payload["model_state"], strict=True)
-    setattr(model, "_lid_family", family)
+    model._lid_family = family
     model.eval()
 
     history_raw = payload["history"]
@@ -727,7 +1038,7 @@ def load_checkpoint(
     }:
         raise ValueError("checkpoint normalization schema mismatch")
     mean = torch.as_tensor(normalization["mean"]).detach().cpu().float().contiguous()
-    if mean.shape != (architecture.ambient_dim,) or not torch.isfinite(mean).all():
+    if mean.shape != (ambient_dim,) or not torch.isfinite(mean).all():
         raise ValueError("checkpoint normalization mean is invalid")
     scale = float(normalization["scale"])
     if not math.isfinite(scale) or scale <= 0:
@@ -763,9 +1074,9 @@ def load_checkpoint(
 
 
 def _model_and_context(
-    model_or_result: ScaleConditionedNeuralField | TrainingResult,
+    model_or_result: nn.Module | TrainingResult,
     family: str | None,
-) -> tuple[ScaleConditionedNeuralField, Family, Tensor, float]:
+) -> tuple[nn.Module, Family, Tensor, float]:
     if isinstance(model_or_result, TrainingResult):
         canonical = model_or_result.family
         if family is not None and _canonical_family(family) != canonical:
@@ -781,12 +1092,29 @@ def _model_and_context(
     if inferred is None:
         raise ValueError("family is required when passing a bare model")
     canonical = _canonical_family(inferred)
+    if canonical == "scale_conditioned_normalizing_flow" and not isinstance(
+        model, ScaleConditionedRealNVP
+    ):
+        raise TypeError("scale-conditioned NF family requires ScaleConditionedRealNVP")
     mean = torch.zeros(model.config.ambient_dim, dtype=torch.float32)
     return model, canonical, mean, 1.0
 
 
-def predict_primitives(
+def _bridge_spec_for_model(
     model_or_result: ScaleConditionedNeuralField | TrainingResult,
+) -> BrownianBridgeSpec:
+    """Recover the checkpointed bridge identity; bare bridge models are unsafe."""
+
+    if isinstance(model_or_result, TrainingResult):
+        return _bridge_spec_from_training_config(model_or_result.config)
+    raise ValueError(
+        "bare Schrodinger-bridge models are forbidden because the explicit "
+        "Hydra bridge contract is unavailable"
+    )
+
+
+def predict_primitives(
+    model_or_result: nn.Module | TrainingResult,
     query: Any,
     scale: float,
     *,
@@ -805,10 +1133,21 @@ def predict_primitives(
     model, canonical_family, mean, normalization_scale = _model_and_context(
         model_or_result, family
     )
+    if canonical_family == "scale_conditioned_normalizing_flow":
+        raise ValueError(
+            "scale-conditioned NF exposes a fixed-likelihood readout, not "
+            "vector-field primitives"
+        )
     if not math.isfinite(scale) or scale <= 0:
         raise ValueError("scale must be finite and positive")
     if canonical_family == "rectified_flow" and not 0 < scale < 1:
         raise ValueError("rectified-flow scale t must lie strictly between 0 and 1")
+    if canonical_family == "brownian_schrodinger_bridge":
+        bridge_spec = _bridge_spec_for_model(model_or_result)
+        if not 0 < scale <= bridge_spec.terminal_time:
+            raise ValueError(
+                "Schrodinger-bridge time-to-go tau must lie in (0, terminal_time]"
+            )
     if divergence_backend not in {"exact", "hutchinson"}:
         raise ValueError("divergence_backend must be exact or hutchinson")
     if isinstance(batch_size, bool) or batch_size <= 0:
@@ -844,9 +1183,9 @@ def predict_primitives(
             device=device, dtype=dtype
         )
         evaluation_point = (
-            data_batch
-            if canonical_family == "gaussian_diffusion"
-            else model_scale * data_batch
+            model_scale * data_batch
+            if canonical_family == "rectified_flow"
+            else data_batch
         )
         condition = torch.full(
             (data_batch.shape[0],),
@@ -874,12 +1213,18 @@ def predict_primitives(
         if canonical_family == "gaussian_diffusion":
             variance = model_scale**2
             field = (raw_field - evaluation_point) / variance
-            divergence = (
-                raw_divergence - model.config.ambient_dim
-            ) / variance
-        else:
+            divergence = (raw_divergence - model.config.ambient_dim) / variance
+        elif canonical_family == "rectified_flow":
             field = raw_field
             divergence = raw_divergence
+        else:
+            field, divergence = denoiser_to_forward_drift(
+                raw_field,
+                raw_divergence,
+                evaluation_point,
+                tau=model_scale,
+                ambient_dim=model.config.ambient_dim,
+            )
         fields.append(field.detach().cpu())
         divergences.append(divergence.detach().cpu())
         points.append(evaluation_point.detach().cpu())
@@ -892,12 +1237,12 @@ def predict_primitives(
 
 
 def predict_lid(
-    model_or_result: ScaleConditionedNeuralField | TrainingResult,
+    model_or_result: nn.Module | TrainingResult,
     query: Any,
     scale: float,
     *,
     family: str | None = None,
-    readout: Literal["full", "response"] = "full",
+    readout: Literal["full", "response", "fixed_likelihood"] = "full",
     divergence_backend: Literal["exact", "hutchinson"] = "hutchinson",
     trace_probes: int = 16,
     trace_seed: int = 0,
@@ -905,7 +1250,50 @@ def predict_lid(
 ) -> npt.NDArray[np.float64]:
     """Return one LID estimate per query using the paper's native readout."""
 
-    model, canonical_family, _, _ = _model_and_context(model_or_result, family)
+    model, canonical_family, mean, normalization_scale = _model_and_context(
+        model_or_result, family
+    )
+    if canonical_family == "scale_conditioned_normalizing_flow":
+        if not isinstance(model, ScaleConditionedRealNVP):
+            raise TypeError("fixed-likelihood readout requires ScaleConditionedRealNVP")
+        if readout != "fixed_likelihood":
+            raise ValueError(
+                "scale-conditioned NF supports only the fixed_likelihood readout"
+            )
+        if divergence_backend != "exact":
+            raise ValueError(
+                "scale-conditioned NF requires exact autograd scale differentiation"
+            )
+        if trace_probes not in {0, None}:
+            raise ValueError("exact NF scale differentiation requires trace_probes: 0")
+        if not math.isfinite(scale) or scale <= 0.0:
+            raise ValueError("NF epsilon must be finite and positive")
+        if isinstance(model_or_result, TrainingResult):
+            epsilon_min = model_or_result.config.epsilon_min
+            epsilon_max = model_or_result.config.epsilon_max
+            if epsilon_min is None or epsilon_max is None:
+                raise ValueError("checkpoint lacks the NF epsilon training interval")
+            if not float(epsilon_min) <= scale <= float(epsilon_max):
+                raise ValueError(
+                    "NF epsilon lies outside the checkpointed training interval"
+                )
+        if isinstance(batch_size, bool) or batch_size <= 0:
+            raise ValueError("batch_size must be a positive integer")
+        if isinstance(trace_seed, bool) or trace_seed < 0:
+            raise ValueError("trace_seed must be a non-negative integer")
+        query_cpu = _flat_finite_data(query, name="query")
+        if query_cpu.shape[1] != model.config.ambient_dim:
+            raise ValueError("query ambient dimension does not match model")
+        normalized = (query_cpu - mean.reshape(1, -1)) / normalization_scale
+        parameter = next(model.parameters())
+        model.eval()
+        predictions: list[Tensor] = []
+        for start in range(0, normalized.shape[0], batch_size):
+            batch = normalized[start : start + batch_size].to(
+                device=parameter.device, dtype=parameter.dtype
+            )
+            predictions.append(fixed_point_lid(model, batch, scale).detach().cpu())
+        return np.asarray(torch.cat(predictions).numpy(), dtype=np.float64)
     prediction = predict_primitives(
         model_or_result,
         query,
@@ -929,6 +1317,25 @@ def predict_lid(
             ),
             dtype=np.float64,
         )
+    if canonical_family == "brownian_schrodinger_bridge":
+        bridge_spec = _bridge_spec_for_model(model_or_result)
+        if readout == "response":
+            result = sb_forward_response(
+                prediction.divergence,
+                time_to_go=scale,
+                ambient_dim=ambient_dim,
+            )
+        elif readout == "full":
+            result = sb_forward_full(
+                prediction.field,
+                prediction.divergence,
+                time_to_go=scale,
+                diffusivity=bridge_spec.diffusivity,
+                ambient_dim=ambient_dim,
+            )
+        else:
+            raise ValueError("Schrodinger bridge readout must be full or response")
+        return np.asarray(result, dtype=np.float64)
     if readout == "response":
         return np.asarray(
             rectified_flow_response(

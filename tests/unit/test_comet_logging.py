@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 import types
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -17,15 +17,25 @@ from experiments.comet_logging import (
     safe_scheduler_environment,
 )
 
-
 EXPERIMENT_NAMES = (
-    "lid-generalization-e8-suite-diffusion-seed-0",
-    "lid-generalization-e8-suite-rectified-flow-matching-seed-0",
+    "lid-generalization-e8-suite-diffusion-train-mae-scale-selection-seed-0",
+    (
+        "lid-generalization-e8-suite-rectified-flow-matching-"
+        "train-mae-time-selection-seed-0"
+    ),
+    (
+        "lid-generalization-e8-suite-scale-conditioned-normalizing-flow-"
+        "train-mae-scale-selection-seed-0"
+    ),
+    (
+        "lid-generalization-e8-suite-brownian-schrodinger-bridge-"
+        "train-mae-time-selection-seed-0"
+    ),
 )
 
 
 class FakeExperiment:
-    instances: list["FakeExperiment"] = []
+    instances: ClassVar[list[FakeExperiment]] = []
 
     def __init__(self, **kwargs: Any) -> None:
         self.kwargs = kwargs
@@ -91,9 +101,7 @@ def test_comet_environment_is_required_and_namespace_is_exact() -> None:
         require_comet_environment(
             {
                 **safe_scheduler_environment(),
-                "COMET_EXPERIMENT_NAME": (
-                    "lid-generalization-e8-suite-diffusion-seed-0"
-                ),
+                "COMET_EXPERIMENT_NAME": EXPERIMENT_NAMES[0],
             }
         )
     with pytest.raises(CometConfigurationError, match="COMET_WORKSPACE"):
@@ -112,7 +120,8 @@ def test_factory_never_passes_api_key_to_comet_sdk(
     )
     logger = create_comet_event_logger(
         experiment_name=experiment_name,
-        tags=("diffusion",), environ=safe_scheduler_environment()
+        tags=("diffusion",),
+        environ=safe_scheduler_environment(),
     )
     experiment = FakeExperiment.instances[-1]
     assert experiment.kwargs == {
@@ -133,8 +142,9 @@ def test_production_callback_factory_returns_callback_and_close(
         sys.modules, "comet_ml", types.SimpleNamespace(Experiment=FakeExperiment)
     )
     callback, close = create_comet_callback(
-        experiment_name="lid-generalization-e8-suite-diffusion-seed-0",
-        tags=("diffusion",), environ=safe_scheduler_environment()
+        experiment_name=EXPERIMENT_NAMES[0],
+        tags=("diffusion",),
+        environ=safe_scheduler_environment(),
     )
     callback("training", {"step": 1, "loss": 0.75})
     close()
@@ -151,10 +161,7 @@ def test_event_callback_logs_nested_metrics_and_parameters(
         sys.modules, "comet_ml", types.SimpleNamespace(Experiment=FakeExperiment)
     )
     logger = create_comet_event_logger(
-        experiment_name=(
-            "lid-generalization-e8-suite-rectified-flow-matching-seed-0"
-        ),
-        environ=safe_scheduler_environment()
+        experiment_name=EXPERIMENT_NAMES[1], environ=safe_scheduler_environment()
     )
     logger(
         "validation",
@@ -168,9 +175,7 @@ def test_event_callback_logs_nested_metrics_and_parameters(
     assert experiment.metrics == [
         ({"metrics.mae": 0.25, "metrics.coverage": 1.0}, 7, "validation")
     ]
-    assert experiment.parameters == [
-        ({"dataset": "e8_gaussian4_pca"}, "validation")
-    ]
+    assert experiment.parameters == [({"dataset": "e8_gaussian4_pca"}, "validation")]
 
 
 def test_event_callback_rejects_secret_like_fields(
@@ -181,8 +186,7 @@ def test_event_callback_rejects_secret_like_fields(
         sys.modules, "comet_ml", types.SimpleNamespace(Experiment=FakeExperiment)
     )
     logger = create_comet_event_logger(
-        experiment_name="lid-generalization-e8-suite-diffusion-seed-0",
-        environ=safe_scheduler_environment()
+        experiment_name=EXPERIMENT_NAMES[0], environ=safe_scheduler_environment()
     )
     with pytest.raises(CometConfigurationError, match="secret-like field"):
         logger("training", {"metadata": {"access_token": "do-not-log"}})

@@ -24,6 +24,8 @@ execution:
   families:
     - diffusion
     - rectified_flow
+    - scale_conditioned_nf
+    - schrodinger_bridge
 
 environment:
   PROJECT_ROOT: /home/jovyan/echimbulatov/fork_afedorov/constant_repos/lid-estimation-generalization

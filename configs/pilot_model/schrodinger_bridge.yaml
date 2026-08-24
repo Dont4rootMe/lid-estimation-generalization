@@ -1,0 +1,50 @@
+name: brownian_schrodinger_bridge
+family: schrodinger_bridge
+experiment_name: lid-generalization-e8-suite-brownian-schrodinger-bridge-train-mae-time-selection-seed-${seed}
+readout: full
+selection_prefer: smaller
+derivative_backend: hutchinson
+trace_probes: 16
+
+training:
+  seed: ${seed}
+  device: cuda
+  epochs: 200
+  batch_size: 512
+  learning_rate: 0.0002
+  weight_decay: 0.000001
+  hidden_dim: 1024
+  depth: 6
+  time_embedding_dim: 128
+  validation_interval: 1
+  early_stopping_patience: 20
+  gradient_clip_norm: 1.0
+  num_workers: 4
+  deterministic: true
+  fourier_features: 32
+  max_condition_frequency: 100.0
+  dropout: 0.0
+  normalize: true
+  normalization_epsilon: 1.0e-8
+  bridge_construction: terminal-data-lebesgue-factor-v1
+  bridge_reference_process: brownian-motion
+  bridge_initial_marginal: gaussian-convolution-of-terminal-data
+  bridge_terminal_marginal: dataset-terminal-law
+  bridge_factor_f: lebesgue-measure
+  bridge_factor_g: dataset-terminal-law
+  bridge_conditioning: time-to-go-tau
+  bridge_diffusivity: 1.0
+  bridge_terminal_time: 1.0
+  bridge_tau_min: 0.0001
+  bridge_tau_max: 1.0
+
+scales:
+  - 0.0001
+  - 0.00031684
+  - 0.00099856
+  - 0.00315844
+  - 0.01
+  - 0.03161284
+  - 0.09998244
+  - 0.31618129
+  - 1.0

@@ -20,12 +20,16 @@ data:
 
 evaluation:
   batch_size: 128
-  divergence_backend: hutchinson
-  trace_probes: 16
+  divergence_backend: ${pilot_model.derivative_backend}
+  trace_probes: ${pilot_model.trace_probes}
   trace_seed: ${seed}
   selection:
-    window: 1
-    min_valid_fraction: 0.8
+    source_split: train
+    subset_size: 1000
+    seed: ${seed}
+    criterion: mae
+    tie_tolerance: 1.0e-12
+    tie_break: ${pilot_model.selection_prefer}
 
 logging:
   backend: comet

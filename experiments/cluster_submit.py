@@ -1,4 +1,4 @@
-"""Fail-closed launcher for the two approved A100 pilot jobs.
+"""Fail-closed launcher for the approved A100 pilot model-family jobs.
 
 The default action is a dry run.  Submission requires an explicit ``--submit``
 flag and re-validates every scheduler field immediately before constructing a
@@ -8,14 +8,14 @@ flag and re-validates every scheduler field immediately before constructing a
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 import importlib
-from pathlib import Path, PurePosixPath
 import re
 import shlex
 import stat
 import sys
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from omegaconf import OmegaConf
@@ -29,7 +29,6 @@ from experiments.comet_logging import (
     safe_scheduler_environment,
 )
 
-
 JOB_DESC = "echimbulatov | ent-block-diffusion-eval #ID0137 #rnd"
 QUEUE_NAME = "shared"
 PRIORITY_CLASS = "shared-medium"
@@ -40,7 +39,12 @@ N_WORKERS = 1
 N_GPUS = 1
 INSTANCE_TYPE = "a100.1gpu"
 CUBLAS_WORKSPACE_CONFIG = ":4096:8"
-APPROVED_FAMILIES = ("diffusion", "rectified_flow")
+APPROVED_FAMILIES = (
+    "diffusion",
+    "rectified_flow",
+    "scale_conditioned_nf",
+    "schrodinger_bridge",
+)
 REPO_ROOT = (
     "/home/jovyan/echimbulatov/fork_afedorov/constant_repos/"
     "lid-estimation-generalization"
@@ -88,6 +92,10 @@ _FORBIDDEN_METADATA_TOKENS = (
     "rectified-flow-matching",
     "affine_fm",
     "gaussian_diffusion",
+    "scale_conditioned_nf",
+    "scale-conditioned-normalizing-flow",
+    "schrodinger_bridge",
+    "schrodinger-bridge",
     "e8_gaussian4_pca",
     "e8_spaghetti_pca",
     "e8_sphere4_pca",
@@ -203,15 +211,12 @@ def _validate_environment(value: Mapping[str, Any]) -> dict[str, str | int]:
             raise ClusterConfigError(f"environment.{key} must be {expected!r}")
     if result.get("CUBLAS_WORKSPACE_CONFIG") != CUBLAS_WORKSPACE_CONFIG:
         raise ClusterConfigError(
-            "environment.CUBLAS_WORKSPACE_CONFIG must be "
-            f"{CUBLAS_WORKSPACE_CONFIG!r}"
+            f"environment.CUBLAS_WORKSPACE_CONFIG must be {CUBLAS_WORKSPACE_CONFIG!r}"
         )
     if result.get("MLS_JOB_TOTAL_GPU") != N_GPUS:
         raise ClusterConfigError(f"environment.MLS_JOB_TOTAL_GPU must be {N_GPUS}")
     if result.get("MLS_JOB_REGION_NAME") != REGION:
-        raise ClusterConfigError(
-            f"environment.MLS_JOB_REGION_NAME must be {REGION!r}"
-        )
+        raise ClusterConfigError(f"environment.MLS_JOB_REGION_NAME must be {REGION!r}")
     for key in ("PROJECT_ROOT", "PYTHONPATH"):
         if result.get(key) != REPO_ROOT:
             raise ClusterConfigError(f"environment.{key} must be {REPO_ROOT!r}")
@@ -441,7 +446,9 @@ def validate_job_payload(payload: Mapping[str, Any]) -> None:
             "job script must invoke the approved Python source entrypoint"
         )
     if len(command) != 8:
-        raise ClusterConfigError("job script must contain exactly seven Hydra overrides")
+        raise ClusterConfigError(
+            "job script must contain exactly seven Hydra overrides"
+        )
     family_argument = command[1]
     if not family_argument.startswith("pilot_model="):
         raise ClusterConfigError("job script must select one approved model family")
@@ -506,7 +513,9 @@ def _validate_runtime_secret_file(path: str) -> None:
     if not stat.S_ISREG(mode):
         raise ClusterConfigError("private Comet env path must be a regular file")
     if stat.S_IMODE(mode) & 0o077:
-        raise ClusterConfigError("private Comet env file must have mode 0600 or stricter")
+        raise ClusterConfigError(
+            "private Comet env file must have mode 0600 or stricter"
+        )
 
 
 def _validated_submission_name(job: Any, response: Any) -> str:
@@ -525,9 +534,7 @@ def _validated_submission_name(job: Any, response: Any) -> str:
     return name
 
 
-def submit_jobs(
-    config: ClusterConfig, family: str | None = None
-) -> tuple[str, ...]:
+def submit_jobs(config: ClusterConfig, family: str | None = None) -> tuple[str, ...]:
     """Submit the selected jobs only after all local and payload checks pass."""
 
     jobs = plan_jobs(config, family)
@@ -592,7 +599,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--family",
         choices=APPROVED_FAMILIES,
-        help="plan or submit only one approved family (default: both)",
+        help="plan or submit only one approved family (default: all)",
     )
     parser.add_argument(
         "--submit",
@@ -638,11 +645,11 @@ if __name__ == "__main__":
 __all__ = [
     "APPROVED_FAMILIES",
     "CUBLAS_WORKSPACE_CONFIG",
+    "INSTANCE_TYPE",
+    "JOB_DESC",
     "ClusterConfig",
     "ClusterConfigError",
     "ClusterSubmissionError",
-    "INSTANCE_TYPE",
-    "JOB_DESC",
     "PlannedJob",
     "build_job_payload",
     "load_cluster_config",

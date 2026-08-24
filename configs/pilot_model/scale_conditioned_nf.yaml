@@ -1,10 +1,10 @@
-name: diffusion
-family: diffusion
-experiment_name: lid-generalization-e8-suite-diffusion-train-mae-scale-selection-seed-${seed}
-readout: full
+name: scale_conditioned_normalizing_flow
+family: scale_conditioned_nf
+experiment_name: lid-generalization-e8-suite-scale-conditioned-normalizing-flow-train-mae-scale-selection-seed-${seed}
+readout: fixed_likelihood
 selection_prefer: smaller
-derivative_backend: hutchinson
-trace_probes: 16
+derivative_backend: exact
+trace_probes: 0
 
 training:
   seed: ${seed}
@@ -13,16 +13,18 @@ training:
   batch_size: 512
   learning_rate: 0.0002
   weight_decay: 0.000001
-  hidden_dim: 1024
-  depth: 6
+  hidden_dim: 512
   time_embedding_dim: 128
+  num_coupling_layers: 8
+  conditioner_depth: 2
+  log_scale_limit: 2.0
+  epsilon_min: 0.01
+  epsilon_max: 1.0
   validation_interval: 1
   early_stopping_patience: 20
   gradient_clip_norm: 1.0
   num_workers: 4
   deterministic: true
-  sigma_min: 0.01
-  sigma_max: 1.0
   fourier_features: 32
   max_condition_frequency: 100.0
   dropout: 0.0
