@@ -272,11 +272,19 @@ source до чтения первой dataset cell.
 Registry находится в
 `configs/datasets/registry/paper_benchmarks.yaml`. Он проверяет все 28 каталогов,
 split sizes, shapes, finite numeric arrays, known LID и transformation deltas.
-Known upstream defects (включая старый Spaghetti target) обрабатываются явно,
-не скрытыми правками данных. В частности, canonical Spaghetti проверяется по
-raw split-контракту `train=20`, `val=20`, `test=1`, после чего effective LID 1
-выставляется только в памяти для всех split; per-split correction сохраняется
-в input provenance/manifest.
+Known upstream defects обрабатываются явно, не скрытыми правками данных.
+Canonical Spaghetti проверяется по raw split-контракту `20/20/1`, Funnel —
+`1/1/2`, Crescent Moon — `2/2/3`; затем теоретические effective LID `1`, `2`
+и `3` соответственно выставляются только в памяти для всех split. Каждая
+per-split correction сохраняется в input provenance/manifest, а exact archive
+никогда не изменяется.
+
+Для E8 Sphere exact artifact и официальный generator фактически используют
+шесть активных координат, то есть $S^5$ и LID `5`, с радиусами
+`3, 1, 1/3, 1/9`. Текст статьи описывает $S^4$, LID `4` и радиусы
+`1, 1/3, 1/9, 1/27`. Global campaign честно следует неизменённому artifact с
+target `5` и фиксирует полное construction-расхождение в provenance;
+paper-spec вариант потребовал бы отдельного generated dataset identity.
 
 Подробности: `docs/ARCHITECTURE.md`, `docs/EXPERIMENT_PROTOCOL.md`,
 `docs/MODEL_MATRIX.md`, `docs/LEARNED_BUNDLES.md`,

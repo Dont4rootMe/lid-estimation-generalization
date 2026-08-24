@@ -4,6 +4,22 @@ base_benchmark_id: lid-benchmarks-iclr-2026
 source_kind: locally_generated_from_pinned_upstream
 upstream_revision: 2dcb8e41015f53413ff1ddd049bb006c81a5df52
 overrides:
+- name: e6_exp_pca
+  stored_lid_by_split:
+    train: 2
+    val: 2
+    test: 2
+  lid_override: 2
+  expected_lid: 2
+  notes: 'Generated-source fallback only: the pinned generator writes theoretical LID 2 in every split. This replaces the canonical exact-archive raw contract 1/1/2 while preserving the same effective target.'
+- name: e7_crescent_moon_radius3.0
+  stored_lid_by_split:
+    train: 3
+    val: 3
+    test: 3
+  lid_override: 3
+  expected_lid: 3
+  notes: 'Generated-source fallback only: the pinned generator writes theoretical LID 3 in every split. This replaces the canonical exact-archive raw contract 2/2/3 while preserving the same effective target.'
 - name: e8_spaghetti_pca
   stored_lid_by_split:
     train: 20

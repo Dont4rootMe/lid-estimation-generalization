@@ -2,27 +2,26 @@ from __future__ import annotations
 
 import base64
 import hashlib
-from pathlib import Path
 import stat
 import warnings
 import zipfile
+from pathlib import Path
 
 import pytest
 import yaml
 
 from datasets.archive import (
-    ArchiveExtractionError,
-    ArchiveValidationError,
     EXACT_ARCHIVE_DIRECTORY_ENTRY_COUNT,
     EXACT_ARCHIVE_FILE_COUNT,
     EXACT_ARCHIVE_SHA256,
     EXACT_ARCHIVE_SIZE_BYTES,
     EXACT_ARCHIVE_UNCOMPRESSED_SIZE_BYTES,
+    ArchiveExtractionError,
+    ArchiveValidationError,
     extract_archive,
     verify_archive,
     verify_extracted_tree,
 )
-
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
@@ -179,7 +178,10 @@ def test_rejects_size_hash_and_encryption_contract_mismatches(
     with pytest.raises(ArchiveValidationError, match="size mismatch"):
         verify_archive(
             archive_path,
-            **{**expected, "expected_size_bytes": int(expected["expected_size_bytes"]) + 1},
+            **{
+                **expected,
+                "expected_size_bytes": int(expected["expected_size_bytes"]) + 1,
+            },
         )
     with pytest.raises(ArchiveValidationError, match="SHA-256 mismatch"):
         verify_archive(
@@ -245,15 +247,52 @@ def test_registry_integrity_metadata_matches_archive_constants() -> None:
     assert integrity["size_bytes"] == EXACT_ARCHIVE_SIZE_BYTES
     assert integrity["sha256"] == EXACT_ARCHIVE_SHA256
     assert integrity["file_count"] == EXACT_ARCHIVE_FILE_COUNT
-    assert (
-        integrity["directory_entry_count"]
-        == EXACT_ARCHIVE_DIRECTORY_ENTRY_COUNT
-    )
-    assert (
-        integrity["uncompressed_size_bytes"]
-        == EXACT_ARCHIVE_UNCOMPRESSED_SIZE_BYTES
-    )
+    assert integrity["directory_entry_count"] == EXACT_ARCHIVE_DIRECTORY_ENTRY_COUNT
+    assert integrity["uncompressed_size_bytes"] == EXACT_ARCHIVE_UNCOMPRESSED_SIZE_BYTES
     assert integrity["crc32_verified"] is True
     assert upstream["official_archive_direct_url"].startswith(
         "https://drive.usercontent.google.com/download?"
     )
+
+    defects = {item["id"]: item for item in upstream["known_defects"]}
+    assert {
+        "spaghetti-lid-target",
+        "funnel-partial-lid-correction",
+        "crescent-moon-partial-lid-correction",
+        "sphere-paper-artifact-dimension",
+    } <= defects.keys()
+    funnel_defect = defects["funnel-partial-lid-correction"]
+    assert funnel_defect["path"] == "generators/benchmarks.py"
+    assert funnel_defect["symbol"] == "ExpPCADatasetGenerator"
+    assert funnel_defect["artifact_path"] == "benchmarks/e6_exp_pca"
+    assert funnel_defect["stored_value_by_split"] == {
+        "train": 1,
+        "val": 1,
+        "test": 2,
+    }
+    assert funnel_defect["expected_value"] == 2
+
+    moon_defect = defects["crescent-moon-partial-lid-correction"]
+    assert moon_defect["path"] == "generators/benchmarks.py"
+    assert moon_defect["symbol"] == "CrescentMoonPCADatasetGenerator"
+    assert moon_defect["artifact_path"] == "benchmarks/e7_crescent_moon_radius3.0"
+    assert moon_defect["stored_value_by_split"] == {
+        "train": 2,
+        "val": 2,
+        "test": 3,
+    }
+    assert moon_defect["expected_value"] == 3
+
+    sphere_defect = defects["sphere-paper-artifact-dimension"]
+    assert sphere_defect["path"] == "generators/utils/pca.py"
+    assert sphere_defect["symbol"] == "sphere4_pca"
+    assert sphere_defect["paper_expected_value"] == 4
+    assert sphere_defect["artifact_expected_value"] == 5
+    assert sphere_defect["artifact_active_coordinates"] == 6
+    assert sphere_defect["paper_radii"] == ["1", "1/3", "1/9", "1/27"]
+    assert sphere_defect["artifact_radii_by_direction"] == [
+        "3",
+        "1",
+        "1/3",
+        "1/9",
+    ]

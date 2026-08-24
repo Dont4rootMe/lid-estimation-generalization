@@ -56,7 +56,7 @@ _APPROVED_INVENTORY_FILES = {
         "dataset_config_sha256": "16cb930a273927dcb26d69a0bf44f016898f5de717adfafe18415e53def9ec07",
         "data_root": "data/lid_benchmarks_exact/benchmarks",
         "registry": "configs/datasets/registry/paper_benchmarks.yaml",
-        "registry_sha256": "0bd8fcdeeadf99d5df5494eb96ed0c7bd60ee8433d0123b4740e127fb3e3b86b",
+        "registry_sha256": "08ac45cf701446dc6185ca2f5b83ddf05c4ce6d15c0dec0b499d4633ca397ab0",
         "registry_overlay": None,
         "registry_overlay_sha256": None,
         "suite_order": ("e1", "e2", "e3", "e4", "e5", "e6", "e7", "e8"),

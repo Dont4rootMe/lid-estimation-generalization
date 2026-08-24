@@ -52,19 +52,37 @@ created itself if extraction fails.
    theoretical effective LID 1 in memory for all three splits. The generated
    fallback has its own split policy (`20/20/20 -> 1`). Neither path modifies
    an archive or generated source artifact.
-2. `PaddedDatasetGenerator(additional_dimension=0)` reaches
+2. The exact archive also retains partially corrected LID targets for Funnel
+   and Crescent Moon: `e6_exp_pca` stores `1/1/2` across train/validation/test
+   although the pinned generator defines LID 2, and
+   `e7_crescent_moon_radius3.0` stores `2/2/3` although its generator defines
+   LID 3. The registry validates these raw split contracts before exposing
+   effective LID 2 and 3 in memory; the archive and its `lid-OLD_WRONG.npy`
+   sidecars remain untouched. The separately identified generated fallback
+   overrides the raw contracts to `2/2/2` and `3/3/3`, matching what the pinned
+   generators actually write while preserving the same effective targets.
+3. The published paper describes the E8 sphere benchmark as four copies of
+   $S^4$ embedded through five active coordinates, which would have LID 4,
+   with radii $1, 1/3, 1/9, 1/27$. The official supplemental generator and
+   exact archive instead call `sphere4_pca(dim=6)`: the coefficients use six
+   active coordinates and lie on $S^5$, every raw split stores LID 5, and the
+   direction radii are $3, 1, 1/3, 1/9$. The canonical campaign keeps the
+   scientifically correct target 5 for the actual sealed artifact and records
+   the full paper-versus-artifact construction mismatch. A paper-spec variant
+   must be generated and versioned as a separate dataset identity.
+4. `PaddedDatasetGenerator(additional_dimension=0)` reaches
    `add_random_numbers_to_borders` where `areas_to_modify` is undefined.
-3. Several e1/e5 generators set `copy_val_to_test=True`; generated validation
+5. Several e1/e5 generators set `copy_val_to_test=True`; generated validation
    and test arrays are identical, while the exact archive contains distinct
    splits. A strict split-overlap gate rejects this in confirmatory runs.
-4. Arrows generation samples integer RGB values, rasterizes with clipping and
+6. Arrows generation samples integer RGB values, rasterizes with clipping and
    combines overlaps using pixelwise maximum. This does not exactly implement
    a smooth six-continuous-variable-per-arrow chart everywhere. Reported
    `6 × arrows` ground truth is retained for parity but labelled
    `construction_assumption`. Overlap/quantization sensitivity requires a
    separately versioned row-level covariate artifact and is not claimed by the
    current global aggregate.
-5. The top-level generator has no tests or output checksums and globally seeds
+7. The top-level generator has no tests or output checksums and globally seeds
    NumPy in several functions; Torch randomness in border augmentation is not
    explicitly seeded.
 
