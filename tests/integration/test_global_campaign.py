@@ -148,6 +148,55 @@ def test_nested_pilot_compose_rejects_a_shadowed_pilot_config(
     assert "selected an unapproved source" in str(error.value.__cause__)
 
 
+def test_all_model_training_configs_accept_materialized_checkpoint_defaults() -> None:
+    config = validate_global_campaign_config(
+        compose_global_campaign_config(("logging.backend=none",))
+    )
+    plans = global_campaign.model_plans(config)
+
+    assert tuple(plan.variant_id for plan in plans) == (
+        global_campaign.APPROVED_MODEL_VARIANTS
+    )
+    for plan in plans:
+        materialized = global_campaign._canonical_training_config_record(
+            plan.model["training"], field="test Hydra training config"
+        )
+        assert len(materialized) > len(plan.model["training"])
+        global_campaign._require_matching_training_configs(
+            materialized, plan.model["training"]
+        )
+
+
+def test_training_config_guard_rejects_real_or_unknown_checkpoint_changes() -> None:
+    config = validate_global_campaign_config(
+        compose_global_campaign_config(("logging.backend=none",))
+    )
+    plan = global_campaign.model_plans(config)[0]
+    materialized = global_campaign._canonical_training_config_record(
+        plan.model["training"], field="test Hydra training config"
+    )
+
+    changed = dict(materialized)
+    changed["learning_rate"] = float(changed["learning_rate"]) * 2.0
+    with pytest.raises(
+        GlobalCampaignError,
+        match="trained checkpoint config differs from the Hydra model config",
+    ):
+        global_campaign._require_matching_training_configs(
+            changed, plan.model["training"]
+        )
+
+    unknown = dict(materialized)
+    unknown["undeclared_setting"] = None
+    with pytest.raises(
+        GlobalCampaignError,
+        match="trained checkpoint config is not a valid TrainingConfig",
+    ):
+        global_campaign._require_matching_training_configs(
+            unknown, plan.model["training"]
+        )
+
+
 def _tiny_plans(config: dict[str, Any]) -> tuple[ModelPlan, ...]:
     model = {
         "name": "test_diffusion",
@@ -237,7 +286,7 @@ class _FakeTraining:
         *,
         progress_checkpoint_path=None,
     ):
-        del family, validation, config
+        del family, validation
         self.calls += 1
         progress = Path(progress_checkpoint_path)
         self.progress_paths.append(progress)
@@ -252,6 +301,9 @@ class _FakeTraining:
         return SimpleNamespace(
             checkpoint_path=Path(checkpoint_path),
             checkpoint_sha256=sha256_path(Path(checkpoint_path)),
+            config=global_campaign._canonical_training_config_record(
+                config, field="fake trainer config"
+            ),
         )
 
 

@@ -1820,6 +1820,42 @@ def _training_call(
     )
 
 
+def _canonical_training_config_record(value: Any, *, field: str) -> dict[str, Any]:
+    """Materialize one training config through the checkpoint schema.
+
+    Pilot Hydra files intentionally omit family-irrelevant optional settings,
+    while ``TrainingConfig.to_dict()`` stores those defaults explicitly as
+    ``null`` in checkpoints.  Canonicalizing both representations through the
+    same validated dataclass makes only that sparse-vs-materialized difference
+    equivalent; unknown fields and invalid values still fail closed.
+    """
+
+    from models.training import TrainingConfig
+
+    if callable(getattr(value, "to_dict", None)):
+        value = value.to_dict()
+    try:
+        record = _mapping(value, field=field)
+        return TrainingConfig.from_mapping(record).to_dict()
+    except (GlobalCampaignError, TypeError, ValueError) as exc:
+        raise GlobalCampaignError(f"{field} is not a valid TrainingConfig") from exc
+
+
+def _require_matching_training_configs(
+    trained_config: Any, hydra_training: Mapping[str, Any]
+) -> None:
+    trained_record = _canonical_training_config_record(
+        trained_config, field="trained checkpoint config"
+    )
+    hydra_record = _canonical_training_config_record(
+        hydra_training, field="Hydra model training config"
+    )
+    if canonical_json(trained_record) != canonical_json(hydra_record):
+        raise GlobalCampaignError(
+            "trained checkpoint config differs from the Hydra model config"
+        )
+
+
 def _model_readouts(model: Mapping[str, Any]) -> tuple[str, ...]:
     if model["family"] == "independent_affine_flow":
         return ("response", "full", "fm_to_score")
@@ -2102,17 +2138,7 @@ def _run_cell(
         raise GlobalCampaignError(f"trainer did not write checkpoint: {checkpoint}")
     trained_config = getattr(trained, "config", None)
     if trained_config is not None:
-        trained_config_record = (
-            trained_config.to_dict()
-            if callable(getattr(trained_config, "to_dict", None))
-            else _plain(trained_config)
-        )
-        if canonical_json(trained_config_record) != canonical_json(
-            model_plan.model["training"]
-        ):
-            raise GlobalCampaignError(
-                "trained checkpoint config differs from the Hydra model config"
-            )
+        _require_matching_training_configs(trained_config, model_plan.model["training"])
     declared_checkpoint_sha = getattr(trained, "checkpoint_sha256", None)
     checkpoint_sha = sha256_path(checkpoint)
     if (
