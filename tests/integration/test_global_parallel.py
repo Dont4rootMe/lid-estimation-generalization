@@ -351,12 +351,24 @@ def test_h100_profile_is_explicit_and_legacy_default_is_unchanged() -> None:
 
     h100 = with_h100_profile(base)
     assert h100["execution"] == dict(H100_PROFILE)
-    assert {
-        plan.model["training"]["batch_size"]
-        for plan in global_campaign.model_plans(h100)
-    } == {4096}
+    plans = global_campaign.model_plans(h100)
+    assert {plan.model["training"]["batch_size"] for plan in plans} == {4096}
     assert h100["campaign"]["evaluation"]["batch_size"] == 128
     assert h100["execution"]["evaluation_batch_size_override"] == 512
+    affine_plans = tuple(
+        plan for plan in plans if plan.model["family"] == "independent_affine_flow"
+    )
+    assert len(affine_plans) == 6
+    assert {plan.model["diagnostics"]["batch_size"] for plan in affine_plans} == {512}
+
+    legacy_affine_plans = tuple(
+        plan
+        for plan in global_campaign.model_plans(base)
+        if plan.model["family"] == "independent_affine_flow"
+    )
+    assert {
+        plan.model["diagnostics"]["batch_size"] for plan in legacy_affine_plans
+    } == {128}
 
 
 def test_cell_dag_dependencies_follow_declared_references_including_paired_delta() -> (

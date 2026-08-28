@@ -778,14 +778,35 @@ def model_plans(config: Mapping[str, Any]) -> tuple[ModelPlan, ...]:
         if isinstance(execution, Mapping)
         else None
     )
+    evaluation_batch_override = (
+        execution.get("evaluation_batch_size_override")
+        if isinstance(execution, Mapping)
+        else None
+    )
 
     def resolved_model(variant_id: str) -> dict[str, Any]:
         model = _resolved_pilot_model(variant_id, seed)
-        if training_batch_override is None:
-            return model
-        training = _mapping(model.get("training"), field=f"{variant_id}.training")
-        training["batch_size"] = int(training_batch_override)
-        return {**model, "training": training}
+        resolved = dict(model)
+        if training_batch_override is not None:
+            training = _mapping(model.get("training"), field=f"{variant_id}.training")
+            training["batch_size"] = int(training_batch_override)
+            resolved["training"] = training
+
+        # The outer selector and affine-FM diagnostics independently evaluate
+        # the same Hutchinson estimator.  Its probe stream is consumed inside
+        # the predictor's batch loop, so the batch partition is part of that
+        # deterministic evaluation contract.  Keep both paths aligned when a
+        # production profile increases the effective evaluation batch size.
+        if (
+            evaluation_batch_override is not None
+            and model.get("family") == "independent_affine_flow"
+        ):
+            diagnostics = _mapping(
+                model.get("diagnostics"), field=f"{variant_id}.diagnostics"
+            )
+            diagnostics["batch_size"] = int(evaluation_batch_override)
+            resolved["diagnostics"] = diagnostics
+        return resolved
 
     return tuple(
         ModelPlan(
