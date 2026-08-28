@@ -30,6 +30,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import UTC, datetime
+from itertools import pairwise
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -151,7 +152,15 @@ REQUIRED_SUITE_IDS = ("e1", "e2", "e3", "e4", "e5", "e6", "e7", "e8")
 KNOWN_SELECTION_PROTOCOL = "held_out_source_train_supervised_mae_v1"
 UNKNOWN_SELECTION_PROTOCOL = "held_out_source_train_reference_stability_v1"
 FROZEN_EVALUATION_PROTOCOL = "single_train_selected_scale_v1"
+CHECKPOINT_RETENTION_RETAIN = "retain"
+CHECKPOINT_RETENTION_PRUNE_AFTER_EVALUATION = "prune_after_cell_evaluation"
+SUPPORTED_CHECKPOINT_RETENTION_POLICIES = (
+    CHECKPOINT_RETENTION_RETAIN,
+    CHECKPOINT_RETENTION_PRUNE_AFTER_EVALUATION,
+)
+TRAINING_ATTESTATION_SCHEMA_VERSION = 1
 _EXPERIMENT_NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
 
 class GlobalCampaignError(RuntimeError):
@@ -630,11 +639,15 @@ def validate_global_campaign_config(
         raise GlobalCampaignError("tie_tolerance must be non-negative")
 
     evaluation = _mapping(campaign.get("evaluation"), field="campaign.evaluation")
-    if set(evaluation) != {
+    legacy_evaluation_fields = {
         "batch_size",
         "frozen_candidate_count",
         "save_retrospective_validation_curves",
         "save_retrospective_test_curves",
+    }
+    if frozenset(evaluation) not in {
+        frozenset(legacy_evaluation_fields),
+        frozenset({*legacy_evaluation_fields, "checkpoint_retention"}),
     }:
         raise GlobalCampaignError("campaign.evaluation fields differ from contract")
     _positive_int(evaluation["batch_size"], field="campaign.evaluation.batch_size")
@@ -647,6 +660,14 @@ def validate_global_campaign_config(
         raise GlobalCampaignError("retrospective validation curves are forbidden")
     if evaluation["save_retrospective_test_curves"] is not False:
         raise GlobalCampaignError("retrospective test curves are forbidden")
+    if (
+        evaluation.get("checkpoint_retention", CHECKPOINT_RETENTION_RETAIN)
+        not in SUPPORTED_CHECKPOINT_RETENTION_POLICIES
+    ):
+        raise GlobalCampaignError(
+            "evaluation.checkpoint_retention must be retain or "
+            "prune_after_cell_evaluation"
+        )
 
     resume = _mapping(campaign.get("resume"), field="campaign.resume")
     expected_resume = {
@@ -1240,7 +1261,18 @@ def _save_npy(path: Path, value: npt.ArrayLike) -> None:
     os.replace(temporary, path)
 
 
-def _output_inventory(directory: Path) -> dict[str, dict[str, Any]]:
+def _checkpoint_retention_policy(evaluation: Mapping[str, Any]) -> str:
+    policy = evaluation.get("checkpoint_retention", CHECKPOINT_RETENTION_RETAIN)
+    if policy not in SUPPORTED_CHECKPOINT_RETENTION_POLICIES:
+        raise GlobalCampaignError("cell checkpoint retention policy is invalid")
+    return str(policy)
+
+
+def _output_inventory(
+    directory: Path,
+    *,
+    excluded_relative_paths: frozenset[str] = frozenset(),
+) -> dict[str, dict[str, Any]]:
     records: dict[str, dict[str, Any]] = {}
     for path in sorted(directory.rglob("*")):
         if path.is_symlink():
@@ -1248,6 +1280,8 @@ def _output_inventory(directory: Path) -> dict[str, dict[str, Any]]:
         if not path.is_file() or path.name == "manifest.json":
             continue
         relative = path.relative_to(directory).as_posix()
+        if relative in excluded_relative_paths:
+            continue
         records[relative] = {
             "size_bytes": path.stat().st_size,
             "sha256": sha256_path(path),
@@ -1316,12 +1350,131 @@ def _source_evidence(data: CellData, config: Mapping[str, Any]) -> dict[str, Any
     }
 
 
+def _validate_training_attestation(
+    attestation: Mapping[str, Any],
+    *,
+    model: Mapping[str, Any],
+    checkpoint_retention: str,
+    checkpoint_sha256: Any,
+) -> list[str]:
+    errors: list[str] = []
+    required = {
+        "schema_version",
+        "model_family",
+        "training_config_sha256",
+        "checkpoint_sha256",
+        "checkpoint_size_bytes",
+        "checkpoint_retention",
+        "history",
+    }
+    if set(attestation) != required:
+        errors.append("training attestation fields differ from contract")
+    if attestation.get("schema_version") != TRAINING_ATTESTATION_SCHEMA_VERSION or (
+        isinstance(attestation.get("schema_version"), bool)
+    ):
+        errors.append("training attestation schema_version is invalid")
+    if attestation.get("model_family") != model.get("family"):
+        errors.append("training attestation model family differs")
+    try:
+        training_config = _canonical_training_config_record(
+            model["training"], field="attested Hydra model training config"
+        )
+    except (GlobalCampaignError, KeyError) as exc:
+        errors.append(f"cannot attest training config: {exc}")
+    else:
+        expected_training_sha = sha256_bytes(
+            canonical_json(training_config).encode("utf-8")
+        )
+        if attestation.get("training_config_sha256") != expected_training_sha:
+            errors.append("training attestation config SHA differs")
+    attested_sha = attestation.get("checkpoint_sha256")
+    if not isinstance(attested_sha, str) or not _SHA256.fullmatch(attested_sha):
+        errors.append("training attestation checkpoint SHA is invalid")
+    if attested_sha != checkpoint_sha256:
+        errors.append("training attestation checkpoint SHA differs from summary")
+    size = attestation.get("checkpoint_size_bytes")
+    if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+        errors.append("training attestation checkpoint size is invalid")
+    if attestation.get("checkpoint_retention") != checkpoint_retention:
+        errors.append("training attestation checkpoint retention differs")
+
+    history = attestation.get("history")
+    if not isinstance(history, Mapping) or set(history) != {
+        "status",
+        "best_epoch",
+        "best_validation_loss",
+        "epochs",
+    }:
+        errors.append("training attestation history schema differs")
+        return errors
+    status = history.get("status")
+    epochs = history.get("epochs")
+    if status == "unavailable_from_trainer":
+        if (
+            history.get("best_epoch") is not None
+            or history.get("best_validation_loss") is not None
+            or epochs != []
+        ):
+            errors.append("unavailable training history contains measurements")
+        return errors
+    if status != "complete" or not isinstance(epochs, list) or not epochs:
+        errors.append("training attestation history is invalid")
+        return errors
+    previous_epoch = 0
+    validation_by_epoch: dict[int, float] = {}
+    for row in epochs:
+        if not isinstance(row, Mapping) or set(row) != {
+            "epoch",
+            "train_loss",
+            "validation_loss",
+            "learning_rate",
+        }:
+            errors.append("training attestation epoch fields differ")
+            continue
+        epoch = row.get("epoch")
+        if (
+            isinstance(epoch, bool)
+            or not isinstance(epoch, int)
+            or epoch <= previous_epoch
+        ):
+            errors.append("training attestation epochs do not strictly increase")
+            continue
+        previous_epoch = epoch
+        numeric_valid = True
+        for field in ("train_loss", "validation_loss", "learning_rate"):
+            value = row.get(field)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+            ):
+                errors.append(f"training attestation {field} is not finite")
+                numeric_valid = False
+        if numeric_valid:
+            validation_by_epoch[epoch] = float(row["validation_loss"])
+    best_epoch = history.get("best_epoch")
+    best_loss = history.get("best_validation_loss")
+    if (
+        isinstance(best_epoch, bool)
+        or not isinstance(best_epoch, int)
+        or best_epoch not in validation_by_epoch
+        or isinstance(best_loss, bool)
+        or not isinstance(best_loss, (int, float))
+        or not math.isfinite(float(best_loss))
+    ):
+        errors.append("training attestation best history fields are invalid")
+    elif float(best_loss) != validation_by_epoch[best_epoch]:
+        errors.append("training attestation best loss differs from history")
+    return errors
+
+
 def validate_global_cell(
     directory: Path,
     *,
     expected_identity: Mapping[str, Any] | None = None,
     reference_summary: Mapping[str, Any] | None = None,
     expected_source_evidence: Mapping[str, Any] | None = None,
+    allow_transient_prunable_checkpoint: bool = False,
 ) -> list[str]:
     """Recompute selection and split metrics from the sealed pointwise arrays."""
 
@@ -1350,6 +1503,16 @@ def validate_global_cell(
     identity = manifest.get("identity")
     if not isinstance(identity, Mapping):
         return errors + ["cell identity must be a mapping"]
+    raw_evaluation_contract = identity.get("evaluation_contract")
+    if not isinstance(raw_evaluation_contract, Mapping):
+        checkpoint_retention = CHECKPOINT_RETENTION_RETAIN
+        errors.append("cell evaluation contract is invalid")
+    else:
+        try:
+            checkpoint_retention = _checkpoint_retention_policy(raw_evaluation_contract)
+        except GlobalCampaignError as exc:
+            checkpoint_retention = CHECKPOINT_RETENTION_RETAIN
+            errors.append(str(exc))
     if expected_identity is not None and not _same_json(identity, expected_identity):
         errors.append("cell identity differs from the expected campaign cell")
     if manifest.get("evaluation_protocol") != FROZEN_EVALUATION_PROTOCOL:
@@ -1369,7 +1532,15 @@ def validate_global_cell(
         errors.append("cell outputs must be a mapping")
     else:
         try:
-            actual = _output_inventory(root)
+            actual = _output_inventory(
+                root,
+                excluded_relative_paths=(
+                    frozenset({"checkpoint.pt"})
+                    if checkpoint_retention
+                    == CHECKPOINT_RETENTION_PRUNE_AFTER_EVALUATION
+                    else frozenset()
+                ),
+            )
         except GlobalCampaignError as exc:
             errors.append(str(exc))
         else:
@@ -1433,8 +1604,59 @@ def validate_global_cell(
         errors.append("input_record.json does not recompute identity input SHA")
     if summary.get("input_sha256") != identity.get("input_sha256"):
         errors.append("summary input SHA differs from cell identity")
-    if sha256_path(root / "checkpoint.pt") != summary.get("checkpoint_sha256"):
-        errors.append("checkpoint SHA differs from summary")
+    summary_checkpoint_sha = summary.get("checkpoint_sha256")
+    if not isinstance(summary_checkpoint_sha, str) or not _SHA256.fullmatch(
+        summary_checkpoint_sha
+    ):
+        errors.append("summary checkpoint SHA is invalid")
+    checkpoint_path = root / "checkpoint.pt"
+    attestation_path = root / "training_attestation.json"
+    attestation: dict[str, Any] | None = None
+    if attestation_path.exists():
+        try:
+            attestation = _load_json(attestation_path)
+        except GlobalCampaignError as exc:
+            errors.append(f"cannot read training attestation: {exc}")
+        else:
+            errors.extend(
+                _validate_training_attestation(
+                    attestation,
+                    model=model,
+                    checkpoint_retention=checkpoint_retention,
+                    checkpoint_sha256=summary_checkpoint_sha,
+                )
+            )
+            if summary.get("training_attestation_sha256") != sha256_path(
+                attestation_path
+            ):
+                errors.append("summary training-attestation SHA differs")
+    elif checkpoint_retention == CHECKPOINT_RETENTION_PRUNE_AFTER_EVALUATION:
+        errors.append("pruned cell lacks training attestation")
+
+    if checkpoint_retention == CHECKPOINT_RETENTION_RETAIN:
+        if not checkpoint_path.is_file():
+            errors.append("retained checkpoint is missing")
+        elif sha256_path(checkpoint_path) != summary_checkpoint_sha:
+            errors.append("checkpoint SHA differs from summary")
+        if summary.get("checkpoint_retention", CHECKPOINT_RETENTION_RETAIN) != (
+            CHECKPOINT_RETENTION_RETAIN
+        ):
+            errors.append("summary checkpoint retention differs")
+    else:
+        if summary.get("checkpoint_retention") != checkpoint_retention:
+            errors.append("summary checkpoint retention differs")
+        if checkpoint_path.exists():
+            if not allow_transient_prunable_checkpoint:
+                errors.append("pruned sealed cell retains checkpoint")
+            elif (
+                not checkpoint_path.is_file()
+                or sha256_path(checkpoint_path) != summary_checkpoint_sha
+            ):
+                errors.append("transient checkpoint differs from summary")
+            elif attestation is not None and checkpoint_path.stat().st_size != (
+                attestation.get("checkpoint_size_bytes")
+            ):
+                errors.append("transient checkpoint size differs from attestation")
 
     if scales.size == 0 or np.any(scales <= 0) or np.unique(scales).size != scales.size:
         errors.append("scales must be finite, positive, and unique")
@@ -1856,6 +2078,95 @@ def _require_matching_training_configs(
         )
 
 
+def _training_history_attestation(trained: Any) -> dict[str, Any]:
+    """Preserve portable optimizer history before a sealed checkpoint is pruned."""
+
+    raw_history = getattr(trained, "history", None)
+    if raw_history is None:
+        return {
+            "status": "unavailable_from_trainer",
+            "best_epoch": None,
+            "best_validation_loss": None,
+            "epochs": [],
+        }
+    if isinstance(raw_history, (str, bytes)) or not isinstance(raw_history, Sequence):
+        raise GlobalCampaignError("trained history must be a sequence")
+    history: list[dict[str, Any]] = []
+    for index, raw_metric in enumerate(raw_history):
+        if callable(getattr(raw_metric, "to_dict", None)):
+            raw_metric = raw_metric.to_dict()
+        metric = _mapping(raw_metric, field=f"trained history[{index}]")
+        if set(metric) != {
+            "epoch",
+            "train_loss",
+            "validation_loss",
+            "learning_rate",
+        }:
+            raise GlobalCampaignError("trained history entry fields differ")
+        epoch = metric["epoch"]
+        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch <= 0:
+            raise GlobalCampaignError("trained history epoch must be positive")
+        numeric: dict[str, float] = {}
+        for field in ("train_loss", "validation_loss", "learning_rate"):
+            value = metric[field]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+            ):
+                raise GlobalCampaignError(f"trained history {field} must be finite")
+            numeric[field] = float(value)
+        history.append({"epoch": epoch, **numeric})
+    if not history or any(
+        left["epoch"] >= right["epoch"] for left, right in pairwise(history)
+    ):
+        raise GlobalCampaignError("trained history epochs must strictly increase")
+    best_epoch = getattr(trained, "best_epoch", None)
+    best_validation_loss = getattr(trained, "best_validation_loss", None)
+    if (
+        isinstance(best_epoch, bool)
+        or not isinstance(best_epoch, int)
+        or best_epoch not in {row["epoch"] for row in history}
+        or isinstance(best_validation_loss, bool)
+        or not isinstance(best_validation_loss, (int, float))
+        or not math.isfinite(float(best_validation_loss))
+    ):
+        raise GlobalCampaignError("trained best-history fields are invalid")
+    matching = next(row for row in history if row["epoch"] == best_epoch)
+    if float(best_validation_loss) != matching["validation_loss"]:
+        raise GlobalCampaignError("trained best loss differs from its history epoch")
+    return {
+        "status": "complete",
+        "best_epoch": best_epoch,
+        "best_validation_loss": float(best_validation_loss),
+        "epochs": history,
+    }
+
+
+def _training_attestation(
+    trained: Any,
+    *,
+    checkpoint: Path,
+    checkpoint_sha256: str,
+    retention_policy: str,
+    model: Mapping[str, Any],
+) -> dict[str, Any]:
+    training_config = _canonical_training_config_record(
+        model["training"], field="Hydra model training config"
+    )
+    return {
+        "schema_version": TRAINING_ATTESTATION_SCHEMA_VERSION,
+        "model_family": str(model["family"]),
+        "training_config_sha256": sha256_bytes(
+            canonical_json(training_config).encode("utf-8")
+        ),
+        "checkpoint_sha256": checkpoint_sha256,
+        "checkpoint_size_bytes": checkpoint.stat().st_size,
+        "checkpoint_retention": retention_policy,
+        "history": _training_history_attestation(trained),
+    }
+
+
 def _model_readouts(model: Mapping[str, Any]) -> tuple[str, ...]:
     if model["family"] == "independent_affine_flow":
         return ("response", "full", "fm_to_score")
@@ -2027,6 +2338,9 @@ def _run_cell(
     affine_diagnostics_fn: AffineDiagnosticsFunction,
     callback: Callable[[str, Mapping[str, Any]], None] | None,
 ) -> tuple[Path, dict[str, Any]]:
+    checkpoint_retention = _checkpoint_retention_policy(
+        config["campaign"]["evaluation"]
+    )
     identity = _cell_identity(
         campaign_id=campaign_id,
         campaign_config_sha=campaign_config_sha,
@@ -2101,6 +2415,40 @@ def _run_cell(
         config["campaign"]["resume"]["training_progress_filename"]
     )
 
+    # The post-evaluation manifest is written before pruning.  If the process
+    # dies after the atomic unlink but before the directory rename, all science
+    # outputs are already immutable and can be sealed without retraining.
+    if (
+        checkpoint_retention == CHECKPOINT_RETENTION_PRUNE_AFTER_EVALUATION
+        and (work_dir / "manifest.json").is_file()
+        and not checkpoint.exists()
+        and not progress.exists()
+    ):
+        errors = validate_global_cell(
+            work_dir,
+            expected_identity=identity,
+            reference_summary=reference_summary,
+        )
+        if errors:
+            raise GlobalCampaignError(
+                f"pruned incomplete global cell failed recovery: {errors}"
+            )
+        os.replace(work_dir, final_dir)
+        summary = _load_json(final_dir / "summary.json")
+        summary["summary_sha256"] = sha256_path(final_dir / "summary.json")
+        _emit(
+            callback,
+            "cell.completed",
+            model_plan=model_plan,
+            cell=cell,
+            cell_id=cell_id,
+            selected_scale=summary["selected_scale"],
+            metrics=summary["metrics"],
+            recovered_after_checkpoint_prune=True,
+            shared_filesystem_cell_dir=str(final_dir),
+        )
+        return final_dir, summary
+
     def training_log(payload: Mapping[str, Any]) -> None:
         epoch = payload.get("epoch")
         _emit(
@@ -2146,6 +2494,15 @@ def _run_cell(
         and declared_checkpoint_sha != checkpoint_sha
     ):
         raise GlobalCampaignError("trained checkpoint SHA differs from checkpoint file")
+    training_attestation = _training_attestation(
+        trained,
+        checkpoint=checkpoint,
+        checkpoint_sha256=checkpoint_sha,
+        retention_policy=checkpoint_retention,
+        model=model_plan.model,
+    )
+    training_attestation_path = work_dir / "training_attestation.json"
+    _write_json(training_attestation_path, training_attestation)
 
     scales = np.ascontiguousarray(
         np.asarray(model_plan.model["scales"], dtype=np.float64)
@@ -2291,6 +2648,8 @@ def _run_cell(
         "reference_binding": reference_binding,
         "partition": partition.record,
         "checkpoint_sha256": checkpoint_sha,
+        "checkpoint_retention": checkpoint_retention,
+        "training_attestation_sha256": sha256_path(training_attestation_path),
         "input_sha256": data.input_sha256,
         "evaluation_protocol": FROZEN_EVALUATION_PROTOCOL,
         "validation_candidate_count": 1,
@@ -2304,7 +2663,14 @@ def _run_cell(
     summary["summary_sha256"] = sha256_path(work_dir / "summary.json")
     # Store the self-hash only in the returned/aggregate record.  Embedding a
     # file's hash inside itself would create a circular identity.
-    outputs = _output_inventory(work_dir)
+    outputs = _output_inventory(
+        work_dir,
+        excluded_relative_paths=(
+            frozenset({"checkpoint.pt"})
+            if checkpoint_retention == CHECKPOINT_RETENTION_PRUNE_AFTER_EVALUATION
+            else frozenset()
+        ),
+    )
     manifest = {
         "schema_version": GLOBAL_CELL_MANIFEST_SCHEMA_VERSION,
         "identity": identity,
@@ -2319,9 +2685,23 @@ def _run_cell(
         work_dir,
         expected_identity=identity,
         reference_summary=reference_summary,
+        allow_transient_prunable_checkpoint=(
+            checkpoint_retention == CHECKPOINT_RETENTION_PRUNE_AFTER_EVALUATION
+        ),
     )
     if errors:
         raise GlobalCampaignError(f"new global cell failed validation: {errors}")
+    if checkpoint_retention == CHECKPOINT_RETENTION_PRUNE_AFTER_EVALUATION:
+        checkpoint.unlink()
+        errors = validate_global_cell(
+            work_dir,
+            expected_identity=identity,
+            reference_summary=reference_summary,
+        )
+        if errors:
+            raise GlobalCampaignError(
+                f"pruned global cell failed strict validation: {errors}"
+            )
     os.replace(work_dir, final_dir)
     summary["summary_sha256"] = sha256_path(final_dir / "summary.json")
     _emit(

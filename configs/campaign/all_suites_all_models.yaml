@@ -45,6 +45,7 @@ evaluation:
   frozen_candidate_count: 1
   save_retrospective_validation_curves: false
   save_retrospective_test_curves: false
+  checkpoint_retention: prune_after_cell_evaluation
 
 resume:
   schema_version: 1

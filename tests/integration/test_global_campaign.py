@@ -304,13 +304,34 @@ class _FakeTraining:
             config=global_campaign._canonical_training_config_record(
                 config, field="fake trainer config"
             ),
+            history=(
+                {
+                    "epoch": 1,
+                    "train_loss": 0.5,
+                    "validation_loss": 0.25,
+                    "learning_rate": 1.0e-3,
+                },
+            ),
+            best_epoch=1,
+            best_validation_loss=0.25,
         )
 
 
 def _load_checkpoint(path, *, device):
     del device
     return SimpleNamespace(
-        checkpoint_path=Path(path), checkpoint_sha256=sha256_path(Path(path))
+        checkpoint_path=Path(path),
+        checkpoint_sha256=sha256_path(Path(path)),
+        history=(
+            {
+                "epoch": 1,
+                "train_loss": 0.5,
+                "validation_loss": 0.25,
+                "learning_rate": 1.0e-3,
+            },
+        ),
+        best_epoch=1,
+        best_validation_loss=0.25,
     )
 
 
@@ -407,6 +428,14 @@ def test_all_models_all_cells_resume_and_deep_validate(
     assert manifest["expected_models"] == 10
     assert manifest["expected_cells_per_model"] == 39
     assert len(manifest["cells"]) == 390
+    for record in manifest["cells"]:
+        cell_dir = campaign_root / record["path"]
+        assert not (cell_dir / "checkpoint.pt").exists()
+        attestation = json.loads((cell_dir / "training_attestation.json").read_text())
+        summary = json.loads((cell_dir / "summary.json").read_text())
+        assert attestation["checkpoint_retention"] == ("prune_after_cell_evaluation")
+        assert attestation["checkpoint_sha256"] == summary["checkpoint_sha256"]
+        assert attestation["history"]["status"] == "complete"
     aggregate = json.loads((campaign_root / "aggregate.json").read_text())
     assert aggregate["coverage"]["models"] == 10
     assert aggregate["e1_sample_size_stability"]
@@ -430,6 +459,26 @@ def test_all_models_all_cells_resume_and_deep_validate(
         if row["model_variant"] == "diffusion" and row["cell_key"] == known_cell.key
     )
     known_dir = campaign_root / known_record["path"]
+    attestation_path = known_dir / "training_attestation.json"
+    original_attestation = global_campaign._load_json(attestation_path)
+    tampered_attestation = {
+        **original_attestation,
+        "checkpoint_sha256": "0" * 64,
+    }
+    global_campaign._write_json(attestation_path, tampered_attestation)
+    cell_manifest = global_campaign._load_json(known_dir / "manifest.json")
+    cell_manifest["outputs"] = global_campaign._output_inventory(known_dir)
+    global_campaign._write_json(known_dir / "manifest.json", cell_manifest)
+    attestation_errors = global_campaign.validate_global_cell(
+        known_dir, expected_identity=cell_manifest["identity"]
+    )
+    assert any(
+        "attestation checkpoint SHA differs" in error for error in attestation_errors
+    )
+    global_campaign._write_json(attestation_path, original_attestation)
+    cell_manifest["outputs"] = global_campaign._output_inventory(known_dir)
+    global_campaign._write_json(known_dir / "manifest.json", cell_manifest)
+
     target_path = known_dir / "test_target.npy"
     target = np.load(target_path, allow_pickle=False)
     np.save(target_path, target + 1.0, allow_pickle=False)
@@ -452,6 +501,113 @@ def test_all_models_all_cells_resume_and_deep_validate(
     )
     with pytest.raises(GlobalCampaignError, match="existing final global campaign"):
         run_global_campaign(config, **kwargs)
+
+
+def test_legacy_retained_checkpoint_contract_remains_valid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = validate_global_campaign_config(
+        compose_global_campaign_config(("logging.backend=none",))
+    )
+    config["campaign"]["evaluation"].pop("checkpoint_retention")
+    config = validate_global_campaign_config(config)
+    monkeypatch.setattr(global_campaign, "model_plans", _tiny_plans)
+    monkeypatch.setattr(
+        global_campaign, "hash_declared_sources", lambda root: SOURCE_SHA
+    )
+    trainer = _FakeTraining(fail_call=2)
+    revision = {"value": 1}
+    with pytest.raises(RuntimeError, match="fixture interruption"):
+        run_global_campaign(
+            config,
+            root=PROJECT_ROOT,
+            output_root=tmp_path,
+            source_preflight_fn=_source_preflight,
+            cell_loader=_cell_loader_factory(revision),
+            train_fn=trainer,
+            predict_fn=_predict,
+            load_checkpoint_fn=_load_checkpoint,
+            logger_factory=_logger_factory([], []),
+        )
+    campaign_root = next(path for path in tmp_path.iterdir() if path.is_dir())
+    sealed = [
+        path.parent
+        for path in campaign_root.rglob("manifest.json")
+        if not path.parent.name.startswith(".")
+    ]
+    assert len(sealed) == 1
+    assert (sealed[0] / "checkpoint.pt").is_file()
+    assert global_campaign.validate_global_cell(sealed[0]) == []
+    # Pre-pruning schema-v1 cells had neither the optional attestation nor the
+    # explicit summary retention fields; they remain strictly valid.
+    (sealed[0] / "training_attestation.json").unlink()
+    summary = global_campaign._load_json(sealed[0] / "summary.json")
+    summary.pop("checkpoint_retention")
+    summary.pop("training_attestation_sha256")
+    global_campaign._write_json(sealed[0] / "summary.json", summary)
+    manifest = global_campaign._load_json(sealed[0] / "manifest.json")
+    manifest["outputs"] = global_campaign._output_inventory(sealed[0])
+    global_campaign._write_json(sealed[0] / "manifest.json", manifest)
+    assert global_campaign.validate_global_cell(sealed[0]) == []
+
+
+def test_pruned_complete_staging_recovers_without_retraining(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = validate_global_campaign_config(
+        compose_global_campaign_config(("logging.backend=none",))
+    )
+    monkeypatch.setattr(global_campaign, "model_plans", _tiny_plans)
+    monkeypatch.setattr(
+        global_campaign, "hash_declared_sources", lambda root: SOURCE_SHA
+    )
+    revision = {"value": 1}
+    trainer = _FakeTraining(fail_call=2)
+    replace = global_campaign.os.replace
+    interrupt = {"armed": True}
+
+    def interrupt_first_cell_seal(source, destination):
+        source_path = Path(source)
+        if (
+            interrupt["armed"]
+            and source_path.is_dir()
+            and source_path.name.startswith(".")
+            and source_path.name.endswith(".incomplete")
+        ):
+            interrupt["armed"] = False
+            assert not (source_path / "checkpoint.pt").exists()
+            raise RuntimeError("fixture post-prune seal interruption")
+        return replace(source, destination)
+
+    monkeypatch.setattr(global_campaign.os, "replace", interrupt_first_cell_seal)
+    kwargs = {
+        "root": PROJECT_ROOT,
+        "output_root": tmp_path,
+        "source_preflight_fn": _source_preflight,
+        "cell_loader": _cell_loader_factory(revision),
+        "train_fn": trainer,
+        "predict_fn": _predict,
+        "load_checkpoint_fn": _load_checkpoint,
+        "logger_factory": _logger_factory([], []),
+    }
+    with pytest.raises(RuntimeError, match="post-prune seal interruption"):
+        run_global_campaign(config, **kwargs)
+    campaign_root = next(path for path in tmp_path.iterdir() if path.is_dir())
+    staging = next(campaign_root.rglob(".*.incomplete"))
+    assert (staging / "manifest.json").is_file()
+    assert not (staging / "checkpoint.pt").exists()
+    assert global_campaign.validate_global_cell(staging) == []
+
+    # Cell 1 is sealed directly from its validated staging directory.  The
+    # trainer's second call belongs to cell 2 and proves cell 1 was not rerun.
+    with pytest.raises(RuntimeError, match="fixture interruption"):
+        run_global_campaign(config, **kwargs)
+    assert trainer.calls == 2
+    ledger = json.loads((campaign_root / "state" / "ledger.json").read_text())
+    assert len(ledger["completed_cells"]) == 1
+    sealed = campaign_root / ledger["completed_cells"][0]["path"]
+    assert not (sealed / "checkpoint.pt").exists()
+    assert global_campaign.validate_global_cell(sealed) == []
 
 
 def test_input_mutation_changes_campaign_identity_before_training(
@@ -649,6 +805,10 @@ def test_comet_state_resumes_same_deterministic_experiment(
             "stability_min_valid_fraction",
         ),
         ("campaign.evaluation.frozen_candidate_count=true", "one frozen"),
+        (
+            "campaign.evaluation.checkpoint_retention=delete_immediately",
+            "checkpoint_retention",
+        ),
     ],
 )
 def test_boolean_numeric_contracts_are_rejected(override: str, match: str) -> None:
