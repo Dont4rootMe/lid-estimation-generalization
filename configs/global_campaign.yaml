@@ -7,6 +7,16 @@ project: lid-generalization
 seed: 0
 output_root: artifacts/global
 
+# The default library/CLI path remains the original single-process campaign.
+# experiments.global_parallel replaces this block with the immutable H100
+# profile before any campaign identity is derived.
+execution:
+  profile: legacy_sequential
+  strategy: sequential
+  worker_count: 1
+  training_batch_size_override: null
+  evaluation_batch_size_override: null
+
 data:
   canonical_archive: data/benchmarks.zip
   canonical_extracted_root: data/lid_benchmarks_exact

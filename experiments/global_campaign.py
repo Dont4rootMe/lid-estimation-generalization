@@ -54,6 +54,7 @@ from experiments.metrics import (
     prediction_summary,
 )
 from experiments.pilot import (
+    _affine_outer_curve_consistency_error,
     _array_sha256,
     _features_in_model_space,
     compose_pilot_config,
@@ -159,6 +160,10 @@ SUPPORTED_CHECKPOINT_RETENTION_POLICIES = (
     CHECKPOINT_RETENTION_PRUNE_AFTER_EVALUATION,
 )
 TRAINING_ATTESTATION_SCHEMA_VERSION = 1
+EXECUTION_STRATEGY_SEQUENTIAL = "sequential"
+EXECUTION_STRATEGY_CELL_DAG = "cell_dag_pool"
+EXECUTION_PROFILE_LEGACY = "legacy_sequential"
+EXECUTION_PROFILE_H100 = "h100_8gpu_cell_dag"
 _EXPERIMENT_NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -438,6 +443,7 @@ def validate_global_campaign_config(
             "project",
             "seed",
             "output_root",
+            "execution",
             "data",
             "logging",
             "campaign",
@@ -457,6 +463,79 @@ def validate_global_campaign_config(
     if isinstance(seed, bool) or not isinstance(seed, int) or seed != 0:
         raise GlobalCampaignError("global campaign seed must be exactly 0")
     _safe_path(value.get("output_root"), field="output_root")
+
+    execution = _mapping(
+        value.get(
+            "execution",
+            {
+                "profile": EXECUTION_PROFILE_LEGACY,
+                "strategy": EXECUTION_STRATEGY_SEQUENTIAL,
+                "worker_count": 1,
+                "training_batch_size_override": None,
+                "evaluation_batch_size_override": None,
+            },
+        ),
+        field="execution",
+    )
+    _reject_unknown(
+        execution,
+        {
+            "profile",
+            "strategy",
+            "worker_count",
+            "training_batch_size_override",
+            "evaluation_batch_size_override",
+        },
+        field="execution",
+    )
+    if set(execution) != {
+        "profile",
+        "strategy",
+        "worker_count",
+        "training_batch_size_override",
+        "evaluation_batch_size_override",
+    }:
+        raise GlobalCampaignError("execution fields differ from contract")
+    strategy = execution["strategy"]
+    if strategy not in {
+        EXECUTION_STRATEGY_SEQUENTIAL,
+        EXECUTION_STRATEGY_CELL_DAG,
+    }:
+        raise GlobalCampaignError("execution.strategy is unsupported")
+    worker_count = _positive_int(
+        execution["worker_count"], field="execution.worker_count"
+    )
+    for field in ("training_batch_size_override", "evaluation_batch_size_override"):
+        override = execution[field]
+        if override is not None:
+            _positive_int(override, field=f"execution.{field}")
+    profile = execution["profile"]
+    if not isinstance(profile, str) or not _EXPERIMENT_NAME.fullmatch(
+        profile.replace("_", "-")
+    ):
+        raise GlobalCampaignError("execution.profile must be a descriptive name")
+    if strategy == EXECUTION_STRATEGY_SEQUENTIAL:
+        if (
+            worker_count != 1
+            or execution["training_batch_size_override"] is not None
+            or execution["evaluation_batch_size_override"] is not None
+        ):
+            raise GlobalCampaignError(
+                "sequential execution forbids worker and batch overrides"
+            )
+    elif worker_count > len(APPROVED_MODEL_VARIANTS) * EXPECTED_GLOBAL_CELL_COUNT:
+        raise GlobalCampaignError(
+            "cell-DAG execution cannot use more workers than campaign cells"
+        )
+    if profile == EXECUTION_PROFILE_H100 and execution != {
+        "profile": EXECUTION_PROFILE_H100,
+        "strategy": EXECUTION_STRATEGY_CELL_DAG,
+        "worker_count": 8,
+        "training_batch_size_override": 4096,
+        "evaluation_batch_size_override": 512,
+    }:
+        raise GlobalCampaignError("the H100 execution profile is immutable")
+    value["execution"] = execution
 
     data = _mapping(value.get("data"), field="data")
     _reject_unknown(
@@ -693,11 +772,26 @@ def validate_global_campaign_config(
 
 def model_plans(config: Mapping[str, Any]) -> tuple[ModelPlan, ...]:
     seed = int(config["seed"])
+    execution = config.get("execution", {})
+    training_batch_override = (
+        execution.get("training_batch_size_override")
+        if isinstance(execution, Mapping)
+        else None
+    )
+
+    def resolved_model(variant_id: str) -> dict[str, Any]:
+        model = _resolved_pilot_model(variant_id, seed)
+        if training_batch_override is None:
+            return model
+        training = _mapping(model.get("training"), field=f"{variant_id}.training")
+        training["batch_size"] = int(training_batch_override)
+        return {**model, "training": training}
+
     return tuple(
         ModelPlan(
             variant_id=str(row["id"]),
             experiment_name=str(row["experiment_name"]),
-            model=_resolved_pilot_model(str(row["id"]), seed),
+            model=resolved_model(str(row["id"])),
         )
         for row in config["campaign"]["models"]
     )
@@ -786,6 +880,10 @@ def partition_source_train(
         "selection_indices_sha256": _array_sha(selected),
         "fit_features_sha256": _array_sha(fit_features),
         "selection_features_sha256": _array_sha(selected_features),
+        # FM diagnostics use the shared semantic-array digest rather than the
+        # source-inventory digest above.  Persist both so a pruned cell can
+        # still bind its diagnostic query to these exact held-out rows.
+        "selection_features_fm_sha256": _array_sha256(selected_features),
         **(
             {"selection_target_sha256": _array_sha(selected_target)}
             if selected_target is not None
@@ -1358,6 +1456,7 @@ def _validate_training_attestation(
     checkpoint_sha256: Any,
 ) -> list[str]:
     errors: list[str] = []
+    training_config: dict[str, Any] | None = None
     required = {
         "schema_version",
         "model_family",
@@ -1416,12 +1515,15 @@ def _validate_training_attestation(
             or epochs != []
         ):
             errors.append("unavailable training history contains measurements")
+        if checkpoint_retention == CHECKPOINT_RETENTION_PRUNE_AFTER_EVALUATION:
+            errors.append("pruned checkpoint requires complete training history")
         return errors
     if status != "complete" or not isinstance(epochs, list) or not epochs:
         errors.append("training attestation history is invalid")
         return errors
     previous_epoch = 0
     validation_by_epoch: dict[int, float] = {}
+    history_rows_valid = True
     for row in epochs:
         if not isinstance(row, Mapping) or set(row) != {
             "epoch",
@@ -1430,6 +1532,7 @@ def _validate_training_attestation(
             "learning_rate",
         }:
             errors.append("training attestation epoch fields differ")
+            history_rows_valid = False
             continue
         epoch = row.get("epoch")
         if (
@@ -1438,6 +1541,7 @@ def _validate_training_attestation(
             or epoch <= previous_epoch
         ):
             errors.append("training attestation epochs do not strictly increase")
+            history_rows_valid = False
             continue
         previous_epoch = epoch
         numeric_valid = True
@@ -1450,6 +1554,7 @@ def _validate_training_attestation(
             ):
                 errors.append(f"training attestation {field} is not finite")
                 numeric_valid = False
+                history_rows_valid = False
         if numeric_valid:
             validation_by_epoch[epoch] = float(row["validation_loss"])
     best_epoch = history.get("best_epoch")
@@ -1465,6 +1570,147 @@ def _validate_training_attestation(
         errors.append("training attestation best history fields are invalid")
     elif float(best_loss) != validation_by_epoch[best_epoch]:
         errors.append("training attestation best loss differs from history")
+    elif history_rows_valid and len(validation_by_epoch) == len(epochs):
+        ordered_epochs = list(validation_by_epoch)
+        expected_best_epoch = min(
+            ordered_epochs, key=lambda epoch: validation_by_epoch[epoch]
+        )
+        expected_best_loss = validation_by_epoch[expected_best_epoch]
+        if best_epoch != expected_best_epoch or float(best_loss) != expected_best_loss:
+            errors.append(
+                "training attestation best epoch/loss is not the first strict minimum"
+            )
+
+        if training_config is not None:
+            epoch_budget = int(training_config["epochs"])
+            validation_interval = int(training_config["validation_interval"])
+            patience = training_config["early_stopping_patience"]
+            last_epoch = ordered_epochs[-1]
+            full_schedule = list(
+                range(validation_interval, epoch_budget + 1, validation_interval)
+            )
+            if not full_schedule or full_schedule[-1] != epoch_budget:
+                full_schedule.append(epoch_budget)
+            if last_epoch == epoch_budget:
+                if ordered_epochs != full_schedule:
+                    errors.append(
+                        "training attestation validation schedule differs from config"
+                    )
+            elif last_epoch > epoch_budget or patience is None:
+                errors.append(
+                    "training attestation termination is not justified by config"
+                )
+            else:
+                early_schedule = list(
+                    range(validation_interval, last_epoch + 1, validation_interval)
+                )
+                if ordered_epochs != early_schedule:
+                    errors.append(
+                        "training attestation early-stop schedule differs from config"
+                    )
+                stale_validations = (
+                    len(ordered_epochs) - ordered_epochs.index(expected_best_epoch) - 1
+                )
+                if stale_validations != int(patience):
+                    errors.append(
+                        "training attestation early stop does not match patience"
+                    )
+    return errors
+
+
+def _validate_affine_diagnostic_binding(
+    root: Path,
+    *,
+    fm: Mapping[str, Any],
+    model: Mapping[str, Any],
+    checkpoint_sha256: Any,
+    scales: npt.NDArray[np.float64],
+    selection_curve: npt.NDArray[np.float64],
+    partition: Mapping[str, Any],
+) -> list[str]:
+    """Bind a self-valid FM diagnostic subtree to this exact outer cell."""
+
+    errors: list[str] = []
+    directory = root / "fm_diagnostics"
+    try:
+        metadata = _load_json(directory / "metadata.json")
+        diagnostic_scales = np.ravel(
+            np.asarray(
+                _load_numeric_array(directory / "arrays" / "scales.npy", ndim=1),
+                dtype=np.float64,
+            )
+        )
+        diagnostic_target = np.asarray(
+            _load_numeric_array(directory / "arrays" / "target.npy", ndim=1),
+            dtype=np.float64,
+        )
+        diagnostic_full = np.asarray(
+            _load_numeric_array(directory / "arrays" / "full.npy", ndim=2),
+            dtype=np.float64,
+        )
+        diagnostic_response = np.asarray(
+            _load_numeric_array(directory / "arrays" / "response.npy", ndim=2),
+            dtype=np.float64,
+        )
+        diagnostic_correction = np.asarray(
+            _load_numeric_array(directory / "arrays" / "correction.npy", ndim=2),
+            dtype=np.float64,
+        )
+        outer_target = np.asarray(
+            _load_numeric_array(root / "train_selection_target.npy", ndim=1),
+            dtype=np.float64,
+        )
+        actual_manifest_sha = sha256_path(directory / "manifest.json")
+        actual_metadata_sha = sha256_path(directory / "metadata.json")
+        actual_summary_sha = sha256_path(directory / "summary.json")
+    except (GlobalCampaignError, OSError, ValueError) as exc:
+        return [f"cannot bind FM diagnostics to outer cell: {exc}"]
+
+    outer_curve_sha = _array_sha256(selection_curve)
+    expected_fm = {
+        "status": "completed_strict_v2",
+        "path": "fm_diagnostics",
+        "manifest_sha256": actual_manifest_sha,
+        "metadata_sha256": actual_metadata_sha,
+        "summary_sha256": actual_summary_sha,
+        "outer_selection_curve_sha256": outer_curve_sha,
+    }
+    if not _same_json(fm, expected_fm):
+        errors.append("FM diagnostic summary attestation does not recompute")
+    if metadata.get("checkpoint_sha256") != checkpoint_sha256:
+        errors.append("FM diagnostics are not bound to the outer checkpoint")
+    if (
+        metadata.get("outer_selection_curve_sha256") != outer_curve_sha
+        or fm.get("outer_selection_curve_sha256") != outer_curve_sha
+    ):
+        errors.append("FM diagnostics are not bound to the outer selection curve")
+    training = model.get("training")
+    diagnostics = model.get("diagnostics")
+    expected_variant = (
+        training.get("flow_variant_id") if isinstance(training, Mapping) else None
+    )
+    if metadata.get("variant_id") != expected_variant:
+        errors.append("FM diagnostic variant differs from the outer model")
+    if not isinstance(diagnostics, Mapping) or not _same_json(
+        metadata.get("config"), diagnostics
+    ):
+        errors.append("FM diagnostic config differs from the outer model")
+    if metadata.get("raw_query_sha256") != partition.get(
+        "selection_features_fm_sha256"
+    ):
+        errors.append("FM diagnostics are not bound to held-out selection rows")
+    if not np.array_equal(diagnostic_scales, scales):
+        errors.append("FM diagnostic scales differ from outer selection scales")
+    if not np.array_equal(diagnostic_target, outer_target):
+        errors.append("FM diagnostic target differs from outer selection target")
+    curve_error = _affine_outer_curve_consistency_error(
+        diagnostic_full=diagnostic_full,
+        diagnostic_response=diagnostic_response,
+        diagnostic_correction=diagnostic_correction,
+        outer_selection_curve=selection_curve,
+    )
+    if curve_error is not None:
+        errors.append(f"FM diagnostics differ from outer selection: {curve_error}")
     return errors
 
 
@@ -1919,6 +2165,17 @@ def validate_global_cell(
                 errors.append(f"cannot validate FM diagnostics: {type(exc).__name__}")
             else:
                 errors.extend(f"FM diagnostics: {error}" for error in diagnostic_errors)
+                errors.extend(
+                    _validate_affine_diagnostic_binding(
+                        root,
+                        fm=fm,
+                        model=model,
+                        checkpoint_sha256=summary_checkpoint_sha,
+                        scales=scales,
+                        selection_curve=curve,
+                        partition=(partition if isinstance(partition, Mapping) else {}),
+                    )
+                )
     elif family == "independent_affine_flow":
         if not isinstance(fm, Mapping) or fm.get("status") != (
             "not_applicable_no_lid_targets"
@@ -2154,7 +2411,7 @@ def _training_attestation(
     training_config = _canonical_training_config_record(
         model["training"], field="Hydra model training config"
     )
-    return {
+    attestation = {
         "schema_version": TRAINING_ATTESTATION_SCHEMA_VERSION,
         "model_family": str(model["family"]),
         "training_config_sha256": sha256_bytes(
@@ -2165,6 +2422,17 @@ def _training_attestation(
         "checkpoint_retention": retention_policy,
         "history": _training_history_attestation(trained),
     }
+    errors = _validate_training_attestation(
+        attestation,
+        model=model,
+        checkpoint_retention=retention_policy,
+        checkpoint_sha256=checkpoint_sha256,
+    )
+    if errors:
+        raise GlobalCampaignError(
+            f"refusing to attest inconsistent training evidence: {errors}"
+        )
+    return attestation
 
 
 def _model_readouts(model: Mapping[str, Any]) -> tuple[str, ...]:
@@ -2460,11 +2728,7 @@ def _run_cell(
             training=dict(payload),
         )
 
-    if checkpoint.is_file() and not progress.exists():
-        trained = load_checkpoint_fn(
-            checkpoint, device=str(model_plan.model["training"]["device"])
-        )
-    else:
+    if not (checkpoint.is_file() and not progress.exists()):
         _emit(
             callback,
             "cell.started",
@@ -2473,7 +2737,7 @@ def _run_cell(
             cell_id=cell_id,
             resumed=progress.is_file(),
         )
-        trained = _training_call(
+        _training_call(
             train_fn,
             family=str(model_plan.model["family"]),
             partition=partition,
@@ -2484,16 +2748,38 @@ def _run_cell(
         )
     if not checkpoint.is_file() or checkpoint.stat().st_size <= 0:
         raise GlobalCampaignError(f"trainer did not write checkpoint: {checkpoint}")
+    # Evaluation and the surviving attestation must come from a round-tripped
+    # checkpoint, never only from the trainer's in-memory return value.  Once
+    # pruning unlinks the file this loaded payload is the last opportunity to
+    # prove that optimizer history/config and evaluated weights are identical.
+    trained = load_checkpoint_fn(
+        checkpoint, device=str(model_plan.model["training"]["device"])
+    )
     trained_config = getattr(trained, "config", None)
-    if trained_config is not None:
+    if trained_config is None:
+        if checkpoint_retention == CHECKPOINT_RETENTION_PRUNE_AFTER_EVALUATION:
+            raise GlobalCampaignError(
+                "pruned checkpoint round-trip lacks its training config"
+            )
+    else:
         _require_matching_training_configs(trained_config, model_plan.model["training"])
     declared_checkpoint_sha = getattr(trained, "checkpoint_sha256", None)
     checkpoint_sha = sha256_path(checkpoint)
-    if (
-        declared_checkpoint_sha is not None
-        and declared_checkpoint_sha != checkpoint_sha
-    ):
+    if declared_checkpoint_sha is None:
+        if checkpoint_retention == CHECKPOINT_RETENTION_PRUNE_AFTER_EVALUATION:
+            raise GlobalCampaignError(
+                "pruned checkpoint round-trip lacks its checkpoint SHA"
+            )
+    elif declared_checkpoint_sha != checkpoint_sha:
         raise GlobalCampaignError("trained checkpoint SHA differs from checkpoint file")
+    declared_checkpoint_path = getattr(trained, "checkpoint_path", None)
+    if checkpoint_retention == CHECKPOINT_RETENTION_PRUNE_AFTER_EVALUATION and (
+        declared_checkpoint_path is None
+        or Path(declared_checkpoint_path).resolve() != checkpoint.resolve()
+    ):
+        raise GlobalCampaignError(
+            "pruned checkpoint round-trip lacks its exact checkpoint path"
+        )
     training_attestation = _training_attestation(
         trained,
         checkpoint=checkpoint,
@@ -2507,7 +2793,17 @@ def _run_cell(
     scales = np.ascontiguousarray(
         np.asarray(model_plan.model["scales"], dtype=np.float64)
     )
-    batch_size = int(config["campaign"]["evaluation"]["batch_size"])
+    execution = config.get("execution", {})
+    evaluation_batch_override = (
+        execution.get("evaluation_batch_size_override")
+        if isinstance(execution, Mapping)
+        else None
+    )
+    batch_size = int(
+        config["campaign"]["evaluation"]["batch_size"]
+        if evaluation_batch_override is None
+        else evaluation_batch_override
+    )
     curve = _prediction_curve(
         predict_fn,
         trained,
@@ -4180,6 +4476,10 @@ def run_global_campaign(
     """Execute all cells sequentially in this process and seal one campaign."""
 
     config = validate_global_campaign_config(hydra_config)
+    if config["execution"]["strategy"] != EXECUTION_STRATEGY_SEQUENTIAL:
+        raise GlobalCampaignError(
+            "cell_dag_pool campaigns must use experiments.global_parallel"
+        )
     project_root = (repository_root() if root is None else Path(root)).resolve()
     configured_output = _safe_path(config["output_root"], field="output_root")
     selected_output = configured_output if output_root is None else Path(output_root)

@@ -205,7 +205,12 @@ def _tiny_plans(config: dict[str, Any]) -> tuple[ModelPlan, ...]:
         "selection_prefer": "smaller",
         "derivative_backend": "exact",
         "trace_probes": 0,
-        "training": {"device": "cpu", "seed": 0},
+        "training": {
+            "device": "cpu",
+            "seed": 0,
+            "epochs": 1,
+            "early_stopping_patience": None,
+        },
         "scales": [0.1, 0.2, 0.4],
     }
     return tuple(
@@ -294,8 +299,15 @@ class _FakeTraining:
             progress.write_bytes(b"strict-progress-fixture")
             self.fail_call = None
             raise RuntimeError("fixture interruption")
-        Path(checkpoint_path).write_bytes(
-            f"checkpoint:{self.calls}:{float(np.asarray(train).sum())}".encode()
+        checkpoint_record = {
+            "call": self.calls,
+            "train_sum": float(np.asarray(train).sum()),
+            "config": global_campaign._canonical_training_config_record(
+                config, field="fake trainer config"
+            ),
+        }
+        Path(checkpoint_path).write_text(
+            json.dumps(checkpoint_record, sort_keys=True), encoding="utf-8"
         )
         progress.unlink(missing_ok=True)
         return SimpleNamespace(
@@ -319,9 +331,11 @@ class _FakeTraining:
 
 def _load_checkpoint(path, *, device):
     del device
+    checkpoint_record = json.loads(Path(path).read_text(encoding="utf-8"))
     return SimpleNamespace(
         checkpoint_path=Path(path),
         checkpoint_sha256=sha256_path(Path(path)),
+        config=checkpoint_record["config"],
         history=(
             {
                 "epoch": 1,
@@ -358,6 +372,217 @@ def _predict(
     )
     values = np.asarray(query)
     return values[:, 0] + float(scale)
+
+
+def test_pruning_rejects_missing_or_nonminimal_training_history(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"training-attestation-fixture")
+    checkpoint_sha = sha256_path(checkpoint)
+    model = _tiny_plans(
+        {
+            "campaign": {
+                "models": [{"id": "diffusion", "experiment_name": "fixture-diffusion"}]
+            }
+        }
+    )[0].model
+
+    historyless = SimpleNamespace(history=None)
+    with pytest.raises(GlobalCampaignError, match="complete training history"):
+        global_campaign._training_attestation(
+            historyless,
+            checkpoint=checkpoint,
+            checkpoint_sha256=checkpoint_sha,
+            retention_policy="prune_after_cell_evaluation",
+            model=model,
+        )
+
+    nonminimal = SimpleNamespace(
+        history=(
+            {
+                "epoch": 1,
+                "train_loss": 0.5,
+                "validation_loss": 1.0,
+                "learning_rate": 1.0e-3,
+            },
+            {
+                "epoch": 2,
+                "train_loss": 0.4,
+                "validation_loss": 9.0,
+                "learning_rate": 1.0e-3,
+            },
+        ),
+        best_epoch=2,
+        best_validation_loss=9.0,
+    )
+    nonminimal_model = {
+        **model,
+        "training": {
+            **model["training"],
+            "epochs": 2,
+            "early_stopping_patience": None,
+        },
+    }
+    with pytest.raises(GlobalCampaignError, match="first strict minimum"):
+        global_campaign._training_attestation(
+            nonminimal,
+            checkpoint=checkpoint,
+            checkpoint_sha256=checkpoint_sha,
+            retention_policy="prune_after_cell_evaluation",
+            model=nonminimal_model,
+        )
+
+    valid = SimpleNamespace(
+        history=nonminimal.history,
+        best_epoch=1,
+        best_validation_loss=1.0,
+    )
+    attestation = global_campaign._training_attestation(
+        valid,
+        checkpoint=checkpoint,
+        checkpoint_sha256=checkpoint_sha,
+        retention_policy="prune_after_cell_evaluation",
+        model=nonminimal_model,
+    )
+    attestation["history"]["best_epoch"] = 2
+    attestation["history"]["best_validation_loss"] = 9.0
+    errors = global_campaign._validate_training_attestation(
+        attestation,
+        model=nonminimal_model,
+        checkpoint_retention="prune_after_cell_evaluation",
+        checkpoint_sha256=checkpoint_sha,
+    )
+    assert any("first strict minimum" in error for error in errors)
+
+
+def test_pruned_affine_cell_rejects_resealed_cross_checkpoint_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from experiments import fm_diagnostics
+
+    monkeypatch.setattr(fm_diagnostics, "validate_fm_diagnostics", lambda path: [])
+    config = validate_global_campaign_config(
+        compose_global_campaign_config(("logging.backend=none",))
+    )
+    cell = load_campaign_inventory(config, PROJECT_ROOT)[13]
+    assert cell.target_policy == "known_lid"
+    data = _cell_loader_factory({"value": 1})(cell, config, PROJECT_ROOT)
+    model = global_campaign._resolved_pilot_model("direct_rectified_flow", 0)
+    model["training"] = {
+        **model["training"],
+        "device": "cpu",
+        "epochs": 1,
+        "early_stopping_patience": None,
+    }
+    plan = ModelPlan(
+        variant_id="direct_rectified_flow",
+        experiment_name="affine-cross-binding-fixture",
+        model=model,
+    )
+    trainer = _FakeTraining()
+
+    def fake_diagnostics(
+        output_dir,
+        *,
+        trained,
+        partition,
+        scales,
+        selection_curve,
+        model,
+    ):
+        output = Path(output_dir)
+        arrays = output / "arrays"
+        arrays.mkdir(parents=True)
+        response = np.zeros_like(selection_curve)
+        correction = np.asarray(selection_curve)
+        for name, value in {
+            "scales": scales,
+            "target": partition.selection_target,
+            "full": selection_curve,
+            "response": response,
+            "correction": correction,
+        }.items():
+            global_campaign._save_npy(arrays / f"{name}.npy", value)
+        metadata = {
+            "checkpoint_sha256": trained.checkpoint_sha256,
+            "outer_selection_curve_sha256": global_campaign._array_sha256(
+                selection_curve
+            ),
+            "raw_query_sha256": global_campaign._array_sha256(
+                partition.selection_features
+            ),
+            "variant_id": model["training"]["flow_variant_id"],
+            "config": model["diagnostics"],
+        }
+        global_campaign._write_json(output / "metadata.json", metadata)
+        global_campaign._write_json(output / "summary.json", {"fixture": True})
+        global_campaign._write_json(output / "manifest.json", {"fixture": True})
+        return {
+            "status": "completed_strict_v2",
+            "path": "fm_diagnostics",
+            "manifest_sha256": sha256_path(output / "manifest.json"),
+            "metadata_sha256": sha256_path(output / "metadata.json"),
+            "summary_sha256": sha256_path(output / "summary.json"),
+            "outer_selection_curve_sha256": global_campaign._array_sha256(
+                selection_curve
+            ),
+        }
+
+    final_dir, _ = global_campaign._run_cell(
+        campaign_root=tmp_path / "campaign",
+        campaign_id=str(config["campaign"]["campaign_id"]),
+        campaign_config_sha="1" * 64,
+        source_sha=SOURCE_SHA,
+        config=config,
+        model_plan=plan,
+        cell=cell,
+        data=data,
+        reference_summary=None,
+        train_fn=trainer,
+        predict_fn=_predict,
+        load_checkpoint_fn=_load_checkpoint,
+        affine_diagnostics_fn=fake_diagnostics,
+        callback=None,
+    )
+    assert global_campaign.validate_global_cell(final_dir) == []
+
+    diagnostic_dir = final_dir / "fm_diagnostics"
+    metadata = global_campaign._load_json(diagnostic_dir / "metadata.json")
+    metadata["checkpoint_sha256"] = "f" * 64
+    global_campaign._write_json(diagnostic_dir / "metadata.json", metadata)
+    summary = global_campaign._load_json(final_dir / "summary.json")
+    summary["fm_diagnostics"]["metadata_sha256"] = sha256_path(
+        diagnostic_dir / "metadata.json"
+    )
+    summary["fm_diagnostics"]["manifest_sha256"] = sha256_path(
+        diagnostic_dir / "manifest.json"
+    )
+    global_campaign._write_json(final_dir / "summary.json", summary)
+    manifest = global_campaign._load_json(final_dir / "manifest.json")
+    manifest["outputs"] = global_campaign._output_inventory(
+        final_dir, excluded_relative_paths=frozenset({"checkpoint.pt"})
+    )
+    global_campaign._write_json(final_dir / "manifest.json", manifest)
+
+    errors = global_campaign.validate_global_cell(final_dir)
+    assert "FM diagnostics are not bound to the outer checkpoint" in errors
+
+    metadata["checkpoint_sha256"] = summary["checkpoint_sha256"]
+    metadata["outer_selection_curve_sha256"] = "e" * 64
+    global_campaign._write_json(diagnostic_dir / "metadata.json", metadata)
+    summary["fm_diagnostics"]["metadata_sha256"] = sha256_path(
+        diagnostic_dir / "metadata.json"
+    )
+    summary["fm_diagnostics"]["outer_selection_curve_sha256"] = "e" * 64
+    global_campaign._write_json(final_dir / "summary.json", summary)
+    manifest["outputs"] = global_campaign._output_inventory(
+        final_dir, excluded_relative_paths=frozenset({"checkpoint.pt"})
+    )
+    global_campaign._write_json(final_dir / "manifest.json", manifest)
+
+    errors = global_campaign.validate_global_cell(final_dir)
+    assert "FM diagnostics are not bound to the outer selection curve" in errors
 
 
 def _logger_factory(events, closes):
