@@ -51,6 +51,7 @@ NF_ABLATION_SCHEMA_VERSION = 1
 NF_ABLATION_ID = "nf-quality-readout-optimizer-architecture-v1"
 WORKER_COUNT = 8
 PARTITION_SEED = 0
+DETERMINISTIC_CUBLAS_WORKSPACE_CONFIG = ":4096:8"
 READOUTS = ("autograd", "symmetric_fd", "ols3", "ols5", "ols9")
 PAPER_PARITY_READOUT = "global_ols9"
 FINITE_DIFFERENCE_LOG_STEP = 0.01
@@ -2179,6 +2180,9 @@ def _ablation_identity_record(
         "candidates": [_plain(value) for value in STAGE1_CANDIDATES],
         "readouts": list(READOUTS),
         "paper_parity_readout": PAPER_PARITY_READOUT,
+        "deterministic_cublas_workspace_config": (
+            DETERMINISTIC_CUBLAS_WORKSPACE_CONFIG
+        ),
         "finite_difference_log_step": FINITE_DIFFERENCE_LOG_STEP,
         "ols_log_step": OLS_LOG_STEP,
         "selection_scales": list(SELECTION_SCALES),
@@ -2493,6 +2497,20 @@ def _visible_device_tokens(
             f"expected exactly {worker_count} unique CUDA_VISIBLE_DEVICES tokens"
         )
     return tokens
+
+
+def _configure_deterministic_cublas(*, require_cuda: bool) -> None:
+    """Freeze the CUDA workspace contract before any worker imports PyTorch."""
+
+    if not require_cuda:
+        return
+    configured = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+    if configured not in {None, DETERMINISTIC_CUBLAS_WORKSPACE_CONFIG}:
+        raise NFAblationError(
+            "CUBLAS_WORKSPACE_CONFIG differs from the deterministic campaign "
+            f"contract {DETERMINISTIC_CUBLAS_WORKSPACE_CONFIG!r}"
+        )
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = DETERMINISTIC_CUBLAS_WORKSPACE_CONFIG
 
 
 def _require_h100_device_name(value: Any, *, field: str) -> str:
@@ -3527,6 +3545,7 @@ def run_nf_ablation_campaign(
         raise NFAblationError(
             f"production NF ablation requires exactly {WORKER_COUNT} GPU workers"
         )
+    _configure_deterministic_cublas(require_cuda=require_cuda)
     checkout = (
         campaign.repository_root()
         if project_root is None

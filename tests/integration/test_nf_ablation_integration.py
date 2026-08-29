@@ -797,6 +797,25 @@ def test_coordinator_production_worker_preflight_fails_before_source_access(
     )
 
 
+def test_production_configures_exact_deterministic_cublas_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CUBLAS_WORKSPACE_CONFIG", raising=False)
+    nf_ablation._configure_deterministic_cublas(require_cuda=True)
+    assert (
+        os.environ["CUBLAS_WORKSPACE_CONFIG"]
+        == nf_ablation.DETERMINISTIC_CUBLAS_WORKSPACE_CONFIG
+    )
+
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+    with pytest.raises(nf_ablation.NFAblationError, match="differs"):
+        nf_ablation._configure_deterministic_cublas(require_cuda=True)
+
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", "cpu-sentinel")
+    nf_ablation._configure_deterministic_cublas(require_cuda=False)
+    assert os.environ["CUBLAS_WORKSPACE_CONFIG"] == "cpu-sentinel"
+
+
 def test_nvidia_smi_preflight_uses_exact_fields_and_parses_one_gpu(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
