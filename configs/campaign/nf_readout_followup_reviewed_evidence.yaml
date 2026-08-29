@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "source_campaign_identity": "b37fc13d34fec456905cbdfdbb4245df117c21f58985c550f91c87b9d4c9813f",
+  "source_identity_sha256": "e23fe76648176fb3da13e88ed86702c2495b7dfde2889d20094c3bc27e166d59",
+  "source_baseline_campaign_identity": "a80ddd279bb32d66664994fcd1e0e9c781030064d22f9af8f45d6b96e7f584bd",
+  "source_baseline_unified_sha256": "df2140318020663875a0bdd6384d18954473dede44799cf2bf4278aabfdc36ef",
+  "stage1_ledger_sha256": "50d4edd5a7f516dd5e648819b442b073eed97f017851380b1c2b19bc554eaed1",
+  "stage1_scores_sha256": "7ae1b6e81077ed89fd9dd1b157a6350e346b7f03f31f29392962e42bc7d356b6",
+  "promotions_sha256": "9d836be49dbaf24f2980d98d22d7229b696be601caf5a51cadd3b618da9fd727",
+  "stage2_ledger_sha256": "6f798f15dcea095462c0daa1e6aa25f57085f6f70281919505d9c042b0b414b1",
+  "stage2_scores_sha256": "f4763c57efea3338bbd9cce8805e3dbeed68fdc258be60e821a5b320f4da82c0"
+}

@@ -6,7 +6,9 @@ import csv
 import json
 import math
 import os
+import shutil
 import threading
+from dataclasses import replace
 from functools import wraps
 from pathlib import Path
 from types import SimpleNamespace
@@ -359,6 +361,110 @@ def test_conditional_cell_seals_prunes_and_recovers_post_prune_window(
     assert recovered["reused"] is True
     assert Path(recovered["directory"]) == final_dir
     assert final_dir.is_dir() and not work_dir.exists()
+
+
+def test_conditional_cell_evaluates_multiple_frozen_test_readouts_once(
+    tmp_path: Path,
+) -> None:
+    task = replace(
+        _task(tmp_path),
+        evaluate_test=True,
+        test_readout=("autograd", "ols5"),
+    )
+    data = _cell_data(task.expected_input_sha256)
+
+    result = nf_ablation._run_cell_task(task, _dependencies(data=data))
+
+    sealed = Path(result["directory"])
+    assert sorted(path.name for path in sealed.glob("test_prediction__*.npy")) == [
+        "test_prediction__autograd.npy",
+        "test_prediction__ols5.npy",
+    ]
+    assert len(list(sealed.glob("validation_prediction__*.npy"))) == len(
+        nf_ablation.READOUTS
+    )
+    assert not list(sealed.rglob("checkpoint.pt"))
+    assert not list(sealed.rglob("training_progress.pt"))
+
+    summary = json.loads((sealed / "summary.json").read_text(encoding="utf-8"))
+    assert set(summary["readouts"]["autograd"]["metrics"]) == {
+        "validation",
+        "test",
+    }
+    assert set(summary["readouts"]["ols5"]["metrics"]) == {
+        "validation",
+        "test",
+    }
+    for readout in set(nf_ablation.READOUTS) - {"autograd", "ols5"}:
+        assert set(summary["readouts"][readout]["metrics"]) == {"validation"}
+
+    scalar_task = replace(task, test_readout="ols5")
+    scalar_result = nf_ablation._run_cell_task(scalar_task, _dependencies(data=data))
+    scalar_sealed = Path(scalar_result["directory"])
+    scalar_identity = nf_ablation._task_identity(
+        scalar_task,
+        nf_ablation._candidate_model(
+            nf_ablation.candidate_by_id(scalar_task.candidate_id),
+            seed=scalar_task.seed,
+        ),
+    )
+    assert nf_ablation._validate_cell(scalar_sealed, scalar_identity) == []
+    assert [path.name for path in scalar_sealed.glob("test_prediction__*.npy")] == [
+        "test_prediction__ols5.npy"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("corruption", "expected_error"),
+    (
+        ("missing_frozen_prediction", "test prediction coverage differs"),
+        ("extra_unfrozen_prediction", "test prediction coverage differs"),
+        ("missing_frozen_metric", "summary metric split coverage differs for ols5"),
+    ),
+)
+def test_conditional_cell_rejects_semantically_corrupt_seal_on_resume(
+    tmp_path: Path,
+    corruption: str,
+    expected_error: str,
+) -> None:
+    task = replace(
+        _task(tmp_path),
+        evaluate_test=True,
+        test_readout=("autograd", "ols5"),
+    )
+    data = _cell_data(task.expected_input_sha256)
+    result = nf_ablation._run_cell_task(task, _dependencies(data=data))
+    sealed = Path(result["directory"])
+
+    if corruption == "missing_frozen_prediction":
+        (sealed / "test_prediction__ols5.npy").unlink()
+    elif corruption == "extra_unfrozen_prediction":
+        shutil.copyfile(
+            sealed / "test_prediction__ols5.npy",
+            sealed / "test_prediction__ols9.npy",
+        )
+    elif corruption == "missing_frozen_metric":
+        summary_path = sealed / "summary.json"
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        del summary["readouts"]["ols5"]["metrics"]["test"]
+        nf_ablation._write_json(summary_path, summary)
+    else:  # pragma: no cover - the parametrization is closed above
+        raise AssertionError(corruption)
+
+    manifest_path = sealed / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["outputs"] = nf_ablation._manifest_outputs(sealed)
+    nf_ablation._write_json(manifest_path, manifest)
+    identity = nf_ablation._task_identity(
+        task,
+        nf_ablation._candidate_model(
+            nf_ablation.candidate_by_id(task.candidate_id), seed=task.seed
+        ),
+    )
+
+    assert expected_error in nf_ablation._validate_cell(sealed, identity)
+    with pytest.raises(nf_ablation.NFAblationError, match="refusing to reuse invalid"):
+        nf_ablation._run_cell_task(task, _bomb_dependencies())
 
 
 def test_p0_resumes_independent_components_and_prunes_each_checkpoint(

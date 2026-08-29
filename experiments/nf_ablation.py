@@ -246,7 +246,10 @@ class NFCellTask:
     evaluate_test: bool
     expected_input_sha256: str
     source_record: Mapping[str, Any]
-    test_readout: str | None = None
+    # A tuple is used only by the explicit readout-only follow-up.  Keeping a
+    # scalar for the original ablation preserves the scientific identities of
+    # every already sealed stage-1/stage-2 cell.
+    test_readout: str | tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -955,21 +958,110 @@ def _validate_cell(directory: Path, identity: Mapping[str, Any]) -> list[str]:
         errors.append("summary seed differs")
     if summary.get("input_sha256") != identity.get("input_sha256"):
         errors.append("summary input differs")
+    expected_splits = identity.get("evaluation_splits")
+    if expected_splits not in (["validation"], ["validation", "test"]):
+        errors.append("identity evaluation splits are invalid")
+        expected_splits = []
+    if summary.get("evaluation_splits") != expected_splits:
+        errors.append("summary evaluation splits differ")
+
+    raw_test_readout = identity.get("test_readout")
+    if raw_test_readout is None:
+        frozen_test_readouts: tuple[str, ...] = ()
+    elif isinstance(raw_test_readout, str):
+        frozen_test_readouts = (raw_test_readout,)
+    elif isinstance(raw_test_readout, Sequence):
+        frozen_test_readouts = tuple(str(value) for value in raw_test_readout)
+    else:
+        errors.append("identity frozen test readout set is invalid")
+        frozen_test_readouts = ()
+    if len(set(frozen_test_readouts)) != len(frozen_test_readouts):
+        errors.append("identity frozen test readout set contains duplicates")
+    if bool(frozen_test_readouts) != (expected_splits == ["validation", "test"]):
+        errors.append("identity test split/readout contract differs")
+
+    try:
+        candidate = candidate_by_id(str(identity.get("candidate_id")))
+    except NFAblationError:
+        errors.append("identity candidate is invalid")
+        expected_readouts: set[str] = set()
+    else:
+        expected_readouts = (
+            {PAPER_PARITY_READOUT}
+            if candidate.independent_fixed_epsilon
+            else set(READOUTS)
+        )
+    if not set(frozen_test_readouts) <= expected_readouts:
+        errors.append("identity frozen test readout is invalid for the candidate")
+
+    summary_readouts = summary.get("readouts")
+    if not isinstance(summary_readouts, Mapping):
+        errors.append("summary readouts are missing")
+    elif set(summary_readouts) != expected_readouts:
+        errors.append("summary readout coverage differs")
+    else:
+        frozen = set(frozen_test_readouts)
+        for readout in sorted(expected_readouts):
+            readout_summary = summary_readouts.get(readout)
+            metrics = (
+                readout_summary.get("metrics")
+                if isinstance(readout_summary, Mapping)
+                else None
+            )
+            expected_metric_splits = {"validation"}
+            if readout in frozen:
+                expected_metric_splits.add("test")
+            if (
+                not isinstance(metrics, Mapping)
+                or set(metrics) != expected_metric_splits
+            ):
+                errors.append(f"summary metric split coverage differs for {readout}")
+
+    expected_validation_predictions = {
+        f"validation_prediction__{readout}.npy" for readout in expected_readouts
+    }
+    actual_validation_predictions = {
+        path.name for path in directory.glob("validation_prediction__*.npy")
+    }
+    if actual_validation_predictions != expected_validation_predictions:
+        errors.append("validation prediction coverage differs")
+    expected_test_predictions = {
+        f"test_prediction__{readout}.npy" for readout in frozen_test_readouts
+    }
+    actual_test_predictions = {
+        path.name for path in directory.glob("test_prediction__*.npy")
+    }
+    if actual_test_predictions != expected_test_predictions:
+        errors.append("test prediction coverage differs")
+
     outputs = manifest.get("outputs")
     if not isinstance(outputs, list):
         errors.append("manifest outputs are missing")
     else:
+        declared_outputs: set[str] = set()
         for row in outputs:
             try:
-                path = directory / str(row["path"])
+                relative = str(row["path"])
+                path = (directory / relative).resolve()
+                path.relative_to(directory.resolve())
                 if (
-                    not path.is_file()
+                    relative in declared_outputs
+                    or not path.is_file()
                     or path.stat().st_size != int(row["size"])
                     or _sha256_path(path) != row["sha256"]
                 ):
-                    errors.append(f"output differs: {row.get('path')}")
+                    errors.append(f"output differs: {relative}")
+                declared_outputs.add(relative)
             except (KeyError, OSError, TypeError, ValueError):
                 errors.append("manifest output row is malformed")
+        actual_outputs = {
+            path.relative_to(directory).as_posix()
+            for path in directory.rglob("*")
+            if path.is_file()
+            and path.relative_to(directory).as_posix() != "manifest.json"
+        }
+        if declared_outputs != actual_outputs:
+            errors.append("manifest output coverage differs")
     if list(directory.rglob("checkpoint.pt")) or list(
         directory.rglob("training_progress.pt")
     ):
@@ -1405,7 +1497,12 @@ def _run_conditional_cell(
         ):
             if split == "test" and not task.evaluate_test:
                 continue
-            if split == "test" and task.test_readout != readout:
+            frozen_test_readouts = (
+                (task.test_readout,)
+                if isinstance(task.test_readout, str)
+                else tuple(task.test_readout or ())
+            )
+            if split == "test" and readout not in frozen_test_readouts:
                 continue
             cache_key = (split, selected_index)
             evaluation = split_prediction_cache.get(cache_key)
@@ -2246,15 +2343,25 @@ def _make_cell_task(
     candidate_id: str,
     seed: int,
     evaluate_test: bool,
-    test_readout: str | None = None,
+    test_readout: str | Sequence[str] | None = None,
 ) -> NFCellTask:
     candidate = candidate_by_id(candidate_id)
     allowed_test_readouts = (
         {PAPER_PARITY_READOUT} if candidate.independent_fixed_epsilon else set(READOUTS)
     )
-    if evaluate_test != (test_readout is not None):
-        raise NFAblationError("test evaluation requires exactly one frozen readout")
-    if test_readout is not None and test_readout not in allowed_test_readouts:
+    if isinstance(test_readout, str) or test_readout is None:
+        frozen_test_readouts = () if test_readout is None else (test_readout,)
+        normalized_test_readout: str | tuple[str, ...] | None = test_readout
+    else:
+        frozen_test_readouts = tuple(str(value) for value in test_readout)
+        normalized_test_readout = frozen_test_readouts
+    if not frozen_test_readouts and test_readout is not None:
+        raise NFAblationError("frozen test readout set must not be empty")
+    if len(set(frozen_test_readouts)) != len(frozen_test_readouts):
+        raise NFAblationError("frozen test readout set contains duplicates")
+    if evaluate_test != bool(frozen_test_readouts):
+        raise NFAblationError("test evaluation requires a non-empty frozen readout set")
+    if not set(frozen_test_readouts) <= allowed_test_readouts:
         raise NFAblationError(
             f"invalid frozen test readout {test_readout!r} for {candidate_id}"
         )
@@ -2274,7 +2381,7 @@ def _make_cell_task(
         evaluate_test=evaluate_test,
         expected_input_sha256=input_sha,
         source_record=source_record,
-        test_readout=test_readout,
+        test_readout=normalized_test_readout,
     )
 
 
@@ -2290,7 +2397,7 @@ def _task_descriptor(task: NFCellTask) -> dict[str, Any]:
         "seed": task.seed,
         "cell_key": task.cell.key,
         "evaluate_test": task.evaluate_test,
-        "test_readout": task.test_readout,
+        "test_readout": _plain(task.test_readout),
     }
 
 
