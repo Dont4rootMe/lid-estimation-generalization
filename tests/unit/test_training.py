@@ -36,6 +36,8 @@ from models.training import (
     TrainingResult,
     load_checkpoint,
     predict_lid,
+    predict_nf_log_likelihood,
+    predict_nf_readouts,
     train_model,
 )
 
@@ -399,6 +401,57 @@ def test_scale_conditioned_nf_trains_loads_and_predicts_exact_fixed_likelihood(
     )
     assert lid.shape == (5,)
     assert np.isfinite(lid).all()
+    readouts = predict_nf_readouts(
+        loaded,
+        validation[:5],
+        0.2,
+        finite_difference_log_step=0.01,
+        ols_log_step=0.05,
+        batch_size=2,
+    )
+    assert readouts.finite_difference_epsilons.shape == (2,)
+    assert readouts.finite_difference_log_likelihood.shape == (5, 2)
+    assert readouts.ols_epsilons.shape == (9,)
+    assert readouts.ols_log_likelihood.shape == (5, 9)
+    assert set(readouts.lid_by_readout) == {
+        "autograd",
+        "symmetric_fd",
+        "ols3",
+        "ols5",
+        "ols9",
+    }
+    for prediction in readouts.lid_by_readout.values():
+        assert prediction.shape == (5,)
+        assert np.isfinite(prediction).all()
+    np.testing.assert_array_equal(readouts.lid_autograd, lid)
+
+    unbatched = predict_nf_readouts(
+        loaded,
+        validation[:5],
+        0.2,
+        finite_difference_log_step=0.01,
+        ols_log_step=0.05,
+        batch_size=5,
+    )
+    np.testing.assert_array_equal(
+        unbatched.finite_difference_log_likelihood,
+        readouts.finite_difference_log_likelihood,
+    )
+    np.testing.assert_array_equal(
+        unbatched.ols_log_likelihood,
+        readouts.ols_log_likelihood,
+    )
+    for name, prediction in readouts.lid_by_readout.items():
+        np.testing.assert_array_equal(unbatched.lid_by_readout[name], prediction)
+
+    with pytest.raises(ValueError, match="outside.*training interval"):
+        predict_nf_readouts(
+            loaded,
+            validation[:2],
+            0.1,
+            finite_difference_log_step=0.01,
+            ols_log_step=0.05,
+        )
 
 
 def test_scale_conditioned_nf_requires_complete_explicit_config() -> None:
@@ -412,6 +465,79 @@ def test_scale_conditioned_nf_requires_complete_explicit_config() -> None:
         )
     with pytest.raises(ValueError, match="dropout.*exactly 0"):
         replace(_tiny_nf_config(), dropout=0.1)
+
+
+def test_fixed_epsilon_nf_training_and_checkpoint_round_trip(tmp_path: Path) -> None:
+    rng = np.random.default_rng(541)
+    train = rng.normal(size=(20, 3)).astype(np.float32)
+    validation = rng.normal(size=(8, 3)).astype(np.float32)
+    fixed_epsilon = 0.2
+    config = replace(
+        _tiny_nf_config(seed=19),
+        epochs=1,
+        epsilon_min=fixed_epsilon,
+        epsilon_max=fixed_epsilon,
+    )
+    assert TrainingConfig.from_mapping(config.to_dict()) == config
+    checkpoint = tmp_path / "fixed-epsilon-nf.ckpt"
+
+    trained = train_model(
+        "scale_conditioned_nf",
+        train,
+        validation,
+        config,
+        checkpoint,
+    )
+    assert trained.config.epsilon_min == fixed_epsilon
+    assert trained.config.epsilon_max == fixed_epsilon
+    assert trained.model_contract == {
+        **dict(NF_DENSITY_CONTRACT),
+        "epsilon_min": fixed_epsilon,
+        "epsilon_max": fixed_epsilon,
+    }
+
+    loaded = load_checkpoint(checkpoint)
+    assert loaded.config == config
+    assert loaded.model_contract == trained.model_contract
+    for name, value in trained.model.state_dict().items():
+        torch.testing.assert_close(value.cpu(), loaded.model.state_dict()[name].cpu())
+    prediction = predict_lid(
+        loaded,
+        validation[:3],
+        fixed_epsilon,
+        readout="fixed_likelihood",
+        divergence_backend="exact",
+        trace_probes=0,
+    )
+    assert prediction.shape == (3,)
+    assert np.isfinite(prediction).all()
+    likelihood = predict_nf_log_likelihood(
+        loaded,
+        validation[:3],
+        fixed_epsilon,
+        batch_size=2,
+    )
+    normalized = (
+        torch.as_tensor(validation[:3]) - loaded.normalization_mean.reshape(1, -1)
+    ) / loaded.normalization_scale
+    with torch.no_grad():
+        expected_likelihood = loaded.model.log_prob(normalized, fixed_epsilon).numpy()
+    np.testing.assert_array_equal(likelihood, expected_likelihood)
+    with pytest.raises(ValueError, match="outside.*training interval"):
+        predict_lid(
+            loaded,
+            validation[:2],
+            fixed_epsilon * 1.01,
+            readout="fixed_likelihood",
+            divergence_backend="exact",
+            trace_probes=0,
+        )
+    with pytest.raises(ValueError, match="outside.*training interval"):
+        predict_nf_log_likelihood(
+            loaded,
+            validation[:2],
+            fixed_epsilon * 1.01,
+        )
 
 
 def test_scale_conditioned_nf_predictor_rejects_wrong_readout_contract(

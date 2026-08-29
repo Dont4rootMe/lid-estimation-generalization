@@ -64,6 +64,8 @@ from models.normalizing_flow import (
     ScaleConditionedRealNVP,
     conditional_smoothed_nll,
     fixed_point_lid,
+    fixed_point_likelihood_readouts,
+    fixed_point_log_likelihood_curve,
 )
 from models.readouts import (
     diffusion_flipd,
@@ -439,8 +441,12 @@ def _nf_architecture_from_training_config(
     for name in ("epsilon_min", "epsilon_max"):
         if isinstance(fields[name], bool) or not isinstance(fields[name], (int, float)):
             raise TypeError(f"{name} must be numeric")
-    if not 0.0 < epsilon_min < epsilon_max:
-        raise ValueError("epsilon bounds must satisfy 0 < epsilon_min < epsilon_max")
+    if not (
+        math.isfinite(epsilon_min)
+        and math.isfinite(epsilon_max)
+        and 0.0 < epsilon_min <= epsilon_max
+    ):
+        raise ValueError("epsilon bounds must satisfy 0 < epsilon_min <= epsilon_max")
     if config.dropout != 0.0:
         raise ValueError(
             "scale-conditioned exact likelihood requires dropout to be exactly 0"
@@ -503,6 +509,36 @@ class FieldPrediction:
     divergence: npt.NDArray[np.float64]
     evaluation_point: npt.NDArray[np.float64]
     condition: float
+
+
+@dataclass(frozen=True)
+class NFLikelihoodReadoutPrediction:
+    """All fixed-point NF likelihood readouts at one declared epsilon."""
+
+    epsilon: float
+    finite_difference_log_step: float
+    ols_log_step: float
+    finite_difference_epsilons: npt.NDArray[np.float64]
+    finite_difference_log_likelihood: npt.NDArray[np.float64]
+    ols_epsilons: npt.NDArray[np.float64]
+    ols_log_likelihood: npt.NDArray[np.float64]
+    lid_autograd: npt.NDArray[np.float64]
+    lid_symmetric_fd: npt.NDArray[np.float64]
+    lid_ols3: npt.NDArray[np.float64]
+    lid_ols5: npt.NDArray[np.float64]
+    lid_ols9: npt.NDArray[np.float64]
+
+    @property
+    def lid_by_readout(self) -> Mapping[str, npt.NDArray[np.float64]]:
+        """Return stable public readout identifiers for artifact generation."""
+
+        return {
+            "autograd": self.lid_autograd,
+            "symmetric_fd": self.lid_symmetric_fd,
+            "ols3": self.lid_ols3,
+            "ols5": self.lid_ols5,
+            "ols9": self.lid_ols9,
+        }
 
 
 @dataclass(frozen=True)
@@ -2150,6 +2186,202 @@ def predict_primitives(
         divergence=np.asarray(torch.cat(divergences).numpy(), dtype=np.float64),
         evaluation_point=np.asarray(torch.cat(points).numpy(), dtype=np.float64),
         condition=float(model_scale),
+    )
+
+
+def predict_nf_log_likelihood(
+    model_or_result: nn.Module | TrainingResult,
+    query: Any,
+    epsilon: float,
+    *,
+    family: str | None = None,
+    batch_size: int = 256,
+) -> npt.NDArray[np.float64]:
+    """Evaluate the exact normalized NF log density at one declared epsilon."""
+
+    model, canonical_family, mean, normalization_scale = _model_and_context(
+        model_or_result, family
+    )
+    if canonical_family != "scale_conditioned_normalizing_flow" or not isinstance(
+        model, ScaleConditionedRealNVP
+    ):
+        raise TypeError("predict_nf_log_likelihood requires ScaleConditionedRealNVP")
+    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
+        raise TypeError("NF epsilon must be numeric")
+    scale = float(epsilon)
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError("NF epsilon must be finite and positive")
+    if isinstance(model_or_result, TrainingResult):
+        epsilon_min = model_or_result.config.epsilon_min
+        epsilon_max = model_or_result.config.epsilon_max
+        if epsilon_min is None or epsilon_max is None:
+            raise ValueError("checkpoint lacks the NF epsilon training interval")
+        if not float(epsilon_min) <= scale <= float(epsilon_max):
+            raise ValueError(
+                "NF epsilon lies outside the checkpointed training interval"
+            )
+    if (
+        isinstance(batch_size, bool)
+        or not isinstance(batch_size, int)
+        or batch_size <= 0
+    ):
+        raise ValueError("batch_size must be a positive integer")
+    query_cpu = _flat_finite_data(query, name="query")
+    if query_cpu.shape[1] != model.config.ambient_dim:
+        raise ValueError("query ambient dimension does not match model")
+    normalized = (query_cpu - mean.reshape(1, -1)) / normalization_scale
+    parameter = next(model.parameters())
+    model.eval()
+    likelihoods: list[Tensor] = []
+    for start in range(0, normalized.shape[0], batch_size):
+        batch = normalized[start : start + batch_size].to(
+            device=parameter.device,
+            dtype=parameter.dtype,
+        )
+        curve = fixed_point_log_likelihood_curve(model, batch, (scale,))
+        likelihoods.append(curve[:, 0].detach().cpu())
+    result = np.ascontiguousarray(
+        torch.cat(likelihoods, dim=0).numpy(),
+        dtype=np.float64,
+    )
+    if result.shape != (query_cpu.shape[0],) or not np.isfinite(result).all():
+        raise FloatingPointError("NF log-likelihood inference produced invalid output")
+    return result
+
+
+def predict_nf_readouts(
+    model_or_result: nn.Module | TrainingResult,
+    query: Any,
+    epsilon: float,
+    *,
+    family: str | None = None,
+    finite_difference_log_step: float = 0.01,
+    ols_log_step: float = 0.05,
+    batch_size: int = 256,
+) -> NFLikelihoodReadoutPrediction:
+    """Evaluate every NF likelihood readout and its likelihood-path evidence.
+
+    Symmetric windows are required to stay inside the checkpointed training
+    interval.  The function never clips or substitutes one-sided windows,
+    because doing so would silently change the estimator near a boundary.
+    """
+
+    model, canonical_family, mean, normalization_scale = _model_and_context(
+        model_or_result, family
+    )
+    if canonical_family != "scale_conditioned_normalizing_flow" or not isinstance(
+        model, ScaleConditionedRealNVP
+    ):
+        raise TypeError("predict_nf_readouts requires ScaleConditionedRealNVP")
+    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
+        raise TypeError("NF epsilon must be numeric")
+    center = float(epsilon)
+    if not math.isfinite(center) or center <= 0.0:
+        raise ValueError("NF epsilon must be finite and positive")
+    for name, value in (
+        ("finite_difference_log_step", finite_difference_log_step),
+        ("ols_log_step", ols_log_step),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"{name} must be numeric")
+        if not math.isfinite(float(value)) or float(value) <= 0.0:
+            raise ValueError(f"{name} must be finite and positive")
+    fd_step = float(finite_difference_log_step)
+    regression_step = float(ols_log_step)
+    if isinstance(model_or_result, TrainingResult):
+        epsilon_min = model_or_result.config.epsilon_min
+        epsilon_max = model_or_result.config.epsilon_max
+        if epsilon_min is None or epsilon_max is None:
+            raise ValueError("checkpoint lacks the NF epsilon training interval")
+        largest_log_radius = max(fd_step, 4.0 * regression_step)
+        lower_log_epsilon = math.log(center) - largest_log_radius
+        upper_log_epsilon = math.log(center) + largest_log_radius
+        if lower_log_epsilon < math.log(
+            float(epsilon_min)
+        ) or upper_log_epsilon > math.log(float(epsilon_max)):
+            raise ValueError(
+                "NF readout window lies outside the checkpointed training interval"
+            )
+    if (
+        isinstance(batch_size, bool)
+        or not isinstance(batch_size, int)
+        or batch_size <= 0
+    ):
+        raise ValueError("batch_size must be a positive integer")
+    query_cpu = _flat_finite_data(query, name="query")
+    if query_cpu.shape[1] != model.config.ambient_dim:
+        raise ValueError("query ambient dimension does not match model")
+    normalized = (query_cpu - mean.reshape(1, -1)) / normalization_scale
+    parameter = next(model.parameters())
+    model.eval()
+
+    finite_difference_epsilons: Tensor | None = None
+    ols_epsilons: Tensor | None = None
+    finite_difference_curves: list[Tensor] = []
+    ols_curves: list[Tensor] = []
+    readout_batches: dict[str, list[Tensor]] = {
+        "autograd": [],
+        "symmetric_fd": [],
+        "ols3": [],
+        "ols5": [],
+        "ols9": [],
+    }
+    for start in range(0, normalized.shape[0], batch_size):
+        batch = normalized[start : start + batch_size].to(
+            device=parameter.device,
+            dtype=parameter.dtype,
+        )
+        prediction = fixed_point_likelihood_readouts(
+            model,
+            batch,
+            center,
+            finite_difference_log_step=fd_step,
+            ols_log_step=regression_step,
+        )
+        batch_fd_epsilons = prediction.finite_difference_epsilons.detach().cpu()
+        batch_ols_epsilons = prediction.ols_epsilons.detach().cpu()
+        if finite_difference_epsilons is None:
+            finite_difference_epsilons = batch_fd_epsilons
+            ols_epsilons = batch_ols_epsilons
+        elif not torch.equal(
+            finite_difference_epsilons, batch_fd_epsilons
+        ) or not torch.equal(ols_epsilons, batch_ols_epsilons):
+            raise RuntimeError("NF likelihood grids changed between inference batches")
+        finite_difference_curves.append(
+            prediction.finite_difference_log_likelihood.detach().cpu()
+        )
+        ols_curves.append(prediction.ols_log_likelihood.detach().cpu())
+        readout_batches["autograd"].append(prediction.lid_autograd.detach().cpu())
+        readout_batches["symmetric_fd"].append(
+            prediction.lid_symmetric_fd.detach().cpu()
+        )
+        readout_batches["ols3"].append(prediction.lid_ols3.detach().cpu())
+        readout_batches["ols5"].append(prediction.lid_ols5.detach().cpu())
+        readout_batches["ols9"].append(prediction.lid_ols9.detach().cpu())
+
+    assert finite_difference_epsilons is not None and ols_epsilons is not None
+
+    def array(value: Tensor) -> npt.NDArray[np.float64]:
+        result = np.ascontiguousarray(value.numpy(), dtype=np.float64)
+        if not np.isfinite(result).all():
+            raise FloatingPointError("NF readout inference produced non-finite values")
+        return result
+
+    return NFLikelihoodReadoutPrediction(
+        epsilon=center,
+        finite_difference_log_step=fd_step,
+        ols_log_step=regression_step,
+        finite_difference_epsilons=array(finite_difference_epsilons),
+        finite_difference_log_likelihood=array(
+            torch.cat(finite_difference_curves, dim=0)
+        ),
+        ols_epsilons=array(ols_epsilons),
+        ols_log_likelihood=array(torch.cat(ols_curves, dim=0)),
+        lid_autograd=array(torch.cat(readout_batches["autograd"], dim=0)),
+        lid_symmetric_fd=array(torch.cat(readout_batches["symmetric_fd"], dim=0)),
+        lid_ols3=array(torch.cat(readout_batches["ols3"], dim=0)),
+        lid_ols5=array(torch.cat(readout_batches["ols5"], dim=0)),
+        lid_ols9=array(torch.cat(readout_batches["ols9"], dim=0)),
     )
 
 

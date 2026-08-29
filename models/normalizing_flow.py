@@ -16,7 +16,7 @@ by differentiating this exact likelihood at a fixed observation:
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -83,6 +83,30 @@ class ConditionalFlowConfig:
         if unknown:
             raise ValueError(f"unknown conditional-flow settings: {sorted(unknown)}")
         return cls(**dict(value))
+
+
+@dataclass(frozen=True)
+class FixedPointLikelihoodReadouts:
+    """Likelihood-path diagnostics and LID readouts at one fixed point.
+
+    The finite-difference and OLS bandwidths are deliberately separate.  A
+    small finite-difference step audits the instantaneous autograd derivative,
+    while the wider OLS window is a scientifically distinct smoothed readout.
+    All likelihood values are evaluated at the unchanged observations.
+    """
+
+    epsilon: float
+    finite_difference_log_step: float
+    ols_log_step: float
+    finite_difference_epsilons: Tensor
+    finite_difference_log_likelihood: Tensor
+    ols_epsilons: Tensor
+    ols_log_likelihood: Tensor
+    lid_autograd: Tensor
+    lid_symmetric_fd: Tensor
+    lid_ols3: Tensor
+    lid_ols5: Tensor
+    lid_ols9: Tensor
 
 
 class _AffineCoupling(nn.Module):
@@ -280,6 +304,251 @@ def fixed_point_lid(
         return derivative + model.config.ambient_dim
 
 
+def _positive_finite_scalar(value: float, *, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be numeric")
+    result = float(value)
+    if not math.isfinite(result) or result <= 0.0:
+        raise ValueError(f"{name} must be finite and positive")
+    return result
+
+
+def _offset_epsilon_grid(
+    observations: Tensor,
+    *,
+    epsilon: float,
+    log_step: float,
+    offsets: Sequence[int],
+) -> Tensor:
+    center = _positive_finite_scalar(epsilon, name="epsilon")
+    step = _positive_finite_scalar(log_step, name="log_step")
+    if not offsets:
+        raise ValueError("offsets must be nonempty")
+    if any(
+        isinstance(offset, bool) or not isinstance(offset, int) for offset in offsets
+    ):
+        raise TypeError("offsets must contain integers")
+    requested_log_epsilon = torch.tensor(
+        [math.log(center) + int(offset) * step for offset in offsets],
+        device=observations.device,
+        dtype=observations.dtype,
+    )
+    epsilon_grid = torch.exp(requested_log_epsilon)
+    if not torch.isfinite(epsilon_grid).all() or torch.any(epsilon_grid <= 0):
+        raise ValueError("epsilon grid is not representable in the observation dtype")
+    if epsilon_grid.numel() > 1 and not torch.all(epsilon_grid[1:] > epsilon_grid[:-1]):
+        raise ValueError(
+            "log_step is too small to produce a strictly increasing epsilon grid"
+        )
+    return epsilon_grid
+
+
+def fixed_point_log_likelihood_curve(
+    model: ScaleConditionedRealNVP,
+    observations: Tensor,
+    epsilons: Tensor | Sequence[float],
+) -> Tensor:
+    """Evaluate ``log p_epsilon(x)`` on a declared grid at unchanged ``x``.
+
+    The scale loop avoids materializing a ``batch x scales x ambient_dim``
+    tensor, which is prohibitive for image-space flows.  The returned array has
+    shape ``(batch, scales)`` and follows the model/observation dtype.
+    """
+
+    if observations.ndim < 2 or observations.shape[0] <= 0:
+        raise ValueError("observations must have shape (nonempty batch, ...)")
+    if not torch.is_floating_point(observations):
+        raise ValueError("observations must have a floating-point dtype")
+    fixed = observations.detach()
+    epsilon_grid = torch.as_tensor(
+        epsilons,
+        device=fixed.device,
+        dtype=fixed.dtype,
+    ).detach()
+    if epsilon_grid.ndim != 1 or epsilon_grid.numel() <= 0:
+        raise ValueError("epsilons must be a nonempty rank-one grid")
+    if not torch.isfinite(epsilon_grid).all() or torch.any(epsilon_grid <= 0):
+        raise ValueError("epsilons must contain finite positive values")
+    if epsilon_grid.numel() > 1 and not torch.all(epsilon_grid[1:] > epsilon_grid[:-1]):
+        raise ValueError("epsilons must be strictly increasing")
+    with torch.no_grad():
+        columns = [model.log_prob(fixed, value) for value in epsilon_grid]
+        result = torch.stack(columns, dim=1)
+    if result.shape != (fixed.shape[0], epsilon_grid.numel()):
+        raise RuntimeError("normalizing-flow likelihood curve has the wrong shape")
+    if not torch.isfinite(result).all():
+        raise FloatingPointError("normalizing-flow likelihood curve is non-finite")
+    return result
+
+
+def _local_ols_lid_from_curve(
+    model: ScaleConditionedRealNVP,
+    log_likelihood: Tensor,
+    epsilons: Tensor,
+) -> Tensor:
+    if log_likelihood.ndim != 2:
+        raise ValueError("log_likelihood must have shape (batch, scales)")
+    if epsilons.ndim != 1 or log_likelihood.shape[1] != epsilons.numel():
+        raise ValueError("likelihood curve and epsilon grid shapes do not match")
+    if epsilons.numel() < 3 or epsilons.numel() % 2 == 0:
+        raise ValueError(
+            "local OLS requires an odd window containing at least 3 points"
+        )
+    if not torch.isfinite(log_likelihood).all():
+        raise FloatingPointError("log_likelihood contains non-finite values")
+    log_grid = torch.log(epsilons.detach().to(dtype=torch.float64))
+    centered_grid = log_grid - log_grid.mean()
+    denominator = centered_grid.square().sum()
+    if not torch.isfinite(denominator) or denominator <= 0.0:
+        raise ValueError("epsilon grid is degenerate in log space")
+    values = log_likelihood.detach().to(dtype=torch.float64)
+    center = values[:, values.shape[1] // 2 : values.shape[1] // 2 + 1]
+    slope = torch.matmul(values - center, centered_grid) / denominator
+    return slope + float(model.config.ambient_dim)
+
+
+def fixed_point_lid_symmetric_finite_difference(
+    model: ScaleConditionedRealNVP,
+    observations: Tensor,
+    epsilon: float,
+    *,
+    log_step: float,
+) -> Tensor:
+    """Estimate the fixed-point log-scale derivative by a centered difference."""
+
+    epsilon_grid = _offset_epsilon_grid(
+        observations,
+        epsilon=epsilon,
+        log_step=log_step,
+        offsets=(-1, 1),
+    )
+    likelihood = fixed_point_log_likelihood_curve(model, observations, epsilon_grid)
+    log_grid = torch.log(epsilon_grid.to(dtype=torch.float64))
+    slope = (
+        likelihood[:, 1].to(dtype=torch.float64)
+        - likelihood[:, 0].to(dtype=torch.float64)
+    ) / (log_grid[1] - log_grid[0])
+    return slope + float(model.config.ambient_dim)
+
+
+def fixed_point_lid_symmetric_fd(
+    model: ScaleConditionedRealNVP,
+    observations: Tensor,
+    epsilon: float,
+    *,
+    log_step: float,
+) -> Tensor:
+    """Short alias for :func:`fixed_point_lid_symmetric_finite_difference`."""
+
+    return fixed_point_lid_symmetric_finite_difference(
+        model,
+        observations,
+        epsilon,
+        log_step=log_step,
+    )
+
+
+def fixed_point_lid_local_ols(
+    model: ScaleConditionedRealNVP,
+    observations: Tensor,
+    epsilon: float,
+    *,
+    log_step: float,
+    window_size: int,
+) -> Tensor:
+    """Estimate the local likelihood slope by OLS in ``log(epsilon)``."""
+
+    if isinstance(window_size, bool) or window_size not in {3, 5, 9}:
+        raise ValueError("window_size must be one of 3, 5, or 9")
+    radius = window_size // 2
+    epsilon_grid = _offset_epsilon_grid(
+        observations,
+        epsilon=epsilon,
+        log_step=log_step,
+        offsets=tuple(range(-radius, radius + 1)),
+    )
+    likelihood = fixed_point_log_likelihood_curve(model, observations, epsilon_grid)
+    return _local_ols_lid_from_curve(model, likelihood, epsilon_grid)
+
+
+def fixed_point_likelihood_readouts(
+    model: ScaleConditionedRealNVP,
+    observations: Tensor,
+    epsilon: float,
+    *,
+    finite_difference_log_step: float,
+    ols_log_step: float,
+) -> FixedPointLikelihoodReadouts:
+    """Evaluate all NF ablation readouts while sharing likelihood-path work."""
+
+    center = _positive_finite_scalar(epsilon, name="epsilon")
+    fd_step = _positive_finite_scalar(
+        finite_difference_log_step,
+        name="finite_difference_log_step",
+    )
+    regression_step = _positive_finite_scalar(ols_log_step, name="ols_log_step")
+    finite_difference_epsilons = _offset_epsilon_grid(
+        observations,
+        epsilon=center,
+        log_step=fd_step,
+        offsets=(-1, 1),
+    )
+    finite_difference_log_likelihood = fixed_point_log_likelihood_curve(
+        model,
+        observations,
+        finite_difference_epsilons,
+    )
+    finite_difference_log_grid = torch.log(
+        finite_difference_epsilons.to(dtype=torch.float64)
+    )
+    finite_difference_slope = (
+        finite_difference_log_likelihood[:, 1].to(dtype=torch.float64)
+        - finite_difference_log_likelihood[:, 0].to(dtype=torch.float64)
+    ) / (finite_difference_log_grid[1] - finite_difference_log_grid[0])
+
+    ols_epsilons = _offset_epsilon_grid(
+        observations,
+        epsilon=center,
+        log_step=regression_step,
+        offsets=tuple(range(-4, 5)),
+    )
+    ols_log_likelihood = fixed_point_log_likelihood_curve(
+        model,
+        observations,
+        ols_epsilons,
+    )
+    return FixedPointLikelihoodReadouts(
+        epsilon=center,
+        finite_difference_log_step=fd_step,
+        ols_log_step=regression_step,
+        finite_difference_epsilons=finite_difference_epsilons.detach(),
+        finite_difference_log_likelihood=finite_difference_log_likelihood.detach(),
+        ols_epsilons=ols_epsilons.detach(),
+        ols_log_likelihood=ols_log_likelihood.detach(),
+        lid_autograd=fixed_point_lid(model, observations, center)
+        .detach()
+        .to(dtype=torch.float64),
+        lid_symmetric_fd=(
+            finite_difference_slope + float(model.config.ambient_dim)
+        ).detach(),
+        lid_ols3=_local_ols_lid_from_curve(
+            model,
+            ols_log_likelihood[:, 3:6],
+            ols_epsilons[3:6],
+        ).detach(),
+        lid_ols5=_local_ols_lid_from_curve(
+            model,
+            ols_log_likelihood[:, 2:7],
+            ols_epsilons[2:7],
+        ).detach(),
+        lid_ols9=_local_ols_lid_from_curve(
+            model,
+            ols_log_likelihood,
+            ols_epsilons,
+        ).detach(),
+    )
+
+
 def conditional_smoothed_nll(
     model: ScaleConditionedRealNVP,
     clean: Tensor,
@@ -292,20 +561,34 @@ def conditional_smoothed_nll(
 
     The loss is normalized by ambient dimension for optimizer conditioning;
     ``model.log_prob`` itself always returns the full exact log-density.
+    Equal bounds define a fixed-epsilon density and intentionally consume no
+    uniform random draw before sampling its Gaussian perturbation.
     """
 
-    if not 0.0 < epsilon_min < epsilon_max:
-        raise ValueError("epsilon bounds must satisfy 0 < min < max")
-    uniform = torch.rand(
-        clean.shape[0],
-        device=clean.device,
-        dtype=clean.dtype,
-        generator=generator,
-    )
-    epsilon = torch.exp(
-        math.log(epsilon_min)
-        + uniform * (math.log(epsilon_max) - math.log(epsilon_min))
-    )
+    if not (
+        math.isfinite(epsilon_min)
+        and math.isfinite(epsilon_max)
+        and 0.0 < epsilon_min <= epsilon_max
+    ):
+        raise ValueError("epsilon bounds must satisfy 0 < min <= max")
+    if epsilon_min == epsilon_max:
+        epsilon = torch.full(
+            (clean.shape[0],),
+            float(epsilon_min),
+            device=clean.device,
+            dtype=clean.dtype,
+        )
+    else:
+        uniform = torch.rand(
+            clean.shape[0],
+            device=clean.device,
+            dtype=clean.dtype,
+            generator=generator,
+        )
+        epsilon = torch.exp(
+            math.log(epsilon_min)
+            + uniform * (math.log(epsilon_max) - math.log(epsilon_min))
+        )
     noise = torch.randn(
         clean.shape,
         device=clean.device,
