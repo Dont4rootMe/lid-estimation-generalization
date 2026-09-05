@@ -1,0 +1,11 @@
+runs:
+  - artifacts/vp_baseline_pilot/rank3_gaussian_control-seed-20260905
+  - artifacts/vp_baseline_pilot/e7_crescent_moon_radius3.0-seed-20260905
+  - artifacts/vp_baseline_budget_check/rank3_gaussian_control-seed-20260905
+  - artifacts/vp_baseline_budget_check/e7_crescent_moon_radius3.0-seed-20260905
+output_dir: docs/results
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: artifacts/hydra/vp_pilot_audit/${now:%Y-%m-%d}/${now:%H-%M-%S-%f}
