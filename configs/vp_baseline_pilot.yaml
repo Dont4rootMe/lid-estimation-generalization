@@ -1,0 +1,48 @@
+schema_version: 1
+seed: 20260905
+dataset: e7_crescent_moon_radius3.0
+device: cuda:0
+output_root: artifacts/vp_baseline_pilot
+
+data:
+  provenance_class: regenerated_known_lid_pilot_not_canonical_archive
+  source_train_count: 32768
+  selection_count: 1024
+  evaluation_count: 1024
+  ambient_dim: 30
+  gaussian_control_lid: 3
+  normalization: train_fit_mean_global_rms
+
+model:
+  hidden_sizes: [1024, 512, 256, 256, 128, 128]
+  time_dim: 128
+  beta_min: 0.1
+  beta_max: 20.0
+
+training:
+  steps: 8000
+  batch_size: 256
+  learning_rate: 0.0001
+  weight_decay: 0.01
+  warmup_steps: 500
+  validation_interval: 500
+  early_stopping: false
+  deterministic: true
+  sampling: uniform_with_replacement
+  loss: feature_sum_negative_noise_mse
+  checkpoint_selection: minimum_train_selection_native_loss
+
+evaluation:
+  batch_size: 256
+  lambda_min_power2: -8
+  lambda_max_power2: 4
+  grid_count: 25
+  trace_backend: exact
+  boundary_policy: report_unresolved_do_not_evaluate_test
+  learning_noise_ratios: [0.0625, 0.125, 0.25, 0.5, 1.0, 2.0, 4.0]
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: artifacts/hydra/vp_baseline_pilot/${now:%Y-%m-%d}/${now:%H-%M-%S-%f}
