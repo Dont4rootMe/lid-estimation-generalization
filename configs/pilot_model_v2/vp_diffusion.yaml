@@ -1,0 +1,13 @@
+id: vp_diffusion
+name: vp_diffusion_reduced_flipd_interface
+family: vp_diffusion
+native_coordinate: vp_time_from_lambda
+training:
+  learning_rate: 0.0001
+  weight_decay: 0.01
+  warmup_steps: 500
+  gradient_clip_norm: null
+  field_hidden_sizes: null
+  vp_hidden_sizes: [1024, 512, 256, 256, 128, 128]
+  vp_beta_min: 0.1
+  vp_beta_max: 20.0

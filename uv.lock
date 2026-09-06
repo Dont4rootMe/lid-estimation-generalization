@@ -536,16 +536,35 @@ wheels = [
 ]
 
 [[package]]
+name = "kneed"
+version = "0.8.6"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/72/64/4bb8f8a7a4627b585a66d5bec0c9b30ae5b39a4caea1775c8bfb3fb3f4cf/kneed-0.8.6.tar.gz", hash = "sha256:65b22727c623661701f15edf057f2e6c73e2b1ad4e68cd9ca4291675c318b5ef", size = 13161, upload-time = "2026-03-20T21:01:51.966Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4a/cd/23c89d53c36028bccb39f55aa5dd24c4bdaab76c4d556ad43dc8cf026918/kneed-0.8.6-py3-none-any.whl", hash = "sha256:3412e7b70bce07717386d24fab37f0f985968d1b85ea0c749a6b98caccaf65ec", size = 10797, upload-time = "2026-03-20T21:01:50.87Z" },
+]
+
+[[package]]
 name = "lid-estimation"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "hydra-core" },
+    { name = "kneed" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
 ]
 
 [package.optional-dependencies]
+canary = [
+    { name = "pillow" },
+]
 train = [
     { name = "comet-ml" },
     { name = "torch" },
@@ -572,8 +591,10 @@ requires-dist = [
     { name = "comet-ml", marker = "extra == 'train'", specifier = ">=3.57,<4" },
     { name = "hydra-core", specifier = ">=1.3.2,<1.4" },
     { name = "joblib", marker = "extra == 'upstream'", specifier = ">=1.5,<2" },
+    { name = "kneed", specifier = "==0.8.6" },
     { name = "matplotlib", marker = "extra == 'upstream'", specifier = ">=3.9,<4" },
     { name = "numpy", specifier = ">=1.26,<3" },
+    { name = "pillow", marker = "extra == 'canary'", specifier = "==11.3.0" },
     { name = "pillow", marker = "extra == 'upstream'", specifier = ">=11,<12" },
     { name = "requests", marker = "extra == 'upstream'", specifier = ">=2.32,<3" },
     { name = "scikit-learn", marker = "extra == 'upstream'", specifier = ">=1.6,<2" },
@@ -582,7 +603,7 @@ requires-dist = [
     { name = "torchvision", marker = "extra == 'upstream'", specifier = ">=0.22,<0.23" },
     { name = "tqdm", marker = "extra == 'upstream'", specifier = ">=4.67,<5" },
 ]
-provides-extras = ["train", "upstream"]
+provides-extras = ["canary", "train", "upstream"]
 
 [package.metadata.requires-dev]
 dev = [

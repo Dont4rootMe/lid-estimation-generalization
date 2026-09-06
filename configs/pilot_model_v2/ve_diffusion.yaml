@@ -1,0 +1,7 @@
+id: ve_diffusion
+name: ve_x0_denoiser_shared_bottleneck
+family: diffusion
+native_coordinate: ve_sigma
+training:
+  sigma_min: 0.00390625
+  sigma_max: 64.0

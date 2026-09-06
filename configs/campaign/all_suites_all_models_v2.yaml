@@ -1,0 +1,112 @@
+campaign_id: lid-global-e1-e8-canonical-plus-generated-e3-e4-vp-ve-all-models-v2
+inventory:
+  canonical: configs/global_suite/canonical_exact.yaml
+  generated_e3_e4: configs/global_suite/generated_e3_e4.yaml
+  require_suite_ids: [e1, e2, e3, e4, e5, e6, e7, e8]
+  include_all_representations: true
+
+models:
+  - id: vp_diffusion
+    config: configs/pilot_model_v2/vp_diffusion.yaml
+    experiment_name: lid-generalization-global-v2-vp-diffusion-seed-${seed}
+  - id: ve_diffusion
+    config: configs/pilot_model_v2/ve_diffusion.yaml
+    experiment_name: lid-generalization-global-v2-ve-diffusion-seed-${seed}
+  - id: rectified_flow
+    config: configs/pilot_model_v2/rectified_flow.yaml
+    experiment_name: lid-generalization-global-v2-native-rectified-flow-seed-${seed}
+  - id: scale_conditioned_nf
+    config: configs/pilot_model_v2/scale_conditioned_nf.yaml
+    experiment_name: lid-generalization-global-v2-scale-conditioned-nf-seed-${seed}
+  - id: schrodinger_bridge
+    config: configs/pilot_model_v2/schrodinger_bridge.yaml
+    experiment_name: lid-generalization-global-v2-brownian-bridge-control-seed-${seed}
+  - id: direct_rectified_flow
+    config: configs/pilot_model_v2/direct_rectified_flow.yaml
+    experiment_name: lid-generalization-global-v2-fm-rectified-direct-seed-${seed}
+  - id: posterior_rectified_flow
+    config: configs/pilot_model_v2/posterior_rectified_flow.yaml
+    experiment_name: lid-generalization-global-v2-fm-rectified-posterior-seed-${seed}
+  - id: direct_log_noise_affine_flow
+    config: configs/pilot_model_v2/direct_log_noise_affine_flow.yaml
+    experiment_name: lid-generalization-global-v2-fm-log-noise-direct-seed-${seed}
+  - id: posterior_log_noise_affine_flow
+    config: configs/pilot_model_v2/posterior_log_noise_affine_flow.yaml
+    experiment_name: lid-generalization-global-v2-fm-log-noise-posterior-seed-${seed}
+  - id: direct_vp_trigonometric_flow
+    config: configs/pilot_model_v2/direct_vp_trigonometric_flow.yaml
+    experiment_name: lid-generalization-global-v2-fm-vp-trigonometric-direct-seed-${seed}
+  - id: posterior_vp_trigonometric_flow
+    config: configs/pilot_model_v2/posterior_vp_trigonometric_flow.yaml
+    experiment_name: lid-generalization-global-v2-fm-vp-trigonometric-posterior-seed-${seed}
+
+selection:
+  known_supervised_protocol: held_out_source_train_supervised_mae_bounded_v2
+  known_label_free_protocol: flipd_pointwise_kneedle_v1
+  unknown_reference_protocol: held_out_reference_mean_kneedle_v2
+  index_algorithm: splitmix64_rank_v1
+  fraction: 0.2
+  minimum_selection: 2
+  maximum_selection: 1000
+  minimum_fit: 8
+  criterion: mae
+  tie_tolerance: 1.0e-12
+  lambda_min: 0.00390625
+  lambda_max: 64.0
+  initial_log2_half_step_min: -12
+  initial_log2_half_step_max: 8
+  boundary_extension_half_steps: 4
+  flipd_source_revision: 05ab170c2c9bcada3f9286c3ef86db31b80925fa
+  kneed_version: 0.8.6
+  flipd_grid_count: 50
+  flipd_ignore_time_left: 0.05
+  flipd_ignore_time_right: 0.5
+  flipd_sensitivity: 1.0
+  unknown_grid_count: 50
+  vp_beta_min: 0.1
+  vp_beta_max: 20.0
+  minimum_kneedle_segment: 3
+
+evaluation:
+  batch_size: 128
+  checkpoint_retention: prune_after_cell_evaluation
+  supervised_validation_candidate_count: 1
+  supervised_test_candidate_count: 1
+  kneedle_uses_targets: false
+  save_pointwise_protocol_curves: true
+  nf_primary_readout: ols5
+  nf_ols_log_step: 0.05
+
+canary_gate:
+  schema_version: 1
+  required: true
+  protocol_id: vp-ve-fm-nf-quality-canary-v1
+  report_filename: canary_report.json
+  required_worker_count: 8
+  required_batch_size: 256
+  required_cell_keys:
+    - e2/e2_uniform_pca/coefficients
+    - e2/e2_arrows/dataset
+  required_model_variants:
+    - vp_diffusion
+    - ve_diffusion
+    - posterior_log_noise_affine_flow
+    - scale_conditioned_nf
+
+resume:
+  schema_version: 2
+  cell_attempt_policy: stable_identity_directory
+  training_progress_filename: training_progress.pt
+  invalid_existing_policy: fail
+  source_tree_check_before_every_cell: true
+  lock_filename: campaign.lock
+
+fm_diagnostics:
+  policy: dimension_aware_known_lid_v2
+  exact_trace_max_ambient_dim: 64
+  high_dim_query_subset_size: 8
+  high_dim_trace_probes: [16, 64]
+  high_dim_scale_policy: actual_selection_grid
+  high_dim_exact_status: skipped_cost_prohibitive
+  high_dim_oracle_status: skipped_cost_prohibitive
+  unknown_lid_status: not_applicable_no_lid_targets

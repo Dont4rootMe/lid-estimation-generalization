@@ -16,9 +16,9 @@ checkpoint'ы остаются VE. Переименование их в FLIPD/VP
 
 Дополнение по решению автора: в новой кампании сохраняем **обе diffusion
 строки, VP и VE**. На known-LID публикуем два протокола из одного checkpoint:
-supervised validation-MAE selection и label-free Kneedle из доступного
-FLIPD-кода. Ни добавочная VE-строка, ни второй selector пока не подключены
-к full runner; ниже зафиксирована спецификация их реализации.
+supervised held-out-train MAE selection и label-free Kneedle из доступного
+FLIPD-кода. Эти варианты подключены в отдельном versioned v2 runner; ниже
+зафиксированы его научный контракт и границы интерпретации.
 
 Что уже есть в этом изменении:
 
@@ -34,9 +34,18 @@ FLIPD-кода. Ни добавочная VE-строка, ни второй sel
 - `datasets/vp_pilot.py` содержит только две переносимые pilot fixtures;
   старые локальные `ve_*` скрипты для запуска нового пилота не нужны.
 
-Ни полный benchmark, ни запуск на удалённой машине здесь не выполнены.
-Настройки полного прогона ниже — инструкция для следующего агента; они ещё не
-подключены к `global_campaign.py`. Исторические production-конфиги не изменены.
+Полный v2 benchmark в этом commit ещё не завершён. Реализация вынесена в
+`experiments/global_campaign_v2.py`, `experiments/global_parallel_v2.py` и
+`experiments/v2_canary.py`; исторический v1 runner и его запечатанные результаты
+не переименовываются и не перезаписываются.
+
+Проверенные в pilot-отчёте численные строки ниже следует считать только
+исторической диагностикой. В переданном commit три producing-source SHA из
+`docs/results/vp_pilot_20260905.json` не совпадают с файлами того же Git tree:
+`models/vp_baseline.py`, `models/training.py` и
+`experiments/vp_baseline_pilot.py`; ещё один указанный source-файл отсутствует.
+Поэтому JSON и PNG не являются provenance-валидным результатом нового v2
+прогона и не используются как его вход или acceptance evidence.
 
 ## 1. Данные и разбиения
 
@@ -616,20 +625,108 @@ Extra `upstream` здесь нужен для matplotlib при построен
 Большие training artifacts/checkpoints остаются в ignored `artifacts/`;
 коллега может повторить пилот приведёнными командами.
 
-## 9. Что следующему агенту нужно реализовать
+## 9. Статус production-реализации v2
 
-1. Подключить отдельную VP family к trainer/checkpoint/primitive adapter,
-   переиспользуя проверенные формулы; в новом versioned campaign config
-   сохранить также VE с обновлёнными общими бюджетом/backbone/train support.
-2. Общий reduced bottleneck backbone для vector fields, NF width по parameter
-   count; не менять scientific targets и уже matched FM losses.
-3. Fixed-steps/examples budget без early stopping; полноценный deterministic
-   resume и оба счётчика total/selected-checkpoint exposure.
-4. Общую lambda grid, обязательную проверку всех запросов по checkpoint support
-   и bounded extension; два known-LID протокола A/B из одних checkpoints,
-   reference-selector E1/E5 без доступа к behavioural targets.
-5. Image-space canary и проверку trace/learning quality до полной матрицы.
-6. Старые числа оставить старой кампании; весь новый результат собрать заново.
+На 6 сентября 2026 кодом зафиксирован следующий отдельный контур:
+
+1. Матрица содержит 11 физических вариантов и 39 cells на вариант:
+   35 canonical и 4 generated E3/E4, всего 429 независимых обучений.
+2. Все vector-field family используют bottleneck
+   `[1024, 512, 256, 256, 128, 128]`; ширина conditional RealNVP выбирается
+   детерминированно по ambient dimension с допуском 10% по parameter count.
+3. Бюджет равен 32000 optimizer steps при batch 256 без early stopping.
+   VP использует AdamW, `lr=1e-4`, `weight_decay=0.01`, 500-step warmup и
+   cosine decay; остальные семейства сохраняют свой объявленный native loss и
+   используют `lr=2e-4`, `weight_decay=1e-6`.
+4. Поддержка физической lambda общая: `[1/256, 64]`. У NF training epsilon
+   расширена ровно на `exp(±0.1)`, чтобы пятиточечный OLS5 stencil оставался
+   внутри support даже в крайних evaluation-точках; это не расширяет диапазон
+   выбора масштаба.
+5. Known-LID сохраняет supervised held-out-train selector и точный перенос
+   pointwise FLIPD Kneedle с ambient-dimension fallback. E1/E5 используют
+   target-free reference-mean Kneedle; отсутствие внутреннего knee запечатывает
+   `selection_failed` без surrogate scale и без выдуманных метрик.
+6. Один 8-H100 cell-DAG запускает по одному независимому worker на GPU. Перед
+   оставшимися cells обязательны data gate и восемь полноразмерных production
+   canary cells (VP, VE, один posterior FM и NF на D=30 и Arrows D=3072). Эти
+   восемь cells входят в 429 и затем переиспользуются, а не обучаются повторно.
+7. Для FM cells с ambient dimension не выше 64 сохраняются exact trace и
+   empirical oracle. Для D=256/784/1024/3072 применяется отдельно названная
+   Hutchinson-16/64 prefix-stability проверка без заявления exact/oracle.
+8. Evaluation выполняется и checkpoint удаляется внутри каждой cell до seal.
+   В full DAG stable incomplete directory и progress checkpoint обеспечивают
+   deterministic resume. Canary намеренно строже: незапечатанное обучение с
+   существующим progress checkpoint не может аттестовать полный 0→32000 ETA и
+   требует нового task-specific root с повторным полным замером; уже
+   запечатанные canary cells остаются переиспользуемыми. Comet для v2 по
+   умолчанию отключён.
+
+Это описание реализации, а не утверждение об успешном полном результате.
+Научные числа становятся допустимыми только после PASS canary, завершения всех
+429 trainings и строгой проверки campaign manifest, input inventory, агрегатов
+и единой CSV-таблицы. Старый v1 результат остаётся отдельной неизменяемой
+кампанией.
+
+### Операционный порядок одного production-запуска
+
+Запуск делается из чистого checkout закреплённого commit. Сначала в том же
+task-specific root готовятся input inventory и воспроизводимые identity:
+
+```bash
+export LID_V2_JOB_ROOT=/absolute/task-specific/root
+export LID_V2_CANARY_OUTPUT_ROOT="${LID_V2_JOB_ROOT}/campaign"
+export PYTHONDONTWRITEBYTECODE=1
+python - <<'PY'
+import os
+from pathlib import Path
+from experiments.global_parallel_v2 import prepare_global_v2_campaign
+
+prepared = prepare_global_v2_campaign(
+    root=Path.cwd(), output_root=Path(os.environ["LID_V2_CANARY_OUTPUT_ROOT"])
+)
+for name in (
+    "campaign_identity", "config_sha", "input_inventory_sha", "source_sha"
+):
+    print(name, getattr(prepared, name))
+print("campaign_root", prepared.campaign_root)
+PY
+```
+
+Затем отдельным CPU preflight создаётся Arrows bundle:
+
+```bash
+python -m experiments.v2_canary --data-gate-only \
+  --output-dir "${LID_V2_JOB_ROOT}/arrows_data_gate"
+```
+
+Нужно открыть сгенерированный `arrows_contact_sheet.png`, проверить, что это
+действительно канонический Arrows split и ожидаемый preprocessing, и только
+после человеческой проверки подписать gate:
+
+```bash
+python -m experiments.v2_canary \
+  --approve-arrows-gate "${LID_V2_JOB_ROOT}/arrows_data_gate/arrows_gate.json" \
+  --reviewer <reviewer-id> --reviewed-at <UTC-ISO-8601>
+```
+
+Команда возвращает точный путь `arrows_gate_reviewed.json`; именно этот файл,
+а не неподписанный `arrows_gate.json`, передаётся launcher.
+
+Перед job фиксируются точные значения `LID_V2_EXPECTED_COMMIT`,
+`LID_V2_EXPECTED_GIT_TREE_SHA256`, `LID_V2_EXPECTED_ARCHIVE_SHA256`,
+`LID_V2_EXPECTED_CAMPAIGN_IDENTITY`,
+`LID_V2_EXPECTED_CAMPAIGN_CONFIG_SHA256`,
+`LID_V2_EXPECTED_INPUT_INVENTORY_SHA256`,
+`LID_V2_EXPECTED_DECLARED_SOURCE_SHA256` и путь
+`LID_V2_ARROWS_REVIEWED_GATE`. После этого одна CloudBot job выполняет только:
+
+```bash
+bash scripts/run_v2_full_job.sh
+```
+
+Launcher сначала запускает `experiments.v2_canary`, а full DAG начинает лишь
+после валидного `canary_report.json`. Submit нельзя повторять при неоднозначном
+ответе CloudBot: сначала проверяется список задач и точный task id.
 
 ## Источники и границы воспроизведения
 

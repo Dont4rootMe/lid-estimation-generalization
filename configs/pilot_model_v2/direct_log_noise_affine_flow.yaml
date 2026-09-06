@@ -1,0 +1,27 @@
+id: direct_log_noise_affine_flow
+name: affine_log_noise_direct_shared_bottleneck
+family: independent_affine_flow
+native_coordinate: lambda
+training:
+  flow_variant_id: direct_log_noise_affine_flow
+  flow_schedule: log_noise
+  flow_parameterization: direct_velocity
+  flow_conditioning: log_noise_ratio
+  flow_scale_sampling: log_uniform_noise_ratio
+  flow_loss_weighting: posterior_bias_equivalent
+  flow_noise_ratio_min: 0.00390625
+  flow_noise_ratio_max: 64.0
+diagnostics:
+  schema_version: 1
+  enabled: true
+  source_split: train_selection
+  primary_divergence_backend: hutchinson
+  probe_kind: rademacher
+  trace_probes: 16
+  trace_seed: 0
+  exact_subset_size: 32
+  exact_subset_seed: 0
+  oracle_reference_size: 4096
+  oracle_reference_seed: 0
+  oracle_chunk_size: 1024
+  batch_size: 128

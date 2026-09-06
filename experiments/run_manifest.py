@@ -126,8 +126,10 @@ def environment_state() -> dict[str, Any]:
     for package in (
         "lid-estimation",
         "hydra-core",
+        "kneed",
         "numpy",
         "omegaconf",
+        "scipy",
         "torch",
         "torchvision",
     ):

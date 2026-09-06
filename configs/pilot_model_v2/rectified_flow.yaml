@@ -1,0 +1,8 @@
+id: rectified_flow
+name: native_rectified_flow_shared_bottleneck
+family: rectified_flow
+native_coordinate: rectified_time_from_lambda
+selection_prefer: smaller
+training:
+  time_min: 0.015384615384615385
+  time_max: 0.9961089494163424

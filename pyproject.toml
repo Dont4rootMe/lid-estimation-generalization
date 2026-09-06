@@ -10,10 +10,14 @@ readme = "README.md"
 requires-python = ">=3.11,<3.14"
 dependencies = [
   "hydra-core>=1.3.2,<1.4",
+  "kneed==0.8.6",
   "numpy>=1.26,<3",
 ]
 
 [project.optional-dependencies]
+canary = [
+  "pillow==11.3.0",
+]
 train = [
   "comet-ml>=3.57,<4",
   "torch>=2.6,<2.8",

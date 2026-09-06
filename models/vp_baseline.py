@@ -8,8 +8,11 @@ and the proposed full protocol. Final LID formulas live in models.readouts.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
 import math
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass
+from itertools import pairwise
+from typing import Any, Literal
 
 import torch
 from torch import Tensor, nn
@@ -67,8 +70,53 @@ class VPSchedule:
         }
 
 
-class VPBottleneckMLP(nn.Module):
-    """Fully connected U-shaped network with concatenative skip connections.
+DEFAULT_VP_SCHEDULE = VPSchedule()
+
+
+@dataclass(frozen=True)
+class VPBottleneckConfig:
+    """Serializable architecture definition for the reduced FLIPD MLP."""
+
+    ambient_dim: int
+    hidden_sizes: tuple[int, ...] = (512, 256, 128, 128, 64, 64)
+    time_dim: int = 128
+    condition_transform: Literal["linear", "log"] = "linear"
+
+    def __post_init__(self) -> None:
+        if isinstance(self.ambient_dim, bool) or self.ambient_dim < 1:
+            raise ValueError("ambient_dim must be a positive integer")
+        if len(self.hidden_sizes) < 2 or any(
+            isinstance(width, bool) or not isinstance(width, int) or width < 1
+            for width in self.hidden_sizes
+        ):
+            raise ValueError("hidden_sizes must contain at least two positive integers")
+        if (
+            isinstance(self.time_dim, bool)
+            or not isinstance(self.time_dim, int)
+            or self.time_dim < 4
+            or self.time_dim % 2
+        ):
+            raise ValueError("time_dim must be even and at least four")
+        if self.condition_transform not in {"linear", "log"}:
+            raise ValueError("condition_transform must be linear or log")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> VPBottleneckConfig:
+        unknown = set(value) - set(cls.__dataclass_fields__)
+        if unknown:
+            raise ValueError(f"unknown VP architecture settings: {sorted(unknown)}")
+        fields = dict(value)
+        hidden_sizes = fields.get("hidden_sizes")
+        if isinstance(hidden_sizes, list):
+            fields["hidden_sizes"] = tuple(hidden_sizes)
+        return cls(**fields)
+
+
+class ConditionedBottleneckMLP(nn.Module):
+    """Fully connected U-shaped field with concatenative skip connections.
 
     hidden_sizes describes the encoder, including the bottleneck; the decoder
     mirrors all preceding widths. Sinusoidal time features are concatenated
@@ -76,20 +124,25 @@ class VPBottleneckMLP(nn.Module):
     """
 
     def __init__(
-        self, ambient_dim: int, hidden_sizes=(512, 256, 128, 128, 64, 64), time_dim=128
+        self,
+        ambient_dim: int,
+        hidden_sizes=(512, 256, 128, 128, 64, 64),
+        time_dim=128,
+        *,
+        condition_transform: Literal["linear", "log"] = "linear",
     ):
         super().__init__()
-        if ambient_dim < 1 or len(hidden_sizes) < 2 or any(h < 1 for h in hidden_sizes):
-            raise ValueError("invalid bottleneck architecture")
-        if time_dim < 4 or time_dim % 2:
-            raise ValueError("time_dim must be even and at least four")
-        self.ambient_dim = ambient_dim
-        self.hidden_sizes = tuple(hidden_sizes)
-        self.time_dim = time_dim
-        widths = [ambient_dim + time_dim, *hidden_sizes]
-        self.encoder = nn.ModuleList(
-            nn.Linear(a, b) for a, b in zip(widths[:-1], widths[1:])
+        self.config = VPBottleneckConfig(
+            ambient_dim=ambient_dim,
+            hidden_sizes=tuple(hidden_sizes),
+            time_dim=time_dim,
+            condition_transform=condition_transform,
         )
+        self.ambient_dim = self.config.ambient_dim
+        self.hidden_sizes = self.config.hidden_sizes
+        self.time_dim = self.config.time_dim
+        widths = [self.ambient_dim + self.time_dim, *self.hidden_sizes]
+        self.encoder = nn.ModuleList(nn.Linear(a, b) for a, b in pairwise(widths))
         self.decoder = nn.ModuleList()
         previous = widths[-1]
         for index, skip_width in enumerate(reversed(widths[:-1])):
@@ -101,18 +154,24 @@ class VPBottleneckMLP(nn.Module):
     def forward(self, inputs: Tensor, time: Tensor) -> Tensor:
         if inputs.ndim != 2 or inputs.shape[1] != self.ambient_dim:
             raise ValueError("inputs must be (batch, ambient_dim)")
-        time = torch.as_tensor(time, device=inputs.device, dtype=inputs.dtype)
-        if time.ndim == 0:
-            time = time.expand(inputs.shape[0])
-        if time.shape != (inputs.shape[0],):
-            raise ValueError("time must be scalar or (batch,)")
+        condition = torch.as_tensor(time, device=inputs.device, dtype=inputs.dtype)
+        if condition.ndim == 0:
+            condition = condition.expand(inputs.shape[0])
+        if condition.shape != (inputs.shape[0],):
+            raise ValueError("condition must be scalar or (batch,)")
+        if not torch.isfinite(condition).all():
+            raise ValueError("condition must be finite")
+        if self.config.condition_transform == "log":
+            if torch.any(condition <= 0):
+                raise ValueError("log-conditioned values must be positive")
+            condition = torch.log(condition)
         half = self.time_dim // 2
         frequencies = torch.exp(
             -math.log(10000)
             * torch.arange(half, device=inputs.device, dtype=inputs.dtype)
             / (half - 1)
         )
-        angles = time[:, None] * frequencies[None, :]
+        angles = condition[:, None] * frequencies[None, :]
         state = torch.cat((inputs, angles.sin(), angles.cos()), dim=1)
         skips = [state]
         for layer in self.encoder:
@@ -125,8 +184,45 @@ class VPBottleneckMLP(nn.Module):
         return state
 
 
+class VPBottleneckMLP(ConditionedBottleneckMLP):
+    """VP specialization of the shared bottleneck with native-time input."""
+
+    def __init__(
+        self, ambient_dim: int, hidden_sizes=(512, 256, 128, 128, 64, 64), time_dim=128
+    ) -> None:
+        super().__init__(
+            ambient_dim,
+            hidden_sizes,
+            time_dim,
+            condition_transform="linear",
+        )
+
+
+def bottleneck_parameter_count(
+    ambient_dim: int,
+    hidden_sizes: tuple[int, ...],
+    time_dim: int,
+    *,
+    condition_transform: Literal["linear", "log"] = "linear",
+) -> int:
+    """Return the exact parameter count without allocating real weights."""
+
+    with torch.device("meta"):
+        model = ConditionedBottleneckMLP(
+            ambient_dim,
+            hidden_sizes,
+            time_dim,
+            condition_transform=condition_transform,
+        )
+    return sum(parameter.numel() for parameter in model.parameters())
+
+
 def vp_loss(
-    model: nn.Module, clean: Tensor, time: Tensor, noise: Tensor, schedule=VPSchedule()
+    model: nn.Module,
+    clean: Tensor,
+    time: Tensor,
+    noise: Tensor,
+    schedule: VPSchedule = DEFAULT_VP_SCHEDULE,
 ) -> Tensor:
     alpha, sigma = schedule.coefficients(time)
     noisy = alpha[:, None] * clean + sigma[:, None] * noise
@@ -134,7 +230,10 @@ def vp_loss(
 
 
 def denoise(
-    model: nn.Module, noisy: Tensor, time: Tensor, schedule=VPSchedule()
+    model: nn.Module,
+    noisy: Tensor,
+    time: Tensor,
+    schedule: VPSchedule = DEFAULT_VP_SCHEDULE,
 ) -> Tensor:
     alpha, sigma = schedule.coefficients(time)
     return (noisy + sigma[:, None] * model(noisy, time)) / alpha[:, None]
@@ -155,9 +254,10 @@ def vp_primitives(
     query: Tensor,
     noise_ratio: float,
     *,
-    schedule=VPSchedule(),
+    schedule: VPSchedule = DEFAULT_VP_SCHEDULE,
     probes=0,
     seed=0,
+    generator: torch.Generator | None = None,
 ) -> VPPrimitives:
     """Export score and native-input divergence at y=alpha*x.
 
@@ -174,7 +274,12 @@ def vp_primitives(
     native = alpha[:, None] * query
     if probes:
         divergence = hutchinson_divergence(
-            model, native, time, num_probes=probes, seed=seed
+            model,
+            native,
+            time,
+            num_probes=probes,
+            seed=None if generator is not None else seed,
+            generator=generator,
         )
     else:
         divergence = exact_divergence(model, native, time)

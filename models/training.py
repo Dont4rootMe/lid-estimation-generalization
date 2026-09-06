@@ -24,7 +24,7 @@ import os
 import random
 import tempfile
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from itertools import pairwise
 from pathlib import Path
 from typing import Any, Literal
@@ -64,6 +64,7 @@ from models.normalizing_flow import (
     ScaleConditionedRealNVP,
     conditional_smoothed_nll,
     fixed_point_lid,
+    fixed_point_lid_local_ols,
     fixed_point_likelihood_readouts,
     fixed_point_log_likelihood_curve,
 )
@@ -81,9 +82,19 @@ from models.schrodinger_bridge import (
     denoiser_to_forward_drift,
     validate_time_to_go_bounds,
 )
+from models.vp_baseline import (
+    ConditionedBottleneckMLP,
+    VPBottleneckConfig,
+    VPBottleneckMLP,
+    VPSchedule,
+    bottleneck_parameter_count,
+    vp_loss,
+    vp_primitives,
+)
 
 Family = Literal[
     "gaussian_diffusion",
+    "vp_diffusion",
     "rectified_flow",
     "independent_affine_flow",
     "brownian_schrodinger_bridge",
@@ -92,9 +103,13 @@ Family = Literal[
 LogCallback = Callable[[Mapping[str, float | int | bool | str]], None]
 CHECKPOINT_SCHEMA_VERSION = 2
 LEGACY_CHECKPOINT_SCHEMA_VERSION = 1
+FIXED_STEP_CHECKPOINT_SCHEMA_VERSION = 3
 TRAINING_PROGRESS_SCHEMA_VERSION = 1
+FIXED_STEP_PROGRESS_SCHEMA_VERSION = 2
 TRAINING_PROGRESS_INTERVAL_EPOCHS = 20
-TrainableModel = ScaleConditionedNeuralField | ScaleConditionedRealNVP
+TrainableModel = (
+    ScaleConditionedNeuralField | ScaleConditionedRealNVP | ConditionedBottleneckMLP
+)
 
 
 @dataclass(frozen=True)
@@ -110,6 +125,10 @@ class TrainingConfig:
     seed: int = 0
     device: str = "auto"
     epochs: int = 100
+    training_mode: str = "epochs_v1"
+    steps: int | None = None
+    warmup_steps: int | None = None
+    validation_interval_steps: int | None = None
     batch_size: int = 256
     learning_rate: float = 1.0e-3
     weight_decay: float = 1.0e-4
@@ -154,6 +173,10 @@ class TrainingConfig:
     flow_loss_weighting: str | None = None
     flow_noise_ratio_min: float | None = None
     flow_noise_ratio_max: float | None = None
+    field_hidden_sizes: tuple[int, ...] | None = None
+    vp_hidden_sizes: tuple[int, ...] | None = None
+    vp_beta_min: float | None = None
+    vp_beta_max: float | None = None
 
     def __post_init__(self) -> None:
         integer_positive = {
@@ -167,6 +190,47 @@ class TrainingConfig:
         for name, value in integer_positive.items():
             if isinstance(value, bool) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if self.training_mode not in {"epochs_v1", "fixed_steps_v1"}:
+            raise ValueError("training_mode must be epochs_v1 or fixed_steps_v1")
+        fixed_step_values = (
+            self.steps,
+            self.warmup_steps,
+            self.validation_interval_steps,
+        )
+        if self.training_mode == "epochs_v1":
+            if any(value is not None for value in fixed_step_values):
+                raise ValueError(
+                    "fixed-step settings require training_mode=fixed_steps_v1"
+                )
+        else:
+            if any(value is None for value in fixed_step_values):
+                raise ValueError(
+                    "fixed_steps_v1 requires steps, warmup_steps, and "
+                    "validation_interval_steps"
+                )
+            assert self.steps is not None
+            assert self.warmup_steps is not None
+            assert self.validation_interval_steps is not None
+            if (
+                isinstance(self.steps, bool)
+                or not isinstance(self.steps, int)
+                or self.steps <= 0
+            ):
+                raise ValueError("steps must be a positive integer")
+            if (
+                isinstance(self.warmup_steps, bool)
+                or not isinstance(self.warmup_steps, int)
+                or not 0 <= self.warmup_steps < self.steps
+            ):
+                raise ValueError("warmup_steps must be an integer in [0, steps)")
+            if (
+                isinstance(self.validation_interval_steps, bool)
+                or not isinstance(self.validation_interval_steps, int)
+                or self.validation_interval_steps <= 0
+            ):
+                raise ValueError("validation_interval_steps must be positive")
+            if self.early_stopping_patience is not None:
+                raise ValueError("fixed_steps_v1 forbids early stopping")
         if self.depth is not None and (
             isinstance(self.depth, bool)
             or not isinstance(self.depth, int)
@@ -279,6 +343,21 @@ class TrainingConfig:
                     "complete block"
                 )
             _affine_spec_from_training_config(self)
+        vp_values = (self.vp_hidden_sizes, self.vp_beta_min, self.vp_beta_max)
+        if any(value is not None for value in vp_values):
+            if any(value is None for value in vp_values):
+                raise ValueError("VP settings must be provided as one complete block")
+            assert self.vp_hidden_sizes is not None
+            object.__setattr__(self, "vp_hidden_sizes", tuple(self.vp_hidden_sizes))
+            _vp_architecture_from_training_config(self, ambient_dim=2)
+            _vp_schedule_from_training_config(self)
+        if self.field_hidden_sizes is not None:
+            object.__setattr__(
+                self, "field_hidden_sizes", tuple(self.field_hidden_sizes)
+            )
+            _bottleneck_architecture_from_training_config(
+                self, family="rectified_flow", ambient_dim=2
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -288,7 +367,12 @@ class TrainingConfig:
         unknown = set(value) - set(cls.__dataclass_fields__)
         if unknown:
             raise ValueError(f"unknown training settings: {sorted(unknown)}")
-        return cls(**dict(value))
+        fields = dict(value)
+        if isinstance(fields.get("vp_hidden_sizes"), list):
+            fields["vp_hidden_sizes"] = tuple(fields["vp_hidden_sizes"])
+        if isinstance(fields.get("field_hidden_sizes"), list):
+            fields["field_hidden_sizes"] = tuple(fields["field_hidden_sizes"])
+        return cls(**fields)
 
 
 def _bridge_spec_from_training_config(config: TrainingConfig) -> BrownianBridgeSpec:
@@ -364,6 +448,9 @@ def _affine_spec_from_training_config(config: TrainingConfig) -> AffineFlowSpec:
         "bridge_terminal_time": config.bridge_terminal_time,
         "bridge_tau_min": config.bridge_tau_min,
         "bridge_tau_max": config.bridge_tau_max,
+        "vp_hidden_sizes": config.vp_hidden_sizes,
+        "vp_beta_min": config.vp_beta_min,
+        "vp_beta_max": config.vp_beta_max,
     }
     present_inactive = [name for name, value in inactive.items() if value is not None]
     if present_inactive:
@@ -388,6 +475,145 @@ def _has_affine_settings(config: TrainingConfig) -> bool:
             config.flow_noise_ratio_max,
         )
     )
+
+
+def _has_vp_settings(config: TrainingConfig) -> bool:
+    return any(
+        value is not None
+        for value in (
+            config.vp_hidden_sizes,
+            config.vp_beta_min,
+            config.vp_beta_max,
+        )
+    )
+
+
+def _vp_architecture_from_training_config(
+    config: TrainingConfig, *, ambient_dim: int
+) -> VPBottleneckConfig:
+    if config.vp_hidden_sizes is None:
+        raise ValueError("vp_diffusion requires explicit vp_hidden_sizes")
+    return VPBottleneckConfig(
+        ambient_dim=ambient_dim,
+        hidden_sizes=tuple(config.vp_hidden_sizes),
+        time_dim=config.time_embedding_dim,
+    )
+
+
+def _vp_schedule_from_training_config(config: TrainingConfig) -> VPSchedule:
+    if config.vp_beta_min is None or config.vp_beta_max is None:
+        raise ValueError("vp_diffusion requires explicit VP beta endpoints")
+    inactive = {
+        "sigma_min": config.sigma_min,
+        "sigma_max": config.sigma_max,
+        "time_min": config.time_min,
+        "time_max": config.time_max,
+        "num_coupling_layers": config.num_coupling_layers,
+        "conditioner_depth": config.conditioner_depth,
+        "log_scale_limit": config.log_scale_limit,
+        "epsilon_min": config.epsilon_min,
+        "epsilon_max": config.epsilon_max,
+        "bridge_construction": config.bridge_construction,
+        "bridge_reference_process": config.bridge_reference_process,
+        "bridge_initial_marginal": config.bridge_initial_marginal,
+        "bridge_terminal_marginal": config.bridge_terminal_marginal,
+        "bridge_factor_f": config.bridge_factor_f,
+        "bridge_factor_g": config.bridge_factor_g,
+        "bridge_conditioning": config.bridge_conditioning,
+        "bridge_diffusivity": config.bridge_diffusivity,
+        "bridge_terminal_time": config.bridge_terminal_time,
+        "bridge_tau_min": config.bridge_tau_min,
+        "bridge_tau_max": config.bridge_tau_max,
+        "flow_variant_id": config.flow_variant_id,
+        "flow_schedule": config.flow_schedule,
+        "flow_parameterization": config.flow_parameterization,
+        "flow_conditioning": config.flow_conditioning,
+        "flow_scale_sampling": config.flow_scale_sampling,
+        "flow_loss_weighting": config.flow_loss_weighting,
+        "flow_noise_ratio_min": config.flow_noise_ratio_min,
+        "flow_noise_ratio_max": config.flow_noise_ratio_max,
+        "field_hidden_sizes": config.field_hidden_sizes,
+    }
+    present = [name for name, value in inactive.items() if value is not None]
+    if present:
+        raise ValueError(f"vp_diffusion forbids inactive family settings: {present}")
+    return VPSchedule(
+        beta_min=float(config.vp_beta_min), beta_max=float(config.vp_beta_max)
+    )
+
+
+def _bottleneck_architecture_from_training_config(
+    config: TrainingConfig, *, family: Family, ambient_dim: int
+) -> VPBottleneckConfig:
+    if config.field_hidden_sizes is None:
+        raise ValueError("field_hidden_sizes are required for the bottleneck backbone")
+    condition_transform: Literal["linear", "log"] = (
+        "log"
+        if family in {"gaussian_diffusion", "brownian_schrodinger_bridge"}
+        else "linear"
+    )
+    return VPBottleneckConfig(
+        ambient_dim=ambient_dim,
+        hidden_sizes=tuple(config.field_hidden_sizes),
+        time_dim=config.time_embedding_dim,
+        condition_transform=condition_transform,
+    )
+
+
+def field_parameter_count(
+    family: str,
+    config: TrainingConfig | Mapping[str, Any],
+    ambient_dim: int,
+) -> int:
+    """Return the exact trainable vector-field capacity for one cell."""
+
+    canonical = _canonical_family(family)
+    resolved = _coerce_config(config)
+    if canonical == "scale_conditioned_normalizing_flow":
+        raise ValueError("normalizing flows are not vector fields")
+    if canonical == "vp_diffusion":
+        architecture = _vp_architecture_from_training_config(
+            resolved, ambient_dim=ambient_dim
+        )
+        return bottleneck_parameter_count(
+            architecture.ambient_dim,
+            architecture.hidden_sizes,
+            architecture.time_dim,
+        )
+    if resolved.field_hidden_sizes is not None:
+        architecture = _bottleneck_architecture_from_training_config(
+            resolved, family=canonical, ambient_dim=ambient_dim
+        )
+        return bottleneck_parameter_count(
+            architecture.ambient_dim,
+            architecture.hidden_sizes,
+            architecture.time_dim,
+            condition_transform=architecture.condition_transform,
+        )
+    if canonical == "independent_affine_flow":
+        legacy = _affine_field_architecture_from_training_config(
+            resolved, ambient_dim=ambient_dim
+        )
+    elif resolved.depth is None:
+        raise ValueError(f"{canonical} requires explicit neural-field depth")
+    else:
+        legacy = NeuralFieldConfig(
+            ambient_dim=ambient_dim,
+            hidden_dim=resolved.hidden_dim,
+            depth=resolved.depth,
+            condition_dim=resolved.time_embedding_dim,
+            fourier_features=resolved.fourier_features,
+            max_condition_frequency=resolved.max_condition_frequency,
+            dropout=resolved.dropout,
+            condition_transform=(
+                "log"
+                if canonical in {"gaussian_diffusion", "brownian_schrodinger_bridge"}
+                else "linear"
+            ),
+        )
+    with torch.device("meta"):
+        model = ScaleConditionedNeuralField(legacy)
+    return sum(parameter.numel() for parameter in model.parameters())
 
 
 def _affine_field_architecture_from_training_config(
@@ -467,6 +693,13 @@ def _nf_architecture_from_training_config(
 def _model_contract(family: Family, config: TrainingConfig) -> dict[str, Any]:
     """Return the checkpointed scientific identity for one canonical family."""
 
+    if family == "vp_diffusion":
+        schedule = _vp_schedule_from_training_config(config)
+        return {
+            "schema_version": 1,
+            "family": "vp_diffusion",
+            "objective": schedule.contract(),
+        }
     if family == "scale_conditioned_normalizing_flow":
         _nf_architecture_from_training_config(config, ambient_dim=2)
         assert config.epsilon_min is not None
@@ -493,6 +726,18 @@ def _model_contract(family: Family, config: TrainingConfig) -> dict[str, Any]:
 @dataclass(frozen=True)
 class EpochMetrics:
     epoch: int
+    train_loss: float
+    validation_loss: float
+    learning_rate: float
+
+    def to_dict(self) -> dict[str, float | int]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class StepMetrics:
+    step: int
+    examples_seen: int
     train_loss: float
     validation_loss: float
     learning_rate: float
@@ -590,7 +835,7 @@ class TrainingResult:
     family: Family
     model: TrainableModel
     config: TrainingConfig
-    history: tuple[EpochMetrics, ...]
+    history: tuple[EpochMetrics | StepMetrics, ...]
     best_epoch: int
     best_validation_loss: float
     checkpoint_path: Path
@@ -599,10 +844,23 @@ class TrainingResult:
     normalization_scale: float
     preprocessing: Mapping[str, str | float | int]
     preprocessing_sha256: str
+    weights_metadata: Mapping[str, Any] = field(default_factory=dict)
+    final_model_state: Mapping[str, Tensor] | None = None
 
     @property
     def metrics(self) -> dict[str, float | int]:
         final = self.history[-1]
+        if isinstance(final, StepMetrics):
+            return {
+                "steps_completed": final.step,
+                "examples_seen_total": final.examples_seen,
+                "best_step": self.best_epoch,
+                "examples_seen_at_selected_checkpoint": self.best_epoch
+                * self.config.batch_size,
+                "best_validation_loss": self.best_validation_loss,
+                "final_train_loss": final.train_loss,
+                "final_validation_loss": final.validation_loss,
+            }
         return {
             "epochs_completed": final.epoch,
             "best_epoch": self.best_epoch,
@@ -622,6 +880,8 @@ def _canonical_family(family: str) -> Family:
     aliases: dict[str, Family] = {
         "diffusion": "gaussian_diffusion",
         "gaussian_diffusion": "gaussian_diffusion",
+        "vp": "vp_diffusion",
+        "vp_diffusion": "vp_diffusion",
         "rectified_flow": "rectified_flow",
         "independent_affine_flow": "independent_affine_flow",
         "schrodinger_bridge": "brownian_schrodinger_bridge",
@@ -633,7 +893,8 @@ def _canonical_family(family: str) -> Family:
         return aliases[str(family)]
     except KeyError as exc:
         raise ValueError(
-            "family must be diffusion, gaussian_diffusion, rectified_flow, "
+            "family must be diffusion, gaussian_diffusion, vp, vp_diffusion, "
+            "rectified_flow, "
             "independent_affine_flow, schrodinger_bridge, "
             "brownian_schrodinger_bridge, "
             "scale_conditioned_nf, or scale_conditioned_normalizing_flow"
@@ -851,6 +1112,21 @@ def _objective(
     config: TrainingConfig,
     generator: torch.Generator,
 ) -> Tensor:
+    if family == "vp_diffusion":
+        schedule = _vp_schedule_from_training_config(config)
+        time = torch.rand(
+            batch.shape[0],
+            device=batch.device,
+            dtype=batch.dtype,
+            generator=generator,
+        )
+        noise = torch.randn(
+            batch.shape,
+            device=batch.device,
+            dtype=batch.dtype,
+            generator=generator,
+        )
+        return vp_loss(model, batch, time, noise, schedule)
     if family == "gaussian_diffusion":
         if config.sigma_min is None or config.sigma_max is None:
             raise ValueError(
@@ -932,6 +1208,33 @@ def _validation_loss(
     return weighted_loss / validation.shape[0]
 
 
+def evaluate_native_loss(
+    result: TrainingResult,
+    data: Any,
+    *,
+    seed: int,
+) -> float:
+    """Evaluate the checkpoint's target-free native loss on declared data."""
+
+    if not isinstance(result, TrainingResult):
+        raise TypeError("evaluate_native_loss requires a TrainingResult")
+    data_cpu = _flat_finite_data(data, name="validation")
+    if data_cpu.shape[1] != result.model.config.ambient_dim:
+        raise ValueError("validation ambient dimension does not match model")
+    normalized = (
+        data_cpu - result.normalization_mean.reshape(1, -1)
+    ) / result.normalization_scale
+    parameter = next(result.model.parameters())
+    validation = normalized.to(device=parameter.device, dtype=parameter.dtype)
+    return _validation_loss(
+        result.family,
+        result.model,
+        validation,
+        result.config,
+        seed=seed,
+    )
+
+
 def _checkpoint_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -945,6 +1248,109 @@ def _cpu_state_dict(model: nn.Module) -> dict[str, Tensor]:
         name: value.detach().cpu().clone().contiguous()
         for name, value in model.state_dict().items()
     }
+
+
+def _state_dict_sha256(state: Mapping[str, Tensor]) -> str:
+    digest = hashlib.sha256()
+    for name in sorted(state):
+        value = torch.as_tensor(state[name]).detach().cpu().contiguous()
+        header = json.dumps(
+            {
+                "name": name,
+                "dtype": str(value.dtype),
+                "shape": list(value.shape),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        digest.update(len(header).to_bytes(8, "big"))
+        digest.update(header)
+        digest.update(memoryview(value.view(torch.uint8).numpy()).cast("B"))
+    return digest.hexdigest()
+
+
+class _FixedStepScheduler:
+    """Minimal versioned step scheduler with a strict resumable state."""
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        *,
+        base_learning_rate: float,
+        total_steps: int,
+        warmup_steps: int,
+        schedule: Literal["constant_v1", "warmup_cosine_v1"],
+    ) -> None:
+        self.optimizer = optimizer
+        self.base_learning_rate = base_learning_rate
+        self.total_steps = total_steps
+        self.warmup_steps = warmup_steps
+        self.schedule = schedule
+        self.last_completed_step = 0
+
+    def _multiplier(self, step: int) -> float:
+        if self.schedule == "constant_v1":
+            return 1.0
+        if self.warmup_steps and step <= self.warmup_steps:
+            return step / self.warmup_steps
+        if self.warmup_steps:
+            progress = (step - self.warmup_steps) / (
+                self.total_steps - self.warmup_steps
+            )
+        elif self.total_steps == 1:
+            progress = 0.0
+        else:
+            progress = (step - 1) / (self.total_steps - 1)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    def prepare_step(self, step: int) -> float:
+        if step != self.last_completed_step + 1:
+            raise ValueError("scheduler step is inconsistent with resume state")
+        learning_rate = self.base_learning_rate * self._multiplier(step)
+        for group in self.optimizer.param_groups:
+            group["lr"] = learning_rate
+        return learning_rate
+
+    def complete_step(self, step: int) -> None:
+        if step != self.last_completed_step + 1:
+            raise ValueError("scheduler completion is inconsistent with resume state")
+        self.last_completed_step = step
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "schedule": self.schedule,
+            "base_learning_rate": self.base_learning_rate,
+            "total_steps": self.total_steps,
+            "warmup_steps": self.warmup_steps,
+            "last_completed_step": self.last_completed_step,
+        }
+
+    def load_state_dict(self, value: Mapping[str, Any]) -> None:
+        expected = {
+            "schema_version": 1,
+            "schedule": self.schedule,
+            "base_learning_rate": self.base_learning_rate,
+            "total_steps": self.total_steps,
+            "warmup_steps": self.warmup_steps,
+        }
+        if (
+            not isinstance(value, Mapping)
+            or {key: value.get(key) for key in expected} != expected
+        ):
+            raise ValueError("fixed-step scheduler state mismatch")
+        last_step = value.get("last_completed_step")
+        if (
+            isinstance(last_step, bool)
+            or not isinstance(last_step, int)
+            or not 0 <= last_step <= self.total_steps
+        ):
+            raise ValueError("fixed-step scheduler step is invalid")
+        self.last_completed_step = last_step
+        if last_step:
+            learning_rate = self.base_learning_rate * self._multiplier(last_step)
+            for group in self.optimizer.param_groups:
+                group["lr"] = learning_rate
 
 
 def _tensor_identity_sha256(value: Tensor) -> str:
@@ -1035,6 +1441,96 @@ def _atomic_torch_save(path: Path, payload: Mapping[str, Any]) -> None:
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
+
+
+def _fixed_weights_metadata(
+    *,
+    best_state: Mapping[str, Tensor],
+    final_state: Mapping[str, Tensor],
+    best_step: int,
+    final_step: int,
+    batch_size: int,
+    initial_validation_loss: float,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "selection": "minimum_train_selection_native_loss_v1",
+        "initial": {
+            "step": 0,
+            "examples_seen": 0,
+            "validation_loss": initial_validation_loss,
+        },
+        "selected": {
+            "kind": "validation_best",
+            "step": best_step,
+            "examples_seen": best_step * batch_size,
+            "state_sha256": _state_dict_sha256(best_state),
+        },
+        "final": {
+            "kind": "final",
+            "step": final_step,
+            "examples_seen": final_step * batch_size,
+            "state_sha256": _state_dict_sha256(final_state),
+        },
+    }
+
+
+def _save_fixed_step_checkpoint(
+    path: Path,
+    *,
+    family: Family,
+    model: TrainableModel,
+    config: TrainingConfig,
+    history: tuple[StepMetrics, ...],
+    best_step: int,
+    best_validation_loss: float,
+    best_state: Mapping[str, Tensor],
+    final_state: Mapping[str, Tensor],
+    initial_validation_loss: float,
+    normalization_mean: Tensor,
+    normalization_scale: float,
+    preprocessing: Mapping[str, str | float | int],
+    preprocessing_sha256: str,
+) -> tuple[str, dict[str, Any]]:
+    assert config.steps is not None
+    weights_metadata = _fixed_weights_metadata(
+        best_state=best_state,
+        final_state=final_state,
+        best_step=best_step,
+        final_step=config.steps,
+        batch_size=config.batch_size,
+        initial_validation_loss=initial_validation_loss,
+    )
+    payload: dict[str, Any] = {
+        "schema_version": FIXED_STEP_CHECKPOINT_SCHEMA_VERSION,
+        "family": family,
+        "model_contract": _model_contract(family, config),
+        "architecture": model.config.to_dict(),
+        "training_config": config.to_dict(),
+        "model_state": {
+            name: value.detach().cpu().clone().contiguous()
+            for name, value in best_state.items()
+        },
+        "final_model_state": {
+            name: value.detach().cpu().clone().contiguous()
+            for name, value in final_state.items()
+        },
+        "history": [metric.to_dict() for metric in history],
+        "best_step": best_step,
+        "best_validation_loss": best_validation_loss,
+        "global_step": config.steps,
+        "examples_seen_total": config.steps * config.batch_size,
+        "examples_seen_at_selected_checkpoint": best_step * config.batch_size,
+        "weights_metadata": weights_metadata,
+        "normalization": {
+            "mean": normalization_mean.detach().cpu().contiguous(),
+            "scale": normalization_scale,
+            "preprocessing": dict(preprocessing),
+            "sha256": preprocessing_sha256,
+        },
+    }
+    _atomic_torch_save(path, payload)
+    return _checkpoint_sha256(path), weights_metadata
 
 
 def _training_progress_payload(
@@ -1144,7 +1640,11 @@ def _load_training_progress(
         raise ValueError("unsupported training progress schema_version")
     if _canonical_family(payload["family"]) != family:
         raise ValueError("training progress family mismatch")
-    if payload["training_config"] != config.to_dict():
+    try:
+        stored_config = TrainingConfig.from_mapping(payload["training_config"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("training progress config mismatch") from exc
+    if stored_config != config:
         raise ValueError("training progress config mismatch")
     if payload["model_contract"] != _model_contract(family, config):
         raise ValueError("training progress model contract mismatch")
@@ -1261,6 +1761,269 @@ def _load_training_progress(
     )
 
 
+def _fixed_training_progress_payload(
+    *,
+    family: Family,
+    model: TrainableModel,
+    optimizer: torch.optim.Optimizer,
+    scheduler: _FixedStepScheduler,
+    config: TrainingConfig,
+    global_step: int,
+    history: tuple[StepMetrics, ...],
+    best_step: int,
+    best_validation_loss: float,
+    initial_validation_loss: float,
+    best_state: Mapping[str, Tensor],
+    normalization_mean: Tensor,
+    normalization_scale: float,
+    preprocessing: Mapping[str, str | float | int],
+    preprocessing_sha256: str,
+    data_identity: Mapping[str, Any],
+    sampler_generator: torch.Generator,
+    objective_generator: torch.Generator,
+    device: torch.device,
+) -> dict[str, Any]:
+    return {
+        "schema_version": FIXED_STEP_PROGRESS_SCHEMA_VERSION,
+        "family": family,
+        "model_contract": _model_contract(family, config),
+        "architecture": model.config.to_dict(),
+        "training_config": config.to_dict(),
+        "global_step": global_step,
+        "model_state": _cpu_state_dict(model),
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict(),
+        "history": [metric.to_dict() for metric in history],
+        "best_step": best_step,
+        "best_validation_loss": best_validation_loss,
+        "initial_validation_loss": initial_validation_loss,
+        "best_state": {
+            name: value.detach().cpu().clone().contiguous()
+            for name, value in best_state.items()
+        },
+        "normalization": {
+            "mean": normalization_mean.detach().cpu().contiguous(),
+            "scale": normalization_scale,
+            "preprocessing": dict(preprocessing),
+            "sha256": preprocessing_sha256,
+        },
+        "data_identity": dict(data_identity),
+        "sampler": {
+            "kind": "uniform_with_replacement_v1",
+            "generator_state": sampler_generator.get_state().cpu(),
+        },
+        "counters": {
+            "examples_seen_total": global_step * config.batch_size,
+        },
+        "rng": {
+            "objective_generator": objective_generator.get_state().cpu(),
+            "torch": torch.get_rng_state().cpu(),
+            "cuda": [state.cpu() for state in torch.cuda.get_rng_state_all()]
+            if device.type == "cuda"
+            else [],
+            "device_type": device.type,
+        },
+    }
+
+
+def _load_fixed_training_progress(
+    path: Path,
+    *,
+    family: Family,
+    model: TrainableModel,
+    optimizer: torch.optim.Optimizer,
+    scheduler: _FixedStepScheduler,
+    config: TrainingConfig,
+    normalization_mean: Tensor,
+    normalization_scale: float,
+    preprocessing: Mapping[str, str | float | int],
+    preprocessing_sha256: str,
+    data_identity: Mapping[str, Any],
+    sampler_generator: torch.Generator,
+    objective_generator: torch.Generator,
+    device: torch.device,
+    expected_initial_validation_loss: float,
+) -> tuple[int, list[StepMetrics], int, float, float, dict[str, Tensor]]:
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    required = {
+        "schema_version",
+        "family",
+        "model_contract",
+        "architecture",
+        "training_config",
+        "global_step",
+        "model_state",
+        "optimizer_state",
+        "scheduler_state",
+        "history",
+        "best_step",
+        "best_validation_loss",
+        "initial_validation_loss",
+        "best_state",
+        "normalization",
+        "data_identity",
+        "sampler",
+        "counters",
+        "rng",
+    }
+    if not isinstance(payload, dict) or set(payload) != required:
+        raise ValueError("fixed-step training progress schema mismatch")
+    if payload["schema_version"] != FIXED_STEP_PROGRESS_SCHEMA_VERSION:
+        raise ValueError("unsupported fixed-step progress schema_version")
+    if _canonical_family(payload["family"]) != family:
+        raise ValueError("fixed-step training progress family mismatch")
+    try:
+        stored_config = TrainingConfig.from_mapping(payload["training_config"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("fixed-step training progress config mismatch") from exc
+    if stored_config != config:
+        raise ValueError("fixed-step training progress config mismatch")
+    if payload["model_contract"] != _model_contract(family, config):
+        raise ValueError("fixed-step training progress model contract mismatch")
+    if payload["architecture"] != model.config.to_dict():
+        raise ValueError("fixed-step training progress architecture mismatch")
+    if payload["data_identity"] != dict(data_identity):
+        raise ValueError("fixed-step training progress data identity mismatch")
+
+    normalization = payload["normalization"]
+    if not isinstance(normalization, dict) or set(normalization) != {
+        "mean",
+        "scale",
+        "preprocessing",
+        "sha256",
+    }:
+        raise ValueError("fixed-step progress normalization schema mismatch")
+    stored_mean = torch.as_tensor(normalization["mean"]).detach().cpu().float()
+    if not torch.equal(stored_mean, normalization_mean.detach().cpu().float()):
+        raise ValueError("fixed-step progress normalization mean mismatch")
+    if float(normalization["scale"]) != normalization_scale:
+        raise ValueError("fixed-step progress normalization scale mismatch")
+    if (
+        normalization["preprocessing"] != dict(preprocessing)
+        or normalization["sha256"] != preprocessing_sha256
+    ):
+        raise ValueError("fixed-step progress preprocessing identity mismatch")
+
+    assert config.steps is not None
+    global_step = payload["global_step"]
+    if (
+        isinstance(global_step, bool)
+        or not isinstance(global_step, int)
+        or not 1 <= global_step <= config.steps
+    ):
+        raise ValueError("fixed-step progress global_step is invalid")
+    history_raw = payload["history"]
+    if not isinstance(history_raw, list) or not history_raw:
+        raise ValueError("fixed-step progress history is invalid")
+    history: list[StepMetrics] = []
+    history_fields = {
+        "step",
+        "examples_seen",
+        "train_loss",
+        "validation_loss",
+        "learning_rate",
+    }
+    for item in history_raw:
+        if not isinstance(item, dict) or set(item) != history_fields:
+            raise ValueError("fixed-step progress history entry schema mismatch")
+        metric = StepMetrics(**item)
+        if metric.examples_seen != metric.step * config.batch_size or not all(
+            math.isfinite(float(value))
+            for value in (
+                metric.train_loss,
+                metric.validation_loss,
+                metric.learning_rate,
+            )
+        ):
+            raise ValueError("fixed-step progress history entry is invalid")
+        history.append(metric)
+    if history[-1].step != global_step or any(
+        left.step >= right.step for left, right in pairwise(history)
+    ):
+        raise ValueError("fixed-step progress history steps are inconsistent")
+
+    best_step = payload["best_step"]
+    best_validation_loss = float(payload["best_validation_loss"])
+    initial_validation_loss = float(payload["initial_validation_loss"])
+    if (
+        isinstance(best_step, bool)
+        or not isinstance(best_step, int)
+        or best_step not in {metric.step for metric in history}
+        or not math.isfinite(best_validation_loss)
+        or not math.isfinite(initial_validation_loss)
+    ):
+        raise ValueError("fixed-step progress best-state metadata is invalid")
+    if initial_validation_loss != expected_initial_validation_loss:
+        raise ValueError("fixed-step progress initial validation loss mismatch")
+    expected_best = min(
+        history, key=lambda metric: (metric.validation_loss, metric.step)
+    )
+    if (
+        best_step != expected_best.step
+        or best_validation_loss != expected_best.validation_loss
+    ):
+        raise ValueError("fixed-step progress best selection is invalid")
+    best_state = payload["best_state"]
+    if not isinstance(best_state, dict) or not best_state:
+        raise ValueError("fixed-step progress best_state is invalid")
+    sampler = payload["sampler"]
+    if not isinstance(sampler, dict) or set(sampler) != {
+        "kind",
+        "generator_state",
+    }:
+        raise ValueError("fixed-step progress sampler schema mismatch")
+    if sampler["kind"] != "uniform_with_replacement_v1":
+        raise ValueError("fixed-step progress sampler kind mismatch")
+    counters = payload["counters"]
+    if counters != {"examples_seen_total": global_step * config.batch_size}:
+        raise ValueError("fixed-step progress counters mismatch")
+    rng = payload["rng"]
+    if not isinstance(rng, dict) or set(rng) != {
+        "objective_generator",
+        "torch",
+        "cuda",
+        "device_type",
+    }:
+        raise ValueError("fixed-step progress RNG schema mismatch")
+    if rng["device_type"] != device.type:
+        raise ValueError("fixed-step progress device type mismatch")
+    cuda_states = rng["cuda"]
+    if not isinstance(cuda_states, list):
+        raise TypeError("fixed-step progress CUDA RNG states are invalid")
+    if device.type == "cuda" and len(cuda_states) != torch.cuda.device_count():
+        raise ValueError("fixed-step progress CUDA device count mismatch")
+    if device.type != "cuda" and cuda_states:
+        raise ValueError("CPU fixed-step progress cannot carry CUDA RNG states")
+
+    model.load_state_dict(payload["model_state"], strict=True)
+    optimizer.load_state_dict(payload["optimizer_state"])
+    scheduler.load_state_dict(payload["scheduler_state"])
+    if scheduler.last_completed_step != global_step:
+        raise ValueError("fixed-step progress scheduler/global_step mismatch")
+    sampler_generator.set_state(
+        torch.as_tensor(sampler["generator_state"]).detach().cpu()
+    )
+    objective_generator.set_state(
+        torch.as_tensor(rng["objective_generator"]).detach().cpu()
+    )
+    torch.set_rng_state(torch.as_tensor(rng["torch"]).detach().cpu())
+    if device.type == "cuda":
+        torch.cuda.set_rng_state_all(
+            [torch.as_tensor(state).detach().cpu() for state in cuda_states]
+        )
+    return (
+        global_step + 1,
+        history,
+        best_step,
+        best_validation_loss,
+        initial_validation_loss,
+        {
+            str(name): torch.as_tensor(value).detach().cpu().clone().contiguous()
+            for name, value in best_state.items()
+        },
+    )
+
+
 def train_model(
     family: str,
     train: Any,
@@ -1289,6 +2052,30 @@ def train_model(
         raise ValueError(
             f"{canonical_family} cannot carry inactive independent affine-flow settings"
         )
+    if canonical_family == "vp_diffusion":
+        _vp_architecture_from_training_config(resolved_config, ambient_dim=2)
+        _vp_schedule_from_training_config(resolved_config)
+        if resolved_config.training_mode != "fixed_steps_v1":
+            raise ValueError("vp_diffusion requires training_mode=fixed_steps_v1")
+        if resolved_config.gradient_clip_norm is not None:
+            raise ValueError("vp_diffusion requires gradient_clip_norm=null")
+        if resolved_config.field_hidden_sizes is not None:
+            raise ValueError(
+                "vp_diffusion uses vp_hidden_sizes, not field_hidden_sizes"
+            )
+    elif _has_vp_settings(resolved_config):
+        raise ValueError(f"{canonical_family} cannot carry inactive VP settings")
+    if (
+        canonical_family == "scale_conditioned_normalizing_flow"
+        and resolved_config.field_hidden_sizes is not None
+    ):
+        raise ValueError("scale-conditioned NF cannot carry field_hidden_sizes")
+    if (
+        resolved_config.training_mode == "fixed_steps_v1"
+        and canonical_family != "vp_diffusion"
+        and resolved_config.warmup_steps != 0
+    ):
+        raise ValueError("non-VP fixed-step training requires warmup_steps=0")
     if canonical_family == "brownian_schrodinger_bridge":
         bridge_spec = _bridge_spec_from_training_config(resolved_config)
         if (
@@ -1339,16 +2126,42 @@ def train_model(
     previous_deterministic = torch.are_deterministic_algorithms_enabled()
     previous_cudnn_benchmark = torch.backends.cudnn.benchmark
     previous_cudnn_deterministic = torch.backends.cudnn.deterministic
+    previous_cuda_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+    previous_cudnn_tf32 = torch.backends.cudnn.allow_tf32
     if resolved_config.deterministic:
         torch.use_deterministic_algorithms(True)
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
+    if canonical_family == "vp_diffusion":
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
     try:
         if canonical_family == "scale_conditioned_normalizing_flow":
             nf_architecture = _nf_architecture_from_training_config(
                 resolved_config, ambient_dim=train_cpu.shape[1]
             )
             model: TrainableModel = ScaleConditionedRealNVP(nf_architecture).to(device)
+        elif canonical_family == "vp_diffusion":
+            vp_architecture = _vp_architecture_from_training_config(
+                resolved_config, ambient_dim=train_cpu.shape[1]
+            )
+            model = VPBottleneckMLP(
+                vp_architecture.ambient_dim,
+                vp_architecture.hidden_sizes,
+                vp_architecture.time_dim,
+            ).to(device)
+        elif resolved_config.field_hidden_sizes is not None:
+            bottleneck_architecture = _bottleneck_architecture_from_training_config(
+                resolved_config,
+                family=canonical_family,
+                ambient_dim=train_cpu.shape[1],
+            )
+            model = ConditionedBottleneckMLP(
+                bottleneck_architecture.ambient_dim,
+                bottleneck_architecture.hidden_sizes,
+                bottleneck_architecture.time_dim,
+                condition_transform=bottleneck_architecture.condition_transform,
+            ).to(device)
         else:
             if canonical_family == "independent_affine_flow":
                 field_architecture = _affine_field_architecture_from_training_config(
@@ -1376,6 +2189,8 @@ def train_model(
                 )
             model = ScaleConditionedNeuralField(field_architecture).to(device)
         model._lid_family = canonical_family
+        if canonical_family == "vp_diffusion":
+            model._lid_vp_schedule = _vp_schedule_from_training_config(resolved_config)
         if canonical_family == "independent_affine_flow":
             model._lid_affine_spec = _affine_spec_from_training_config(resolved_config)
         train_tensor = train_cpu.to(device)
@@ -1389,6 +2204,202 @@ def train_model(
         shuffle_generator.manual_seed(resolved_config.seed + 17)
         objective_generator = torch.Generator(device=device)
         objective_generator.manual_seed(resolved_config.seed + 31)
+
+        if resolved_config.training_mode == "fixed_steps_v1":
+            assert resolved_config.steps is not None
+            assert resolved_config.warmup_steps is not None
+            assert resolved_config.validation_interval_steps is not None
+            scheduler = _FixedStepScheduler(
+                optimizer,
+                base_learning_rate=resolved_config.learning_rate,
+                total_steps=resolved_config.steps,
+                warmup_steps=resolved_config.warmup_steps,
+                schedule=(
+                    "warmup_cosine_v1"
+                    if canonical_family == "vp_diffusion"
+                    else "constant_v1"
+                ),
+            )
+            step_history: list[StepMetrics] = []
+            best_validation_loss = math.inf
+            initial_validation_loss = _validation_loss(
+                canonical_family,
+                model,
+                validation_tensor,
+                resolved_config,
+                seed=resolved_config.seed + 1_000_003,
+            )
+            if not math.isfinite(initial_validation_loss):
+                raise FloatingPointError("non-finite initial validation loss")
+            best_step = 0
+            best_state: dict[str, Tensor] | None = None
+            start_step = 1
+            if progress_path is not None and progress_path.exists():
+                (
+                    start_step,
+                    step_history,
+                    best_step,
+                    best_validation_loss,
+                    initial_validation_loss,
+                    best_state,
+                ) = _load_fixed_training_progress(
+                    progress_path,
+                    family=canonical_family,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    config=resolved_config,
+                    normalization_mean=mean,
+                    normalization_scale=scale,
+                    preprocessing=preprocessing,
+                    preprocessing_sha256=preprocessing_sha256,
+                    data_identity=data_identity,
+                    sampler_generator=shuffle_generator,
+                    objective_generator=objective_generator,
+                    device=device,
+                    expected_initial_validation_loss=initial_validation_loss,
+                )
+            interval_loss_sum = 0.0
+            interval_examples = 0
+            parameter_count = sum(parameter.numel() for parameter in model.parameters())
+            for step in range(start_step, resolved_config.steps + 1):
+                model.train()
+                indices = torch.randint(
+                    train_tensor.shape[0],
+                    (resolved_config.batch_size,),
+                    generator=shuffle_generator,
+                    device="cpu",
+                ).to(device)
+                batch = train_tensor[indices]
+                learning_rate = scheduler.prepare_step(step)
+                optimizer.zero_grad(set_to_none=True)
+                loss = _objective(
+                    canonical_family,
+                    model,
+                    batch,
+                    resolved_config,
+                    objective_generator,
+                )
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(f"non-finite training loss at step {step}")
+                loss.backward()
+                if resolved_config.gradient_clip_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), resolved_config.gradient_clip_norm
+                    )
+                optimizer.step()
+                scheduler.complete_step(step)
+                interval_loss_sum += float(loss.item()) * batch.shape[0]
+                interval_examples += batch.shape[0]
+
+                should_validate = (
+                    step % resolved_config.validation_interval_steps == 0
+                    or step == resolved_config.steps
+                )
+                if not should_validate:
+                    continue
+                train_loss = interval_loss_sum / interval_examples
+                validation_loss = _validation_loss(
+                    canonical_family,
+                    model,
+                    validation_tensor,
+                    resolved_config,
+                    seed=resolved_config.seed + 1_000_003,
+                )
+                if not math.isfinite(validation_loss):
+                    raise FloatingPointError(
+                        f"non-finite validation loss at step {step}"
+                    )
+                metric = StepMetrics(
+                    step=step,
+                    examples_seen=step * resolved_config.batch_size,
+                    train_loss=train_loss,
+                    validation_loss=validation_loss,
+                    learning_rate=learning_rate,
+                )
+                step_history.append(metric)
+                if validation_loss < best_validation_loss:
+                    best_validation_loss = validation_loss
+                    best_step = step
+                    best_state = _cpu_state_dict(model)
+                if progress_path is not None:
+                    assert best_state is not None
+                    _atomic_torch_save(
+                        progress_path,
+                        _fixed_training_progress_payload(
+                            family=canonical_family,
+                            model=model,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            config=resolved_config,
+                            global_step=step,
+                            history=tuple(step_history),
+                            best_step=best_step,
+                            best_validation_loss=best_validation_loss,
+                            initial_validation_loss=initial_validation_loss,
+                            best_state=best_state,
+                            normalization_mean=mean,
+                            normalization_scale=scale,
+                            preprocessing=preprocessing,
+                            preprocessing_sha256=preprocessing_sha256,
+                            data_identity=data_identity,
+                            sampler_generator=shuffle_generator,
+                            objective_generator=objective_generator,
+                            device=device,
+                        ),
+                    )
+                if log_callback is not None:
+                    log_callback(
+                        {
+                            **metric.to_dict(),
+                            "best_step": best_step,
+                            "best_validation_loss": best_validation_loss,
+                            "parameter_count": parameter_count,
+                            "validated": True,
+                        }
+                    )
+                interval_loss_sum = 0.0
+                interval_examples = 0
+            if best_state is None or not step_history:
+                raise RuntimeError("training ended without a validation measurement")
+            final_state = _cpu_state_dict(model)
+            model.load_state_dict(best_state, strict=True)
+            model.eval()
+            history = tuple(step_history)
+            checkpoint_sha256, weights_metadata = _save_fixed_step_checkpoint(
+                checkpoint,
+                family=canonical_family,
+                model=model,
+                config=resolved_config,
+                history=history,
+                best_step=best_step,
+                best_validation_loss=best_validation_loss,
+                best_state=best_state,
+                final_state=final_state,
+                initial_validation_loss=initial_validation_loss,
+                normalization_mean=mean,
+                normalization_scale=scale,
+                preprocessing=preprocessing,
+                preprocessing_sha256=preprocessing_sha256,
+            )
+            if progress_path is not None:
+                progress_path.unlink(missing_ok=True)
+            return TrainingResult(
+                family=canonical_family,
+                model=model,
+                config=resolved_config,
+                history=history,
+                best_epoch=best_step,
+                best_validation_loss=best_validation_loss,
+                checkpoint_path=checkpoint,
+                checkpoint_sha256=checkpoint_sha256,
+                normalization_mean=mean.detach().cpu().contiguous(),
+                normalization_scale=scale,
+                preprocessing=preprocessing,
+                preprocessing_sha256=preprocessing_sha256,
+                weights_metadata=weights_metadata,
+                final_model_state=final_state,
+            )
 
         history_list: list[EpochMetrics] = []
         best_validation_loss = math.inf
@@ -1578,6 +2589,9 @@ def train_model(
             torch.use_deterministic_algorithms(previous_deterministic)
             torch.backends.cudnn.benchmark = previous_cudnn_benchmark
             torch.backends.cudnn.deterministic = previous_cudnn_deterministic
+        if canonical_family == "vp_diffusion":
+            torch.backends.cuda.matmul.allow_tf32 = previous_cuda_matmul_tf32
+            torch.backends.cudnn.allow_tf32 = previous_cudnn_tf32
 
 
 def load_checkpoint(
@@ -1601,6 +2615,23 @@ def load_checkpoint(
         "best_validation_loss",
         "normalization",
     }
+    fixed_required = {
+        "schema_version",
+        "family",
+        "model_contract",
+        "architecture",
+        "training_config",
+        "model_state",
+        "final_model_state",
+        "history",
+        "best_step",
+        "best_validation_loss",
+        "global_step",
+        "examples_seen_total",
+        "examples_seen_at_selected_checkpoint",
+        "weights_metadata",
+        "normalization",
+    }
     if not isinstance(payload, dict):
         raise TypeError("checkpoint payload must be a mapping")
     schema_version = payload.get("schema_version")
@@ -1608,6 +2639,8 @@ def load_checkpoint(
         required = legacy_required
     elif schema_version == CHECKPOINT_SCHEMA_VERSION:
         required = legacy_required | {"model_contract"}
+    elif schema_version == FIXED_STEP_CHECKPOINT_SCHEMA_VERSION:
+        required = fixed_required
     else:
         raise ValueError("unsupported checkpoint schema_version")
     if set(payload) != required:
@@ -1618,15 +2651,35 @@ def load_checkpoint(
         "independent_affine_flow",
     }:
         raise ValueError(f"{family} requires checkpoint schema_version 2")
+    if schema_version == LEGACY_CHECKPOINT_SCHEMA_VERSION and family == "vp_diffusion":
+        raise ValueError("vp_diffusion requires fixed-step checkpoint schema")
     config = TrainingConfig.from_mapping(payload["training_config"])
+    if (
+        schema_version == FIXED_STEP_CHECKPOINT_SCHEMA_VERSION
+        and config.training_mode != "fixed_steps_v1"
+    ):
+        raise ValueError("fixed-step checkpoint training mode mismatch")
+    if (
+        schema_version != FIXED_STEP_CHECKPOINT_SCHEMA_VERSION
+        and config.training_mode != "epochs_v1"
+    ):
+        raise ValueError("epoch checkpoint training mode mismatch")
     if family != "independent_affine_flow" and _has_affine_settings(config):
         raise ValueError(
             "checkpoint carries inactive independent affine-flow settings for "
             f"family {family}"
         )
+    if family == "vp_diffusion":
+        _vp_architecture_from_training_config(config, ambient_dim=2)
+        _vp_schedule_from_training_config(config)
+        if schema_version != FIXED_STEP_CHECKPOINT_SCHEMA_VERSION:
+            raise ValueError("vp_diffusion requires fixed-step checkpoint schema")
+    elif _has_vp_settings(config):
+        raise ValueError(f"checkpoint carries inactive VP settings for family {family}")
     expected_contract = _model_contract(family, config)
     if (
-        schema_version == CHECKPOINT_SCHEMA_VERSION
+        schema_version
+        in {CHECKPOINT_SCHEMA_VERSION, FIXED_STEP_CHECKPOINT_SCHEMA_VERSION}
         and payload["model_contract"] != expected_contract
     ):
         raise ValueError("checkpoint model_contract mismatch")
@@ -1643,6 +2696,41 @@ def load_checkpoint(
             resolved_device
         )
         ambient_dim = flow_architecture.ambient_dim
+    elif family == "vp_diffusion":
+        vp_architecture = VPBottleneckConfig.from_mapping(payload["architecture"])
+        declared_architecture = _vp_architecture_from_training_config(
+            config, ambient_dim=vp_architecture.ambient_dim
+        )
+        if declared_architecture != vp_architecture:
+            raise ValueError(
+                "checkpoint VP architecture does not match training_config"
+            )
+        model = VPBottleneckMLP(
+            vp_architecture.ambient_dim,
+            vp_architecture.hidden_sizes,
+            vp_architecture.time_dim,
+        ).to(resolved_device)
+        ambient_dim = vp_architecture.ambient_dim
+    elif config.field_hidden_sizes is not None:
+        bottleneck_architecture = VPBottleneckConfig.from_mapping(
+            payload["architecture"]
+        )
+        declared_architecture = _bottleneck_architecture_from_training_config(
+            config,
+            family=family,
+            ambient_dim=bottleneck_architecture.ambient_dim,
+        )
+        if declared_architecture != bottleneck_architecture:
+            raise ValueError(
+                "checkpoint bottleneck architecture does not match training_config"
+            )
+        model = ConditionedBottleneckMLP(
+            bottleneck_architecture.ambient_dim,
+            bottleneck_architecture.hidden_sizes,
+            bottleneck_architecture.time_dim,
+            condition_transform=bottleneck_architecture.condition_transform,
+        ).to(resolved_device)
+        ambient_dim = bottleneck_architecture.ambient_dim
     else:
         field_architecture = NeuralFieldConfig.from_mapping(payload["architecture"])
         if family == "independent_affine_flow":
@@ -1658,6 +2746,8 @@ def load_checkpoint(
         ambient_dim = field_architecture.ambient_dim
     model.load_state_dict(payload["model_state"], strict=True)
     model._lid_family = family
+    if family == "vp_diffusion":
+        model._lid_vp_schedule = _vp_schedule_from_training_config(config)
     if family == "independent_affine_flow":
         model._lid_affine_spec = _affine_spec_from_training_config(config)
     model.eval()
@@ -1665,16 +2755,110 @@ def load_checkpoint(
     history_raw = payload["history"]
     if not isinstance(history_raw, list) or not history_raw:
         raise ValueError("checkpoint history must be a non-empty list")
-    history: list[EpochMetrics] = []
-    for item in history_raw:
-        if not isinstance(item, dict) or set(item) != {
+    history: list[EpochMetrics | StepMetrics] = []
+    weights_metadata: Mapping[str, Any] = {}
+    final_model_state: Mapping[str, Tensor] | None = None
+    if schema_version == FIXED_STEP_CHECKPOINT_SCHEMA_VERSION:
+        step_fields = {
+            "step",
+            "examples_seen",
+            "train_loss",
+            "validation_loss",
+            "learning_rate",
+        }
+        for item in history_raw:
+            if not isinstance(item, dict) or set(item) != step_fields:
+                raise ValueError("fixed-step checkpoint history entry schema mismatch")
+            metric = StepMetrics(**item)
+            if metric.examples_seen != metric.step * config.batch_size or not all(
+                math.isfinite(float(value))
+                for value in (
+                    metric.train_loss,
+                    metric.validation_loss,
+                    metric.learning_rate,
+                )
+            ):
+                raise ValueError("fixed-step checkpoint history entry is invalid")
+            history.append(metric)
+        typed_step_history = [
+            metric for metric in history if isinstance(metric, StepMetrics)
+        ]
+        if any(left.step >= right.step for left, right in pairwise(typed_step_history)):
+            raise ValueError("fixed-step checkpoint history is not ordered")
+        assert config.steps is not None
+        global_step = payload["global_step"]
+        if global_step != config.steps or typed_step_history[-1].step != global_step:
+            raise ValueError("fixed-step checkpoint global_step mismatch")
+        if payload["examples_seen_total"] != global_step * config.batch_size:
+            raise ValueError("fixed-step checkpoint total exposure mismatch")
+        best_epoch = payload["best_step"]
+        if (
+            isinstance(best_epoch, bool)
+            or not isinstance(best_epoch, int)
+            or best_epoch not in {metric.step for metric in typed_step_history}
+        ):
+            raise ValueError("fixed-step checkpoint best_step is invalid")
+        if (
+            payload["examples_seen_at_selected_checkpoint"]
+            != best_epoch * config.batch_size
+        ):
+            raise ValueError("fixed-step checkpoint selected exposure mismatch")
+        best_validation_loss = float(payload["best_validation_loss"])
+        selected_metric = next(
+            metric for metric in typed_step_history if metric.step == best_epoch
+        )
+        if (
+            not math.isfinite(best_validation_loss)
+            or best_validation_loss != selected_metric.validation_loss
+            or best_epoch
+            != min(
+                typed_step_history,
+                key=lambda metric: (metric.validation_loss, metric.step),
+            ).step
+        ):
+            raise ValueError("fixed-step checkpoint best selection is invalid")
+        raw_final_state = payload["final_model_state"]
+        if not isinstance(raw_final_state, dict) or not raw_final_state:
+            raise ValueError("fixed-step checkpoint final_model_state is invalid")
+        model.load_state_dict(raw_final_state, strict=True)
+        model.load_state_dict(payload["model_state"], strict=True)
+        final_model_state = {
+            str(name): torch.as_tensor(value).detach().cpu().clone().contiguous()
+            for name, value in raw_final_state.items()
+        }
+        raw_weights_metadata = payload["weights_metadata"]
+        raw_initial = (
+            raw_weights_metadata.get("initial")
+            if isinstance(raw_weights_metadata, Mapping)
+            else None
+        )
+        if not isinstance(raw_initial, Mapping):
+            raise ValueError("fixed-step checkpoint initial metadata is invalid")
+        initial_validation_loss = float(raw_initial.get("validation_loss", math.nan))
+        if not math.isfinite(initial_validation_loss):
+            raise ValueError("fixed-step checkpoint initial loss is invalid")
+        expected_weights_metadata = _fixed_weights_metadata(
+            best_state=payload["model_state"],
+            final_state=final_model_state,
+            best_step=best_epoch,
+            final_step=global_step,
+            batch_size=config.batch_size,
+            initial_validation_loss=initial_validation_loss,
+        )
+        if raw_weights_metadata != expected_weights_metadata:
+            raise ValueError("fixed-step checkpoint weights metadata mismatch")
+        weights_metadata = expected_weights_metadata
+    else:
+        epoch_fields = {
             "epoch",
             "train_loss",
             "validation_loss",
             "learning_rate",
-        }:
-            raise ValueError("checkpoint history entry schema mismatch")
-        history.append(EpochMetrics(**item))
+        }
+        for item in history_raw:
+            if not isinstance(item, dict) or set(item) != epoch_fields:
+                raise ValueError("checkpoint history entry schema mismatch")
+            history.append(EpochMetrics(**item))
     normalization = payload["normalization"]
     if not isinstance(normalization, dict) or set(normalization) != {
         "mean",
@@ -1697,12 +2881,16 @@ def load_checkpoint(
         or normalization["sha256"] != preprocessing_sha256
     ):
         raise ValueError("checkpoint preprocessing identity mismatch")
-    best_epoch = int(payload["best_epoch"])
-    best_validation_loss = float(payload["best_validation_loss"])
-    if best_epoch not in {metric.epoch for metric in history}:
-        raise ValueError("checkpoint best_epoch is absent from history")
-    if not math.isfinite(best_validation_loss):
-        raise ValueError("checkpoint best_validation_loss must be finite")
+    if schema_version != FIXED_STEP_CHECKPOINT_SCHEMA_VERSION:
+        best_epoch = int(payload["best_epoch"])
+        best_validation_loss = float(payload["best_validation_loss"])
+        epoch_history = [
+            metric for metric in history if isinstance(metric, EpochMetrics)
+        ]
+        if best_epoch not in {metric.epoch for metric in epoch_history}:
+            raise ValueError("checkpoint best_epoch is absent from history")
+        if not math.isfinite(best_validation_loss):
+            raise ValueError("checkpoint best_validation_loss must be finite")
     return TrainingResult(
         family=family,
         model=model,
@@ -1716,6 +2904,8 @@ def load_checkpoint(
         normalization_scale=scale,
         preprocessing=preprocessing,
         preprocessing_sha256=preprocessing_sha256,
+        weights_metadata=weights_metadata,
+        final_model_state=final_model_state,
     )
 
 
@@ -1742,8 +2932,23 @@ def _model_and_context(
         model, ScaleConditionedRealNVP
     ):
         raise TypeError("scale-conditioned NF family requires ScaleConditionedRealNVP")
+    if canonical == "vp_diffusion" and not isinstance(model, VPBottleneckMLP):
+        raise TypeError("vp_diffusion family requires VPBottleneckMLP")
     mean = torch.zeros(model.config.ambient_dim, dtype=torch.float32)
     return model, canonical, mean, 1.0
+
+
+def _vp_schedule_for_model(
+    model_or_result: VPBottleneckMLP | TrainingResult,
+) -> VPSchedule:
+    if isinstance(model_or_result, TrainingResult):
+        return _vp_schedule_from_training_config(model_or_result.config)
+    schedule = getattr(model_or_result, "_lid_vp_schedule", None)
+    if isinstance(schedule, VPSchedule):
+        return schedule
+    raise ValueError(
+        "bare VP models require their checkpointed _lid_vp_schedule contract"
+    )
 
 
 def _bridge_spec_for_model(
@@ -2125,6 +3330,38 @@ def predict_primitives(
         generator = torch.Generator(device=device)
         generator.manual_seed(trace_seed)
 
+    if canonical_family == "vp_diffusion":
+        schedule = _vp_schedule_for_model(model_or_result)
+        schedule.time_for_lambda(scale)
+        vp_fields: list[Tensor] = []
+        vp_divergences: list[Tensor] = []
+        vp_points: list[Tensor] = []
+        native_sigma: float | None = None
+        for start in range(0, normalized.shape[0], batch_size):
+            data_batch = normalized[start : start + batch_size].to(
+                device=device, dtype=dtype
+            )
+            primitives = vp_primitives(
+                model,
+                data_batch,
+                scale,
+                schedule=schedule,
+                probes=trace_probes if divergence_backend == "hutchinson" else 0,
+                seed=trace_seed,
+                generator=generator,
+            )
+            vp_fields.append(primitives.score.detach().cpu())
+            vp_divergences.append(primitives.score_divergence.detach().cpu())
+            vp_points.append(primitives.native_query.detach().cpu())
+            native_sigma = primitives.sigma
+        assert native_sigma is not None
+        return FieldPrediction(
+            field=np.asarray(torch.cat(vp_fields).numpy(), dtype=np.float64),
+            divergence=np.asarray(torch.cat(vp_divergences).numpy(), dtype=np.float64),
+            evaluation_point=np.asarray(torch.cat(vp_points).numpy(), dtype=np.float64),
+            condition=native_sigma,
+        )
+
     fields: list[Tensor] = []
     divergences: list[Tensor] = []
     points: list[Tensor] = []
@@ -2246,6 +3483,81 @@ def predict_nf_log_likelihood(
     )
     if result.shape != (query_cpu.shape[0],) or not np.isfinite(result).all():
         raise FloatingPointError("NF log-likelihood inference produced invalid output")
+    return result
+
+
+def predict_nf_lid_ols5(
+    model_or_result: nn.Module | TrainingResult,
+    query: Any,
+    epsilon: float,
+    *,
+    family: str | None = None,
+    ols_log_step: float = 0.05,
+    batch_size: int = 256,
+) -> npt.NDArray[np.float64]:
+    """Evaluate only the five-point local-OLS NF LID readout."""
+
+    model, canonical_family, mean, normalization_scale = _model_and_context(
+        model_or_result, family
+    )
+    if canonical_family != "scale_conditioned_normalizing_flow" or not isinstance(
+        model, ScaleConditionedRealNVP
+    ):
+        raise TypeError("predict_nf_lid_ols5 requires ScaleConditionedRealNVP")
+    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
+        raise TypeError("NF epsilon must be numeric")
+    center = float(epsilon)
+    if not math.isfinite(center) or center <= 0.0:
+        raise ValueError("NF epsilon must be finite and positive")
+    if isinstance(ols_log_step, bool) or not isinstance(ols_log_step, (int, float)):
+        raise TypeError("ols_log_step must be numeric")
+    step = float(ols_log_step)
+    if not math.isfinite(step) or step <= 0.0:
+        raise ValueError("ols_log_step must be finite and positive")
+    if isinstance(model_or_result, TrainingResult):
+        epsilon_min = model_or_result.config.epsilon_min
+        epsilon_max = model_or_result.config.epsilon_max
+        if epsilon_min is None or epsilon_max is None:
+            raise ValueError("checkpoint lacks the NF epsilon training interval")
+        lower = center * math.exp(-2.0 * step)
+        upper = center * math.exp(2.0 * step)
+        tolerance = 32.0 * torch.finfo(torch.float64).eps * max(1.0, upper)
+        if (
+            lower < float(epsilon_min) - tolerance
+            or upper > float(epsilon_max) + tolerance
+        ):
+            raise ValueError(
+                "NF OLS5 window lies outside the checkpointed training interval"
+            )
+    if (
+        isinstance(batch_size, bool)
+        or not isinstance(batch_size, int)
+        or batch_size <= 0
+    ):
+        raise ValueError("batch_size must be a positive integer")
+    query_cpu = _flat_finite_data(query, name="query")
+    if query_cpu.shape[1] != model.config.ambient_dim:
+        raise ValueError("query ambient dimension does not match model")
+    normalized = (query_cpu - mean.reshape(1, -1)) / normalization_scale
+    parameter = next(model.parameters())
+    model.eval()
+    predictions: list[Tensor] = []
+    for start in range(0, normalized.shape[0], batch_size):
+        batch = normalized[start : start + batch_size].to(
+            device=parameter.device, dtype=parameter.dtype
+        )
+        predictions.append(
+            fixed_point_lid_local_ols(
+                model, batch, center, log_step=step, window_size=5
+            )
+            .detach()
+            .cpu()
+        )
+    result = np.ascontiguousarray(
+        torch.cat(predictions, dim=0).numpy(), dtype=np.float64
+    )
+    if result.shape != (query_cpu.shape[0],) or not np.isfinite(result).all():
+        raise FloatingPointError("NF OLS5 inference produced invalid output")
     return result
 
 
@@ -2493,9 +3805,9 @@ def predict_lid(
         batch_size=batch_size,
     )
     ambient_dim = model.config.ambient_dim
-    if canonical_family == "gaussian_diffusion":
+    if canonical_family in {"gaussian_diffusion", "vp_diffusion"}:
         if readout != "full":
-            raise ValueError("gaussian diffusion supports only the full readout")
+            raise ValueError("diffusion supports only the full readout")
         return np.asarray(
             diffusion_flipd(
                 prediction.field,

@@ -15,6 +15,8 @@ invalidating cells already atomically sealed by any worker.
 from __future__ import annotations
 
 import copy
+import importlib
+import inspect
 import json
 import multiprocessing as mp
 import os
@@ -37,6 +39,20 @@ H100_PROFILE: Mapping[str, Any] = {
     "evaluation_batch_size_override": 512,
 }
 
+_CAMPAIGN_MODULE_ENV = "LID_GLOBAL_CAMPAIGN_MODULE"
+_CAMPAIGN_MODULES = {
+    "experiments.global_campaign",
+    "experiments.global_campaign_v2",
+}
+
+
+def _campaign_api() -> Any:
+    module_name = os.environ.get(_CAMPAIGN_MODULE_ENV, "experiments.global_campaign")
+    if module_name not in _CAMPAIGN_MODULES:
+        raise RuntimeError(f"unsupported global campaign module: {module_name!r}")
+    return importlib.import_module(module_name)
+
+
 TELEMETRY_EPOCH_INTERVAL = 20
 
 
@@ -54,6 +70,7 @@ class ParallelDependencies:
     affine_diagnostics_fn: Any = None
     source_hash_fn: Any = None
     model_plans_fn: Any = None
+    cell_diagnostics_fn: Any = None
 
 
 @dataclass(frozen=True)
@@ -83,7 +100,7 @@ def with_cell_dag_profile(
 ) -> dict[str, Any]:
     """Return a plain config with an explicit, identity-bearing DAG profile."""
 
-    from experiments import global_campaign as campaign
+    campaign = _campaign_api()
 
     value = copy.deepcopy(campaign._mapping(hydra_config, field="global campaign"))
     value["execution"] = {
@@ -117,7 +134,7 @@ def _prepare_campaign(
     output_root: Path | None,
     dependencies: ParallelDependencies,
 ) -> _PreparedCampaign:
-    from experiments import global_campaign as campaign
+    campaign = _campaign_api()
 
     config = campaign.validate_global_campaign_config(hydra_config)
     if config["execution"]["strategy"] != campaign.EXECUTION_STRATEGY_CELL_DAG:
@@ -219,7 +236,7 @@ def _prepare_campaign(
         campaign.canonical_json(input_inventory).encode("utf-8")
     )
     identity_record = {
-        "schema_version": 1,
+        "schema_version": campaign.GLOBAL_CAMPAIGN_SCHEMA_VERSION,
         "campaign_id": campaign_id,
         "config_sha256": config_sha,
         "source_tree_sha256": source_sha,
@@ -271,7 +288,7 @@ def _prepare_campaign(
 def _cell_dependencies(cells: Sequence[Any]) -> tuple[int | None, ...]:
     """Derive the DAG only from each cell's declared reference dataset."""
 
-    from experiments import global_campaign as campaign
+    campaign = _campaign_api()
 
     indices = {cell.key: index for index, cell in enumerate(cells)}
     dependencies: list[int | None] = []
@@ -295,14 +312,17 @@ def _cell_dependencies(cells: Sequence[Any]) -> tuple[int | None, ...]:
 
 
 class _CellIdentityInput:
-    def __init__(self, input_sha256: str) -> None:
+    def __init__(
+        self, input_sha256: str, input_record: Mapping[str, Any] | None = None
+    ) -> None:
         self.input_sha256 = input_sha256
+        self.input_record = {} if input_record is None else dict(input_record)
 
 
 def _expected_cell(
     prepared: _PreparedCampaign, *, model_index: int, cell_index: int
 ) -> tuple[Path, dict[str, Any]]:
-    from experiments import global_campaign as campaign
+    campaign = _campaign_api()
 
     plan = prepared.plans[model_index]
     cell = prepared.cells[cell_index]
@@ -313,7 +333,8 @@ def _expected_cell(
         model_plan=plan,
         cell=cell,
         cell_data=_CellIdentityInput(
-            str(prepared.preflight_inputs[cell.key]["input_sha256"])
+            str(prepared.preflight_inputs[cell.key]["input_sha256"]),
+            prepared.preflight_inputs[cell.key]["input_record"],
         ),
         selection_contract=prepared.config["campaign"]["selection"],
         evaluation_contract=prepared.config["campaign"]["evaluation"],
@@ -335,7 +356,7 @@ def _expected_cell(
 
 
 def _model_ledger_path(prepared: _PreparedCampaign, model_index: int) -> Path:
-    from experiments import global_campaign as campaign
+    campaign = _campaign_api()
 
     return (
         Path(prepared.state_dir)
@@ -350,7 +371,7 @@ def _validate_dag_ledger(
 ) -> None:
     if not path.exists():
         return
-    from experiments import global_campaign as campaign
+    campaign = _campaign_api()
 
     ledger = campaign._load_json(path)
     completed_cells = ledger.get("completed_cells")
@@ -427,7 +448,7 @@ def _write_dag_ledger(
     model_index: int,
     records: Mapping[int, Mapping[str, Any]],
 ) -> None:
-    from experiments import global_campaign as campaign
+    campaign = _campaign_api()
 
     ordered = [dict(records[index]) for index in sorted(records)]
     campaign._write_json(
@@ -448,7 +469,7 @@ def _reconstruct_completed(
 ) -> list[dict[str, dict[int, Any]]]:
     """Strictly discover sealed cells; artifacts, not ledgers, are truth."""
 
-    from experiments import global_campaign as campaign
+    campaign = _campaign_api()
 
     states: list[dict[str, dict[int, Any]]] = []
     for model_index, plan in enumerate(prepared.plans):
@@ -515,7 +536,7 @@ def _run_cell_task(
     dependencies: ParallelDependencies,
     event_callback: Any,
 ) -> dict[str, Any]:
-    from experiments import global_campaign as campaign
+    campaign = _campaign_api()
 
     project_root = Path(prepared.project_root)
     source_hash_fn = (
@@ -558,21 +579,26 @@ def _run_cell_task(
             f"input changed after campaign preflight: {cell.key}"
         )
     try:
+        run_cell_kwargs = {
+            "campaign_root": Path(prepared.campaign_root),
+            "campaign_id": prepared.campaign_id,
+            "campaign_config_sha": prepared.config_sha,
+            "source_sha": prepared.source_sha,
+            "config": prepared.config,
+            "model_plan": plan,
+            "cell": cell,
+            "data": data,
+            "reference_summary": reference_summary,
+            "train_fn": train_fn,
+            "predict_fn": predict_fn,
+            "load_checkpoint_fn": load_checkpoint_fn,
+            "affine_diagnostics_fn": affine_diagnostics_fn,
+            "callback": event_callback,
+        }
+        if "cell_diagnostics_fn" in inspect.signature(campaign._run_cell).parameters:
+            run_cell_kwargs["cell_diagnostics_fn"] = dependencies.cell_diagnostics_fn
         final_dir, summary = campaign._run_cell(
-            campaign_root=Path(prepared.campaign_root),
-            campaign_id=prepared.campaign_id,
-            campaign_config_sha=prepared.config_sha,
-            source_sha=prepared.source_sha,
-            config=prepared.config,
-            model_plan=plan,
-            cell=cell,
-            data=data,
-            reference_summary=reference_summary,
-            train_fn=train_fn,
-            predict_fn=predict_fn,
-            load_checkpoint_fn=load_checkpoint_fn,
-            affine_diagnostics_fn=affine_diagnostics_fn,
-            callback=event_callback,
+            **run_cell_kwargs,
         )
     finally:
         del data
@@ -636,6 +662,7 @@ def _dag_worker_main(
     stop_event: Any,
     require_cuda: bool,
 ) -> None:
+    os.environ["LID_WORKER_SLOT"] = str(worker_slot)
     if device_token is None:
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
         visible_device = "cpu-test-worker"
@@ -653,6 +680,7 @@ def _dag_worker_main(
                 )
             torch.cuda.set_device(0)
             visible_device = f"{device_token}:{torch.cuda.get_device_name(0)}"
+        os.environ["LID_VISIBLE_DEVICE"] = visible_device
         while not stop_event.is_set():
             try:
                 task = task_queue.get(timeout=0.5)
@@ -726,9 +754,8 @@ def _device_tokens(worker_count: int, *, require_cuda: bool) -> list[str | None]
     else:
         tokens = [token.strip() for token in raw.split(",") if token.strip()]
     if len(tokens) != worker_count or len(set(tokens)) != worker_count:
-        from experiments.global_campaign import GlobalCampaignError
-
-        raise GlobalCampaignError(
+        campaign = _campaign_api()
+        raise campaign.GlobalCampaignError(
             f"H100 profile requires exactly {worker_count} unique visible devices"
         )
     return tokens
@@ -753,7 +780,7 @@ def _persist_assignments(
     prepared: _PreparedCampaign,
     assignments: Mapping[tuple[int, int], Mapping[str, Any]],
 ) -> None:
-    from experiments import global_campaign as campaign
+    campaign = _campaign_api()
 
     campaign._write_json(
         _assignment_path(prepared),
@@ -771,7 +798,7 @@ def _resume_assignments(
     prepared: _PreparedCampaign,
     completed: set[tuple[int, int]],
 ) -> dict[tuple[int, int], dict[str, Any]]:
-    from experiments import global_campaign as campaign
+    campaign = _campaign_api()
 
     path = _assignment_path(prepared)
     assignments: dict[tuple[int, int], dict[str, Any]] = {}
@@ -891,11 +918,11 @@ def _run_cell_dag_pool(
     require_cuda: bool,
     handles: Sequence[Any],
 ) -> tuple[list[dict[str, dict[int, Any]]], dict[tuple[int, int], dict[str, Any]]]:
-    """Run the 390-task DAG while keeping the worker pool work-conserving."""
+    """Run the exact campaign DAG while keeping the worker pool work-conserving."""
 
     from collections import deque
 
-    from experiments import global_campaign as campaign
+    campaign = _campaign_api()
 
     try:
         pickle.dumps((prepared, dependencies))
@@ -1106,7 +1133,7 @@ def _finalize_campaign(
     *,
     dependencies: ParallelDependencies,
 ) -> Path:
-    from experiments import global_campaign as campaign
+    campaign = _campaign_api()
 
     campaign_root = Path(prepared.campaign_root)
     state_dir = Path(prepared.state_dir)
@@ -1206,6 +1233,14 @@ def _finalize_campaign(
         "expected_cells_per_model": len(cells),
         "complete": True,
     }
+    extras = getattr(campaign, "final_manifest_extras", None)
+    if callable(extras):
+        final_manifest.update(
+            extras(
+                campaign_root=campaign_root,
+                prepared=prepared,
+            )
+        )
     campaign._write_json(final_path, final_manifest)
     errors = campaign.validate_global_campaign(
         campaign_root,
@@ -1225,7 +1260,7 @@ def _finalize_campaign(
 def _open_coordinator_loggers(
     prepared: _PreparedCampaign, dependencies: ParallelDependencies
 ) -> list[Any]:
-    from experiments import global_campaign as campaign
+    campaign = _campaign_api()
 
     factory = (
         campaign.open_model_logger
@@ -1264,7 +1299,7 @@ def _seal_dag_models(
 ) -> list[dict[str, Any]]:
     """Coordinator-only per-model aggregate, telemetry and manifest phase."""
 
-    from experiments import global_campaign as campaign
+    campaign = _campaign_api()
 
     results: list[dict[str, Any]] = []
     for model_index, plan in enumerate(prepared.plans):
@@ -1385,7 +1420,7 @@ def _run_preflight_only(
     dependencies: ParallelDependencies,
     require_cuda: bool,
 ) -> Path:
-    from experiments import global_campaign as campaign
+    campaign = _campaign_api()
 
     try:
         pickle.dumps((prepared, dependencies))
@@ -1476,9 +1511,9 @@ def run_global_parallel_campaign(
     require_cuda: bool | None = None,
     preflight_only: bool = False,
 ) -> Path:
-    """Execute the 390-cell DAG on a spawn pool and seal one campaign."""
+    """Execute the exact cell DAG on a spawn pool and seal one campaign."""
 
-    from experiments import global_campaign as campaign
+    campaign = _campaign_api()
 
     dependencies = ParallelDependencies() if dependencies is None else dependencies
     prepared = _prepare_campaign(
@@ -1537,6 +1572,9 @@ def run_global_parallel_campaign(
                 dependencies=dependencies,
                 require_cuda=bool(require_cuda),
             )
+        pre_run_gate = getattr(campaign, "validate_pre_run_gate", None)
+        if callable(pre_run_gate):
+            pre_run_gate(campaign_root=campaign_root, prepared=prepared)
         handles = _open_coordinator_loggers(prepared, dependencies)
         try:
             states, _assignments = _run_cell_dag_pool(

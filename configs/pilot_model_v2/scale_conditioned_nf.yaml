@@ -1,0 +1,22 @@
+id: scale_conditioned_nf
+name: scale_conditioned_nf_parameter_matched_ols5
+family: scale_conditioned_nf
+readout: fixed_likelihood
+primary_readout: ols5
+derivative_backend: exact
+trace_probes: 0
+native_coordinate: epsilon
+capacity_policy:
+  id: nf_nearest_multiple_32_to_shared_bottleneck_v1
+  field_hidden_sizes: [1024, 512, 256, 256, 128, 128]
+  time_embedding_dim: 128
+  nf_width_multiple: 32
+  nf_max_relative_gap: 0.1
+training:
+  field_hidden_sizes: null
+  hidden_dim: 384
+  num_coupling_layers: 8
+  conditioner_depth: 2
+  log_scale_limit: 2.0
+  epsilon_min: 0.003534521164202967
+  epsilon_max: 70.73093875684145

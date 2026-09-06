@@ -36,6 +36,7 @@ from models.training import (
     TrainingResult,
     load_checkpoint,
     predict_lid,
+    predict_nf_lid_ols5,
     predict_nf_log_likelihood,
     predict_nf_readouts,
     train_model,
@@ -443,6 +444,26 @@ def test_scale_conditioned_nf_trains_loads_and_predicts_exact_fixed_likelihood(
     )
     for name, prediction in readouts.lid_by_readout.items():
         np.testing.assert_array_equal(unbatched.lid_by_readout[name], prediction)
+
+    ols5_only = predict_nf_lid_ols5(
+        loaded, validation[:5], 0.2, ols_log_step=0.05, batch_size=2
+    )
+    np.testing.assert_allclose(ols5_only, readouts.lid_ols5, rtol=0, atol=1.0e-12)
+
+    padded = replace(
+        loaded,
+        config=replace(
+            loaded.config,
+            epsilon_min=0.1 * np.exp(-0.1),
+            epsilon_max=0.5 * np.exp(0.1),
+        ),
+    )
+    for boundary in (0.1, 0.5):
+        boundary_lid = predict_nf_lid_ols5(
+            padded, validation[:2], boundary, ols_log_step=0.05
+        )
+        assert boundary_lid.shape == (2,)
+        assert np.isfinite(boundary_lid).all()
 
     with pytest.raises(ValueError, match="outside.*training interval"):
         predict_nf_readouts(

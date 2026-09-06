@@ -1,0 +1,104 @@
+schema_version: 1
+protocol_id: vp-ve-fm-nf-quality-canary-v1
+output_root: ${oc.env:LID_V2_CANARY_OUTPUT_ROOT}
+
+data:
+  archive: data/benchmarks.zip
+  archive_sha256: ce0d153a1a78a3a752b29ec2e60167134b6b20c3249db2fe92f9fc1b8b8a9181
+  benchmark_root: data/lid_benchmarks_exact/benchmarks
+  registry: configs/datasets/registry/paper_benchmarks.yaml
+  reviewed_arrows_gate: ${oc.env:LID_V2_ARROWS_REVIEWED_GATE,""}
+  canary_cell_keys:
+    - e2/e2_uniform_pca/coefficients
+    - e2/e2_arrows/dataset
+  arrows_dataset: e2_arrows
+  visual_sample_seed: 20260906
+  selection:
+    protocol: splitmix64_rank_v1
+    fraction: 0.2
+    maximum_selection: 1000
+    minimum_selection: 2
+    minimum_fit: 8
+    seed: 0
+
+execution:
+  worker_count: 8
+  batch_size: 256
+  require_cuda: true
+  accelerator_name_pattern: H100
+  telemetry_interval_seconds: 1.0
+
+training:
+  campaign_config: configs/global_campaign_v2.yaml
+  mode: fixed_steps_v1
+  steps: 32000
+  vp_warmup_steps: 500
+  other_warmup_steps: 0
+  validation_interval_steps: 500
+  model_seed: 0
+  variant_ids:
+    - vp_diffusion
+    - ve_diffusion
+    - posterior_log_noise_affine_flow
+    - scale_conditioned_nf
+  field_hidden_sizes: [1024, 512, 256, 256, 128, 128]
+  nf_hidden_dim_by_ambient:
+    "30": 544
+    "3072": 448
+
+evaluation:
+  lambda_grid:
+    - 0.015625
+    - 0.02209708691207961
+    - 0.03125
+    - 0.04419417382415922
+    - 0.0625
+    - 0.08838834764831845
+    - 0.125
+    - 0.1767766952966369
+    - 0.25
+    - 0.3535533905932738
+    - 0.5
+    - 0.7071067811865476
+    - 1.0
+    - 1.4142135623730951
+    - 2.0
+    - 2.8284271247461903
+    - 4.0
+    - 5.656854249492381
+    - 8.0
+    - 11.313708498984761
+    - 16.0
+  selection_query_count:
+    coefficients: 128
+    dataset: 32
+  trace_query_count: 4
+  trace_probes: [16, 64]
+  trace_seed: 2026090601
+  reconstruction_lambda: 0.5
+  nf_scale_bins:
+    - [0.00390625, 0.03125]
+    - [0.03125, 0.25]
+    - [0.25, 2.0]
+    - [2.0, 16.0]
+    - [16.0, 64.0]
+
+gates:
+  minimum_mean_gpu_utilization_percent: 70.0
+  minimum_p50_gpu_utilization_percent: 60.0
+  maximum_memory_fraction: 0.95
+  maximum_projected_campaign_hours: 96.0
+  runtime_projection_safety_factor: 2.0
+  maximum_best_to_initial_loss_ratio: 0.95
+  maximum_tail_improvement_fraction: 0.10
+  maximum_reconstruction_ratio: 0.90
+  maximum_pointwise_lid_mae: 5.0
+  minimum_nf_improved_bin_fraction: 0.50
+  maximum_trace64_mae: 2.0
+  maximum_trace64_to_trace16_ratio: 1.25
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: ${oc.env:LID_V2_CANARY_OUTPUT_ROOT}/hydra

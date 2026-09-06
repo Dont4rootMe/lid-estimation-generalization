@@ -1,0 +1,16 @@
+id: schrodinger_bridge
+name: brownian_schrodinger_bridge_control_shared_bottleneck
+family: schrodinger_bridge
+native_coordinate: brownian_tau
+training:
+  bridge_construction: terminal-data-lebesgue-factor-v1
+  bridge_reference_process: brownian-motion
+  bridge_initial_marginal: gaussian-convolution-of-terminal-data
+  bridge_terminal_marginal: dataset-terminal-law
+  bridge_factor_f: lebesgue-measure
+  bridge_factor_g: dataset-terminal-law
+  bridge_conditioning: time-to-go-tau
+  bridge_diffusivity: 1.0
+  bridge_terminal_time: 4096.0
+  bridge_tau_min: 0.0000152587890625
+  bridge_tau_max: 4096.0
