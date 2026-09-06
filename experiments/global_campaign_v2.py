@@ -25,6 +25,7 @@ import numpy as np
 import numpy.typing as npt
 import yaml
 from hydra import compose, initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
 from kneed import KneeLocator
 from omegaconf import DictConfig, OmegaConf
 
@@ -150,8 +151,61 @@ def compose_global_campaign_v2_config(
     overrides: Sequence[str] = (), *, root: Path | None = None
 ) -> DictConfig:
     config_dir = _config_dir(root).resolve()
-    with initialize_config_dir(version_base="1.3", config_dir=str(config_dir)):
+    global_hydra = GlobalHydra.instance()
+    if global_hydra.is_initialized():
+        search_path = global_hydra.hydra.config_loader.get_search_path()
+        actual_search_path = tuple(
+            (str(entry.provider), str(entry.path))
+            for entry in search_path.config_search_path
+        )
+        approved_library_search_path = (
+            ("hydra", "pkg://hydra.conf"),
+            ("main", str(config_dir)),
+            ("schema", "structured://"),
+        )
+        approved_cli_search_path = (
+            ("hydra", "pkg://hydra.conf"),
+            ("main", "pkg://experiments"),
+            ("command-line", config_dir.as_uri()),
+            ("schema", "structured://"),
+        )
+        approved_module_cli_search_path = (
+            ("hydra", "pkg://hydra.conf"),
+            ("command-line", config_dir.as_uri()),
+            ("schema", "structured://"),
+        )
+        approved_layouts = {
+            approved_library_search_path: "main",
+            approved_cli_search_path: "command-line",
+            approved_module_cli_search_path: "command-line",
+        }
+        expected_provider = approved_layouts.get(actual_search_path)
+        if expected_provider is None:
+            raise GlobalCampaignError(
+                "active Hydra search path differs from the exact approved v2 "
+                "library and CLI layouts"
+            )
+        expected_path = config_dir.as_uri()
+        repository = global_hydra.hydra.config_loader.repository
+        for config_name in (
+            "global_campaign_v2.yaml",
+            "campaign/all_suites_all_models_v2.yaml",
+        ):
+            selected = repository.load_config(config_name)
+            if (
+                selected is None
+                or selected.provider != expected_provider
+                or selected.path != expected_path
+            ):
+                raise GlobalCampaignError(
+                    f"active Hydra selected an unapproved source for {config_name!r}"
+                )
         config = compose(config_name="global_campaign_v2", overrides=list(overrides))
+    else:
+        with initialize_config_dir(version_base="1.3", config_dir=str(config_dir)):
+            config = compose(
+                config_name="global_campaign_v2", overrides=list(overrides)
+            )
     OmegaConf.set_struct(config, True)
     return config
 

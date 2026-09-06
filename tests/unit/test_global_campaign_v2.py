@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from hydra import initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
 from kneed import KneeLocator
 
 from experiments import global_campaign_v2 as campaign
-from experiments import global_parallel
+from experiments import global_parallel, v2_canary
 from experiments.global_parallel_v2 import with_h100_v2_profile
+
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_v2_config_is_exact_429_matrix_without_batch_override() -> None:
@@ -40,6 +45,105 @@ def test_v2_config_is_exact_429_matrix_without_batch_override() -> None:
         "training_batch_size_override": None,
         "evaluation_batch_size_override": 512,
     }
+
+
+def test_v2_compose_reuses_approved_active_hydra_without_clearing_state() -> None:
+    global_hydra = GlobalHydra.instance()
+    assert not GlobalHydra.instance().is_initialized()
+    with initialize_config_dir(
+        version_base="1.3", config_dir=str((ROOT / "configs").resolve())
+    ):
+        assert global_hydra.is_initialized()
+        config = campaign.compose_global_campaign_v2_config()
+        assert config.campaign.campaign_id == campaign.APPROVED_CAMPAIGN_ID
+        assert global_hydra.is_initialized()
+    assert not GlobalHydra.instance().is_initialized()
+
+
+def test_decorated_canary_reuses_active_hydra_for_nested_v2_compose(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_run(config: object, *, config_path: Path) -> None:
+        active = GlobalHydra.instance()
+        observed["active_before_nested"] = active.is_initialized()
+        assert isinstance(config, dict)
+        observed["outer_protocol"] = config["protocol_id"]
+        observed["search_path"] = tuple(
+            (str(entry.provider), str(entry.path))
+            for entry in active.hydra.config_loader.get_search_path().config_search_path
+        )
+        nested = campaign.compose_global_campaign_v2_config()
+        observed["campaign_id"] = nested.campaign.campaign_id
+        observed["active_after_nested"] = GlobalHydra.instance().is_initialized()
+        observed["same_instance"] = GlobalHydra.instance() is active
+        observed["config_path"] = config_path
+
+    monkeypatch.setattr(v2_canary, "_run", fake_run)
+    monkeypatch.setattr(sys, "argv", ["experiments.v2_canary"])
+    monkeypatch.setenv("LID_V2_CANARY_OUTPUT_ROOT", str(tmp_path / "campaign"))
+    monkeypatch.setenv("LID_V2_ARROWS_REVIEWED_GATE", str(tmp_path / "review.json"))
+    monkeypatch.setenv("HYDRA_MAIN_MODULE", "__main__")
+    assert not GlobalHydra.instance().is_initialized()
+    v2_canary._hydra_main()
+    assert observed == {
+        "active_before_nested": True,
+        "outer_protocol": v2_canary.PROTOCOL_ID,
+        "search_path": (
+            ("hydra", "pkg://hydra.conf"),
+            ("main", str((ROOT / "configs").resolve())),
+            ("schema", "structured://"),
+        ),
+        "campaign_id": campaign.APPROVED_CAMPAIGN_ID,
+        "active_after_nested": True,
+        "same_instance": True,
+        "config_path": ROOT / "configs" / "v2_canary.yaml",
+    }
+    assert not GlobalHydra.instance().is_initialized()
+
+
+def test_v2_compose_rejects_shadow_active_hydra_without_clearing_state(
+    tmp_path: Path,
+) -> None:
+    shadow = tmp_path / "configs"
+    shadow.mkdir()
+    (shadow / "global_campaign_v2.yaml").write_text("schema_version: 999\n")
+    global_hydra = GlobalHydra.instance()
+    assert not GlobalHydra.instance().is_initialized()
+    with initialize_config_dir(version_base="1.3", config_dir=str(shadow.resolve())):
+        assert global_hydra.is_initialized()
+        with pytest.raises(
+            campaign.GlobalCampaignError, match="active Hydra search path differs"
+        ):
+            campaign.compose_global_campaign_v2_config()
+        assert global_hydra.is_initialized()
+    assert not GlobalHydra.instance().is_initialized()
+
+
+def test_v2_compose_rejects_unapproved_config_source_without_clearing_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with initialize_config_dir(
+        version_base="1.3", config_dir=str((ROOT / "configs").resolve())
+    ):
+        active = GlobalHydra.instance()
+        repository = active.hydra.config_loader.repository
+        original_load = repository.load_config
+
+        def shadow_load(config_name: str) -> object:
+            if config_name == "global_campaign_v2.yaml":
+                return SimpleNamespace(provider="shadow", path="file:///shadow")
+            return original_load(config_name)
+
+        monkeypatch.setattr(repository, "load_config", shadow_load)
+        with pytest.raises(
+            campaign.GlobalCampaignError, match="selected an unapproved source"
+        ):
+            campaign.compose_global_campaign_v2_config()
+        assert GlobalHydra.instance() is active
+        assert active.is_initialized()
+    assert not GlobalHydra.instance().is_initialized()
 
 
 def test_vp_common_lambda_roundtrip_and_flipd_filter() -> None:
