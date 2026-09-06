@@ -630,9 +630,41 @@ def vp_time_from_lambda(
     return np.ascontiguousarray(result, dtype=np.float64)
 
 
+def _canonicalize_common_lambdas(
+    values: npt.ArrayLike,
+) -> npt.NDArray[np.float64]:
+    array = np.asarray(values, dtype=np.float64)
+    if array.ndim != 1 or array.size == 0 or not np.isfinite(array).all():
+        raise GlobalCampaignError("common lambda grid must be a finite vector")
+    lower_neighbor = COMMON_LAMBDA_MIN
+    upper_neighbor = COMMON_LAMBDA_MAX
+    for _ in range(4):
+        lower_neighbor = float(np.nextafter(lower_neighbor, -np.inf))
+        upper_neighbor = float(np.nextafter(upper_neighbor, np.inf))
+    if float(array.min()) < lower_neighbor or float(array.max()) > upper_neighbor:
+        raise GlobalCampaignError("common lambda grid lies outside declared support")
+    return np.ascontiguousarray(
+        np.clip(array, COMMON_LAMBDA_MIN, COMMON_LAMBDA_MAX), dtype=np.float64
+    )
+
+
+def _require_canonical_common_lambda_grid(
+    values: npt.ArrayLike,
+) -> npt.NDArray[np.float64]:
+    array = np.asarray(values, dtype=np.float64)
+    canonical = _canonicalize_common_lambdas(array)
+    if not np.array_equal(array, canonical) or np.any(np.diff(array) <= 0.0):
+        raise GlobalCampaignError(
+            "common lambda grid must be canonical and strictly increasing"
+        )
+    return canonical
+
+
 def unknown_reference_lambdas() -> npt.NDArray[np.float64]:
     endpoints = vp_time_from_lambda((COMMON_LAMBDA_MIN, COMMON_LAMBDA_MAX))
-    return vp_lambda_from_time(np.linspace(endpoints[0], endpoints[1], 50))
+    return _canonicalize_common_lambdas(
+        vp_lambda_from_time(np.linspace(endpoints[0], endpoints[1], 50))
+    )
 
 
 def _native_coordinate(model: Mapping[str, Any], noise_ratio: float) -> float:
@@ -1268,6 +1300,7 @@ def select_supervised_bounded(
             proposed = proposed[proposed <= COMMON_LAMBDA_MAX + 1e-12]
             extended_side = "upper"
         if proposed.size:
+            proposed = _canonicalize_common_lambdas(proposed)
             extension_curve = np.asarray(
                 evaluate(np.asarray(proposed, dtype=np.float64)), dtype=np.float64
             )
@@ -2486,6 +2519,7 @@ def validate_global_cell(
                 _load_numeric_array(root / "selection_a_lambdas.npy", ndim=1),
                 dtype=np.float64,
             )
+            lambdas = _require_canonical_common_lambda_grid(lambdas)
             curve = np.asarray(
                 _load_numeric_array(
                     root / "train_selection_curve__supervised.npy", ndim=2
@@ -2634,6 +2668,7 @@ def validate_global_cell(
                 _load_numeric_array(root / "reference_lambdas.npy", ndim=1),
                 dtype=np.float64,
             )
+            lambdas = _require_canonical_common_lambda_grid(lambdas)
             curve = np.asarray(
                 _load_numeric_array(
                     root / "train_selection_curve__reference_kneedle.npy", ndim=2

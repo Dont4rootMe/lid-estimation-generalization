@@ -379,9 +379,63 @@ def test_vp_common_lambda_roundtrip_and_flipd_filter() -> None:
     times = campaign.vp_time_from_lambda(values)
     np.testing.assert_allclose(campaign.vp_lambda_from_time(times), values, rtol=2e-13)
 
+    reference_lambdas = campaign.unknown_reference_lambdas()
+    assert reference_lambdas[0] == campaign.COMMON_LAMBDA_MIN
+    assert reference_lambdas[-1] == campaign.COMMON_LAMBDA_MAX
+    assert np.all(np.diff(reference_lambdas) > 0.0)
+    endpoint_times = campaign.vp_time_from_lambda(
+        (campaign.COMMON_LAMBDA_MIN, campaign.COMMON_LAMBDA_MAX)
+    )
+    np.testing.assert_allclose(
+        campaign.vp_time_from_lambda(reference_lambdas),
+        np.linspace(endpoint_times[0], endpoint_times[1], 50),
+        rtol=0.0,
+        atol=np.finfo(np.float64).eps,
+    )
+
     expected = np.linspace(0.0, 1.0, 50)
     expected = expected[(expected > 0.05) & (expected < 0.5)]
     np.testing.assert_array_equal(campaign.flipd_timesteps(), expected)
+
+
+def test_common_lambda_canonicalization_is_roundoff_only() -> None:
+    values = np.asarray(
+        [
+            np.nextafter(campaign.COMMON_LAMBDA_MIN, 0.0),
+            1.0,
+            np.nextafter(campaign.COMMON_LAMBDA_MAX, np.inf),
+        ]
+    )
+    canonical = campaign._canonicalize_common_lambdas(values)
+    assert canonical[0] == campaign.COMMON_LAMBDA_MIN
+    assert canonical[-1] == campaign.COMMON_LAMBDA_MAX
+    outside = [campaign.COMMON_LAMBDA_MIN, campaign.COMMON_LAMBDA_MAX]
+    for _ in range(5):
+        outside[0] = np.nextafter(outside[0], 0.0)
+        outside[1] = np.nextafter(outside[1], np.inf)
+    for value in outside:
+        with pytest.raises(
+            campaign.GlobalCampaignError, match="outside declared support"
+        ):
+            campaign._canonicalize_common_lambdas([value])
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        [campaign.COMMON_LAMBDA_MIN, 1.0, 1.0],
+        [campaign.COMMON_LAMBDA_MIN, 2.0, 1.0],
+        [np.nextafter(campaign.COMMON_LAMBDA_MIN, 0.0), 1.0],
+        [1.0, np.nextafter(campaign.COMMON_LAMBDA_MAX, np.inf)],
+    ],
+)
+def test_saved_common_lambda_grid_requires_canonical_strict_order(
+    values: list[float],
+) -> None:
+    with pytest.raises(
+        campaign.GlobalCampaignError, match="canonical and strictly increasing"
+    ):
+        campaign._require_canonical_common_lambda_grid(values)
 
 
 def test_flipd_kneedle_matches_pinned_upstream_call_and_fallback() -> None:
@@ -414,6 +468,36 @@ def test_supervised_selector_extends_once_and_ties_to_lower_lambda() -> None:
     assert extended[index] == pytest.approx(0.5)
     assert values.shape == (2, len(extended))
     assert record["status"] == "selected"
+
+
+@pytest.mark.parametrize("side", ["lower", "upper"])
+def test_supervised_selector_canonicalizes_support_boundary(side: str) -> None:
+    lambdas = campaign.initial_supervised_lambdas()
+    if side == "lower":
+        curve = np.arange(lambdas.size, dtype=np.float64)[None, :]
+    else:
+        curve = np.arange(lambdas.size - 1, -1, -1, dtype=np.float64)[None, :]
+    seen: list[np.ndarray] = []
+
+    def evaluate(candidates: np.ndarray) -> np.ndarray:
+        seen.append(candidates.copy())
+        return np.zeros((1, candidates.size), dtype=np.float64)
+
+    extended, _, _, record = campaign.select_supervised_bounded(
+        lambdas,
+        curve,
+        np.zeros(1),
+        evaluate=evaluate,
+    )
+
+    assert record["extended_side"] == side
+    assert len(seen) == 1
+    assert seen[0][0] >= campaign.COMMON_LAMBDA_MIN
+    assert seen[0][-1] <= campaign.COMMON_LAMBDA_MAX
+    boundary = (
+        campaign.COMMON_LAMBDA_MIN if side == "lower" else campaign.COMMON_LAMBDA_MAX
+    )
+    assert boundary in extended
 
 
 def test_reference_kneedle_seals_explicit_no_knee_failure() -> None:
@@ -468,6 +552,80 @@ def test_nf_ols5_support_includes_full_stencil() -> None:
             [campaign.COMMON_LAMBDA_MIN * np.exp(-0.2)],
             include_nf_stencil=True,
         )
+
+
+def test_unknown_reference_grid_is_native_support_safe_for_all_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = campaign.validate_global_campaign_config(
+        campaign.compose_global_campaign_v2_config()
+    )
+    lambdas = campaign.unknown_reference_lambdas()
+    query = np.zeros((3, 30), dtype=np.float64)
+    active_model: dict[str, object] = {}
+    seen: list[float] = []
+
+    def assert_native_support(model: dict[str, object], scale: float) -> None:
+        training = model["training"]
+        assert isinstance(training, dict)
+        family = model["family"]
+        if family == "vp_diffusion":
+            assert np.isfinite(campaign.vp_time_from_lambda([scale])).all()
+            lower = campaign.COMMON_LAMBDA_MIN
+            upper = campaign.COMMON_LAMBDA_MAX
+        elif family == "rectified_flow":
+            lower = float(training["time_min"])
+            upper = float(training["time_max"])
+        elif family == "independent_affine_flow":
+            lower = float(training["flow_noise_ratio_min"])
+            upper = float(training["flow_noise_ratio_max"])
+        elif family == "schrodinger_bridge":
+            lower = float(training["bridge_tau_min"])
+            upper = float(training["bridge_tau_max"])
+        else:
+            lower = campaign.COMMON_LAMBDA_MIN
+            upper = campaign.COMMON_LAMBDA_MAX
+        assert lower <= scale <= upper
+
+    def fake_predict(
+        _trained: object,
+        values: np.ndarray,
+        scale: float,
+        **_kwargs: object,
+    ) -> np.ndarray:
+        assert_native_support(active_model, scale)
+        seen.append(scale)
+        return np.ones(len(values), dtype=np.float64)
+
+    def fake_nf_predict(
+        _trained: object,
+        values: np.ndarray,
+        scale: float,
+        **_kwargs: object,
+    ) -> np.ndarray:
+        assert campaign.COMMON_LAMBDA_MIN <= scale <= campaign.COMMON_LAMBDA_MAX
+        seen.append(scale)
+        return np.ones(len(values), dtype=np.float64)
+
+    monkeypatch.setattr("models.training.predict_nf_lid_ols5", fake_nf_predict)
+    for plan in campaign.model_plans(config):
+        model = campaign.resolve_cell_model(plan, {"feature_shape": [30]})
+        active_model.clear()
+        active_model.update(model)
+        seen.clear()
+        curve = campaign._prediction_curve(
+            fake_predict,
+            object(),
+            query,
+            lambdas,
+            model=model,
+            seed=0,
+            batch_size=128,
+            readout=str(model["primary_readout"]),
+        )
+        assert curve.shape == (3, 50)
+        assert np.isfinite(curve).all()
+        assert len(seen) == 50
 
 
 def test_high_dimensional_fm_diagnostics_use_only_shared_hutchinson_prefixes(

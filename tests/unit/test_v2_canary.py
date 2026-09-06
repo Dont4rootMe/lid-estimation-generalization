@@ -752,3 +752,47 @@ def test_reference_selector_failure_is_a_gate_not_a_type_error(
     )
     assert result["status"] == "failed"
     assert result["failure_reason"] == "no_knee"
+
+
+def test_reference_selector_uses_exact_common_lambda_endpoints(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import experiments.global_campaign_v2
+    import models.training
+
+    observed: list[float] = []
+
+    def strict_predict(
+        _trained: object,
+        query: np.ndarray,
+        scale: float,
+        **_kwargs: object,
+    ) -> np.ndarray:
+        assert experiments.global_campaign_v2.COMMON_LAMBDA_MIN <= scale
+        assert scale <= experiments.global_campaign_v2.COMMON_LAMBDA_MAX
+        observed.append(scale)
+        return np.ones(len(query), dtype=np.float64)
+
+    monkeypatch.setattr(models.training, "predict_lid", strict_predict)
+    monkeypatch.setattr(
+        experiments.global_campaign_v2,
+        "select_unknown_reference_kneedle",
+        lambda scales, curve: (
+            None,
+            {"status": "selection_failed", "failure_reason": "no_knee"},
+        ),
+    )
+    result = _reference_selector_quality(
+        object(),
+        np.zeros((4, 3), dtype=np.float32),
+        variant_id="posterior_log_noise_affine_flow",
+        family="independent_affine_flow",
+        representation="coefficients",
+        trace_seed=9,
+        batch_size=4,
+        output_dir=tmp_path,
+    )
+
+    assert result["status"] == "failed"
+    assert observed[0] == experiments.global_campaign_v2.COMMON_LAMBDA_MIN
+    assert observed[-1] == experiments.global_campaign_v2.COMMON_LAMBDA_MAX
