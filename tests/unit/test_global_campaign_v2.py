@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import json
 import os
 import sys
 from pathlib import Path
@@ -13,7 +15,11 @@ from kneed import KneeLocator
 
 from experiments import global_campaign_v2 as campaign
 from experiments import global_parallel, v2_canary
-from experiments.global_parallel_v2 import with_h100_v2_profile
+from experiments.global_parallel_v2 import (
+    H100_PROFILE_V2,
+    _v2_api,
+    with_h100_v2_profile,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -31,6 +37,19 @@ def test_v2_config_is_exact_429_matrix_without_batch_override() -> None:
         "e2/e2_uniform_pca/coefficients",
         "e2/e2_arrows/dataset",
     )
+    assert campaign.CANARY_COMPANION_CELL_KEYS == (
+        "e3/e3_gaussian_pca/coefficients",
+        "e1/e1_sampled_fmnist_step1/dataset",
+        "e4/e4_sphere_pca_radius1/coefficients",
+        "e2/e2_uniform_pca/dataset",
+    )
+    assert len(campaign.CANARY_TASKS) == 8
+    assert len(campaign.CANARY_REUSE_TASKS) == 24
+    assert len(set(campaign.CANARY_REUSE_TASKS)) == 24
+    assert (
+        tuple(f"{variant}/{key}" for variant, key in campaign.CANARY_REUSE_TASKS)
+        == v2_canary.EXPECTED_ALL_CELL_IDS
+    )
     assert all(plan.model["training"]["batch_size"] == 256 for plan in plans)
     assert plans[0].model["training"]["gradient_clip_norm"] is None
     assert all(
@@ -39,12 +58,221 @@ def test_v2_config_is_exact_429_matrix_without_batch_override() -> None:
 
     production = with_h100_v2_profile(config)
     assert production["execution"] == {
-        "profile": "h100_8gpu_cell_dag_v2",
+        "profile": "h100_8gpu_3lane_cell_dag_v2",
         "strategy": "cell_dag_pool",
-        "worker_count": 8,
+        "worker_count": 24,
+        "physical_device_count": 8,
+        "lanes_per_device": 3,
         "training_batch_size_override": None,
         "evaluation_batch_size_override": 512,
     }
+
+
+def test_v2_h100_profile_maps_three_logical_lanes_to_each_visible_gpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokens = tuple(f"GPU-{index}" for index in range(8))
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", ",".join(tokens))
+
+    with _v2_api():
+        layout = global_parallel._worker_device_layout(
+            H100_PROFILE_V2, require_cuda=True
+        )
+        with pytest.raises(
+            campaign.GlobalCampaignError, match="cannot disable CUDA checks"
+        ):
+            global_parallel._worker_device_layout(H100_PROFILE_V2, require_cuda=False)
+
+    assert len(layout) == 24
+    assert tuple(row["worker_slot"] for row in layout) == tuple(range(24))
+    assert tuple(row["visible_device_token"] for row in layout) == tokens * 3
+    assert tuple(row["physical_device_index"] for row in layout) == tuple(range(8)) * 3
+    assert tuple(row["device_lane"] for row in layout) == (0,) * 8 + (1,) * 8 + (2,) * 8
+    assert all(row["multiplexed"] is True for row in layout)
+
+    prepared = SimpleNamespace(
+        campaign_identity="b" * 64,
+        config={"execution": dict(H100_PROFILE_V2)},
+        cells=tuple(range(39)),
+        plans=tuple(range(11)),
+    )
+    records = [
+        {
+            "slot": row["worker_slot"],
+            "visible_token": row["visible_device_token"],
+            "cuda_required": True,
+            "physical_device_index": row["physical_device_index"],
+            "device_lane": row["device_lane"],
+            "device_count": 1,
+            "device_name": "NVIDIA H100 80GB HBM3",
+        }
+        for row in reversed(layout)
+    ]
+    payload = global_parallel._preflight_payload(
+        prepared, records=records, layout=layout
+    )
+    assert payload["schema_version"] == 2
+    assert payload["execution"]["worker_count"] == 24
+    assert payload["physical_device_count"] == 8
+    assert payload["lanes_per_device"] == 3
+    assert payload["device_mapping_policy"] == (
+        "worker_slot_modulo_physical_device_count_v1"
+    )
+    assert [row["slot"] for row in payload["workers"]] == list(range(24))
+    assert payload["physical_devices"] == [
+        {
+            "physical_device_index": index,
+            "visible_device_token": tokens[index],
+            "worker_slots": [index, index + 8, index + 16],
+        }
+        for index in range(8)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("worker_count", 8),
+        ("worker_count", 23),
+        ("physical_device_count", 7),
+        ("physical_device_count", True),
+        ("lanes_per_device", 2),
+        ("lanes_per_device", True),
+    ],
+)
+def test_v2_h100_profile_rejects_any_topology_drift(field: str, value: object) -> None:
+    config = with_h100_v2_profile(campaign.compose_global_campaign_v2_config())
+    invalid = copy.deepcopy(config)
+    invalid["execution"][field] = value
+    with pytest.raises(campaign.GlobalCampaignError):
+        campaign.validate_global_campaign_config(invalid)
+
+
+@pytest.mark.parametrize("missing", ["physical_device_count", "lanes_per_device"])
+def test_v2_h100_profile_requires_explicit_topology_fields(missing: str) -> None:
+    config = with_h100_v2_profile(campaign.compose_global_campaign_v2_config())
+    del config["execution"][missing]
+    with pytest.raises(campaign.GlobalCampaignError, match="execution fields differ"):
+        campaign.validate_global_campaign_config(config)
+
+
+def test_v2_assignment_ledger_seals_and_validates_slot_device_mapping(
+    tmp_path: Path,
+) -> None:
+    prepared = SimpleNamespace(
+        campaign_identity="a" * 64,
+        config={"execution": dict(H100_PROFILE_V2)},
+        state_dir=str(tmp_path / "state"),
+        plans=(SimpleNamespace(variant_id="vp_diffusion"),),
+        cells=(
+            SimpleNamespace(key="e2/e2_uniform_pca/coefficients"),
+            SimpleNamespace(key="e2/e2_arrows/dataset"),
+        ),
+    )
+    row = {
+        "model_index": 0,
+        "model_variant": "vp_diffusion",
+        "cell_index": 0,
+        "cell_key": "e2/e2_uniform_pca/coefficients",
+        "worker_slot": 17,
+        "visible_device": "GPU-1:NVIDIA H100 80GB HBM3",
+        "dispatch_sequence": 1,
+        "in_flight_after_dispatch": 24,
+        "ready_after_dispatch": 10,
+        "status": "completed",
+        "physical_device_index": 1,
+        "device_lane": 2,
+        "visible_device_token": "GPU-1",
+    }
+    with _v2_api():
+        global_parallel._persist_assignments(prepared, {(0, 0): row})
+        resumed = global_parallel._resume_assignments(prepared, {(0, 0)})
+    assert resumed == {(0, 0): row}
+
+    path = tmp_path / "state" / "parallel" / "assignments.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload == {
+        "schema_version": 2,
+        "campaign_identity": "a" * 64,
+        "strategy": "cell_dag_pool",
+        "worker_count": 24,
+        "physical_device_count": 8,
+        "lanes_per_device": 3,
+        "device_mapping_policy": "worker_slot_modulo_physical_device_count_v1",
+        "assignments": [row],
+    }
+
+    payload["assignments"][0]["physical_device_index"] = 2
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with (
+        _v2_api(),
+        pytest.raises(campaign.GlobalCampaignError, match="assignment row differs"),
+    ):
+        global_parallel._resume_assignments(prepared, {(0, 0)})
+
+    payload["assignments"][0]["physical_device_index"] = 1
+    repeated = copy.deepcopy(payload["assignments"][0])
+    repeated["cell_index"] = 1
+    repeated["cell_key"] = "e2/e2_arrows/dataset"
+    payload["assignments"].append(repeated)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with (
+        _v2_api(),
+        pytest.raises(
+            campaign.GlobalCampaignError, match="repeats a dispatch sequence"
+        ),
+    ):
+        global_parallel._resume_assignments(prepared, {(0, 0), (0, 1)})
+
+
+def test_v2_pre_run_cell_gate_exactly_binds_all_24_canary_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    keys = campaign.CANARY_CELL_KEYS + campaign.CANARY_COMPANION_CELL_KEYS
+    prepared = SimpleNamespace(
+        plans=tuple(
+            SimpleNamespace(variant_id=variant)
+            for variant in campaign.CANARY_MODEL_VARIANTS
+        ),
+        cells=tuple(SimpleNamespace(key=key) for key in keys),
+        preflight_inputs={key: {"source_evidence": {"key": key}} for key in keys},
+    )
+    task_by_directory: dict[Path, tuple[str, str]] = {}
+    validated: list[tuple[str, str]] = []
+
+    def fake_directory(
+        *, campaign_root: Path, prepared: object, model_index: int, cell_index: int
+    ) -> tuple[Path, dict[str, object]]:
+        del campaign_root, prepared
+        task = (
+            campaign.CANARY_MODEL_VARIANTS[model_index],
+            keys[cell_index],
+        )
+        directory = tmp_path / f"cell-{model_index}-{cell_index}"
+        task_by_directory[directory] = task
+        return directory, {"task": task}
+
+    def fake_validate(
+        directory: Path,
+        *,
+        expected_identity: object,
+        expected_source_evidence: object,
+    ) -> list[str]:
+        del expected_identity, expected_source_evidence
+        validated.append(task_by_directory[directory])
+        return []
+
+    def fake_load(path: Path) -> dict[str, object]:
+        task = task_by_directory[path.parent]
+        status = "passed" if task in set(campaign.CANARY_TASKS) else "not_requested"
+        return {"quality_diagnostics": {"status": status}}
+
+    monkeypatch.setattr(campaign, "_expected_cell_directory", fake_directory)
+    monkeypatch.setattr(campaign, "validate_global_cell", fake_validate)
+    monkeypatch.setattr(campaign, "_load_json", fake_load)
+
+    assert campaign._validate_reusable_canary_cells(tmp_path, prepared) == []
+    assert tuple(validated) == campaign.CANARY_REUSE_TASKS
 
 
 def test_v2_compose_reuses_approved_active_hydra_without_clearing_state() -> None:

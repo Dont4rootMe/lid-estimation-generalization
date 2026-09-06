@@ -74,7 +74,10 @@ FROZEN_EVALUATION_PROTOCOL = "multi_protocol_train_selected_lambda_v2"
 EXECUTION_STRATEGY_SEQUENTIAL = v1.EXECUTION_STRATEGY_SEQUENTIAL
 EXECUTION_STRATEGY_CELL_DAG = v1.EXECUTION_STRATEGY_CELL_DAG
 EXECUTION_PROFILE_LEGACY = "legacy_sequential_v2"
-EXECUTION_PROFILE_H100 = "h100_8gpu_cell_dag_v2"
+EXECUTION_PROFILE_H100 = "h100_8gpu_3lane_cell_dag_v2"
+H100_PHYSICAL_DEVICE_COUNT = 8
+H100_LANES_PER_DEVICE = 3
+H100_LOGICAL_WORKER_COUNT = H100_PHYSICAL_DEVICE_COUNT * H100_LANES_PER_DEVICE
 CHECKPOINT_RETENTION_RETAIN = v1.CHECKPOINT_RETENTION_RETAIN
 CHECKPOINT_RETENTION_PRUNE_AFTER_EVALUATION = (
     v1.CHECKPOINT_RETENTION_PRUNE_AFTER_EVALUATION
@@ -92,7 +95,7 @@ FM_EXACT_TRACE_MAX_AMBIENT_DIM = 64
 FM_HIGH_DIM_QUERY_SUBSET_SIZE = 8
 FM_HIGH_DIM_TRACE_PROBES = (16, 64)
 FM_HIGH_DIM_PROTOCOL = "hutchinson_prefix_stability_high_dimensional_v1"
-CANARY_PROTOCOL_ID = "vp-ve-fm-nf-quality-canary-v1"
+CANARY_PROTOCOL_ID = "vp-ve-fm-nf-quality-canary-v2"
 CANARY_CELL_KEYS = (
     "e2/e2_uniform_pca/coefficients",
     "e2/e2_arrows/dataset",
@@ -104,8 +107,20 @@ CANARY_MODEL_VARIANTS = (
     "scale_conditioned_nf",
 )
 CANARY_TASKS = tuple(
-    (variant, key) for variant in CANARY_MODEL_VARIANTS for key in CANARY_CELL_KEYS
+    (variant, key) for key in CANARY_CELL_KEYS for variant in CANARY_MODEL_VARIANTS
 )
+CANARY_COMPANION_CELL_KEYS = (
+    "e3/e3_gaussian_pca/coefficients",
+    "e1/e1_sampled_fmnist_step1/dataset",
+    "e4/e4_sphere_pca_radius1/coefficients",
+    "e2/e2_uniform_pca/dataset",
+)
+CANARY_COMPANION_TASKS = tuple(
+    (variant, key)
+    for key in CANARY_COMPANION_CELL_KEYS
+    for variant in CANARY_MODEL_VARIANTS
+)
+CANARY_REUSE_TASKS = CANARY_TASKS + CANARY_COMPANION_TASKS
 
 GlobalCampaignError = v1.GlobalCampaignError
 ModelPlan = v1.ModelPlan
@@ -330,13 +345,18 @@ def validate_global_campaign_config(
     _safe_path(value.get("output_root"), field="output_root")
 
     execution = _mapping(value.get("execution"), field="execution")
-    expected_execution_fields = {
+    base_execution_fields = {
         "profile",
         "strategy",
         "worker_count",
         "training_batch_size_override",
         "evaluation_batch_size_override",
     }
+    expected_execution_fields = (
+        base_execution_fields | {"physical_device_count", "lanes_per_device"}
+        if execution.get("profile") == EXECUTION_PROFILE_H100
+        else base_execution_fields
+    )
     if set(execution) != expected_execution_fields:
         raise GlobalCampaignError("v2 execution fields differ")
     if execution["strategy"] not in {
@@ -352,10 +372,25 @@ def validate_global_campaign_config(
             execution["evaluation_batch_size_override"],
             field="execution.evaluation_batch_size_override",
         )
+    if execution["profile"] == EXECUTION_PROFILE_H100:
+        physical_device_count = v1._positive_int(
+            execution["physical_device_count"],
+            field="execution.physical_device_count",
+        )
+        lanes_per_device = v1._positive_int(
+            execution["lanes_per_device"],
+            field="execution.lanes_per_device",
+        )
+        if physical_device_count * lanes_per_device != execution["worker_count"]:
+            raise GlobalCampaignError(
+                "v2 H100 worker_count does not match its device topology"
+            )
     if execution["profile"] == EXECUTION_PROFILE_H100 and execution != {
         "profile": EXECUTION_PROFILE_H100,
         "strategy": EXECUTION_STRATEGY_CELL_DAG,
-        "worker_count": 8,
+        "worker_count": H100_LOGICAL_WORKER_COUNT,
+        "physical_device_count": H100_PHYSICAL_DEVICE_COUNT,
+        "lanes_per_device": H100_LANES_PER_DEVICE,
         "training_batch_size_override": None,
         "evaluation_batch_size_override": 512,
     }:
@@ -520,13 +555,16 @@ def _validate_evaluation_config(evaluation: Mapping[str, Any]) -> None:
 
 def _validate_canary_gate_config(gate: Mapping[str, Any]) -> None:
     expected = {
-        "schema_version": 1,
+        "schema_version": 2,
         "required": True,
         "protocol_id": CANARY_PROTOCOL_ID,
         "report_filename": "canary_report.json",
-        "required_worker_count": 8,
+        "required_physical_device_count": H100_PHYSICAL_DEVICE_COUNT,
+        "required_lanes_per_device": H100_LANES_PER_DEVICE,
+        "required_logical_worker_count": H100_LOGICAL_WORKER_COUNT,
         "required_batch_size": 256,
         "required_cell_keys": list(CANARY_CELL_KEYS),
+        "required_companion_cell_keys": list(CANARY_COMPANION_CELL_KEYS),
         "required_model_variants": list(CANARY_MODEL_VARIANTS),
     }
     if not _same_json(gate, expected):
@@ -3429,7 +3467,8 @@ def _validate_reusable_canary_cells(campaign_root: Path, prepared: Any) -> list[
     errors: list[str] = []
     plan_indices = {plan.variant_id: index for index, plan in enumerate(prepared.plans)}
     cell_indices = {cell.key: index for index, cell in enumerate(prepared.cells)}
-    for variant, key in CANARY_TASKS:
+    quality_tasks = set(CANARY_TASKS)
+    for variant, key in CANARY_REUSE_TASKS:
         try:
             model_index = plan_indices[variant]
             cell_index = cell_indices[key]
@@ -3455,18 +3494,21 @@ def _validate_reusable_canary_cells(campaign_root: Path, prepared: Any) -> list[
         if not cell_errors:
             summary = _load_json(directory / "summary.json")
             diagnostics = summary.get("quality_diagnostics")
+            expected_status = (
+                "passed" if (variant, key) in quality_tasks else "not_requested"
+            )
             if (
                 not isinstance(diagnostics, Mapping)
-                or diagnostics.get("status") != "passed"
+                or diagnostics.get("status") != expected_status
             ):
                 errors.append(
-                    f"canary {variant}/{key}: quality diagnostics did not pass"
+                    f"canary {variant}/{key}: quality diagnostics status differs"
                 )
     return errors
 
 
 def validate_pre_run_gate(*, campaign_root: Path, prepared: Any) -> None:
-    """Refuse the full DAG unless the exact reusable eight-cell canary passed."""
+    """Refuse the full DAG unless all 24 exact reusable canary cells validate."""
 
     report_path = Path(campaign_root) / str(
         prepared.config["campaign"]["canary_gate"]["report_filename"]
@@ -3784,6 +3826,9 @@ def validate_global_campaign(
             "in_flight_after_dispatch",
             "ready_after_dispatch",
             "status",
+            "physical_device_index",
+            "device_lane",
+            "visible_device_token",
         }
         assignment_pairs: set[tuple[str, str]] = set()
         assignment_rows_valid = isinstance(assignment_rows, list)
@@ -3813,15 +3858,30 @@ def validate_global_campaign(
                 status = row.get("status")
                 if status == "completed":
                     sequence = row.get("dispatch_sequence")
+                    worker_slot = row.get("worker_slot")
+                    physical_device_index = row.get("physical_device_index")
+                    device_lane = row.get("device_lane")
+                    visible_device_token = row.get("visible_device_token")
                     if (
-                        type(row.get("worker_slot")) is not int
-                        or not 0 <= row["worker_slot"] < 8
+                        type(worker_slot) is not int
+                        or not 0 <= worker_slot < H100_LOGICAL_WORKER_COUNT
+                        or type(physical_device_index) is not int
+                        or physical_device_index
+                        != worker_slot % H100_PHYSICAL_DEVICE_COUNT
+                        or type(device_lane) is not int
+                        or device_lane != worker_slot // H100_PHYSICAL_DEVICE_COUNT
+                        or not isinstance(visible_device_token, str)
+                        or not visible_device_token
                         or not isinstance(row.get("visible_device"), str)
-                        or not row["visible_device"]
+                        or not row["visible_device"].startswith(
+                            f"{visible_device_token}:"
+                        )
                         or type(sequence) is not int
                         or sequence <= 0
                         or type(row.get("in_flight_after_dispatch")) is not int
-                        or not 1 <= row["in_flight_after_dispatch"] <= 8
+                        or not 1
+                        <= row["in_flight_after_dispatch"]
+                        <= H100_LOGICAL_WORKER_COUNT
                         or type(row.get("ready_after_dispatch")) is not int
                         or row["ready_after_dispatch"] < 0
                     ):
@@ -3832,6 +3892,9 @@ def validate_global_campaign(
                     if (
                         row.get("worker_slot") is not None
                         or row.get("visible_device") != "reconstructed-sealed-cell"
+                        or row.get("physical_device_index") is not None
+                        or row.get("device_lane") is not None
+                        or row.get("visible_device_token") is not None
                         or row.get("dispatch_sequence") is not None
                         or row.get("in_flight_after_dispatch") is not None
                         or row.get("ready_after_dispatch") is not None
@@ -3843,10 +3906,25 @@ def validate_global_campaign(
             assignment_rows_valid = False
         if (
             not isinstance(assignments, Mapping)
-            or assignments.get("schema_version") != 1
+            or set(assignments)
+            != {
+                "schema_version",
+                "campaign_identity",
+                "strategy",
+                "worker_count",
+                "physical_device_count",
+                "lanes_per_device",
+                "device_mapping_policy",
+                "assignments",
+            }
+            or assignments.get("schema_version") != 2
             or assignments.get("campaign_identity") != campaign_identity
             or assignments.get("strategy") != EXECUTION_STRATEGY_CELL_DAG
-            or assignments.get("worker_count") != 8
+            or assignments.get("worker_count") != H100_LOGICAL_WORKER_COUNT
+            or assignments.get("physical_device_count") != H100_PHYSICAL_DEVICE_COUNT
+            or assignments.get("lanes_per_device") != H100_LANES_PER_DEVICE
+            or assignments.get("device_mapping_policy")
+            != "worker_slot_modulo_physical_device_count_v1"
             or not isinstance(assignment_rows, list)
             or len(assignment_rows) != EXPECTED_PHYSICAL_TRAININGS
             or assignment_pairs != set(record_by_pair)

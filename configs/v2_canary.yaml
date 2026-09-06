@@ -1,5 +1,5 @@
-schema_version: 1
-protocol_id: vp-ve-fm-nf-quality-canary-v1
+schema_version: 2
+protocol_id: vp-ve-fm-nf-quality-canary-v2
 output_root: ${oc.env:LID_V2_CANARY_OUTPUT_ROOT}
 
 data:
@@ -11,6 +11,11 @@ data:
   canary_cell_keys:
     - e2/e2_uniform_pca/coefficients
     - e2/e2_arrows/dataset
+  companion_cell_keys:
+    - e3/e3_gaussian_pca/coefficients
+    - e1/e1_sampled_fmnist_step1/dataset
+    - e4/e4_sphere_pca_radius1/coefficients
+    - e2/e2_uniform_pca/dataset
   arrows_dataset: e2_arrows
   visual_sample_seed: 20260906
   selection:
@@ -22,7 +27,9 @@ data:
     seed: 0
 
 execution:
-  worker_count: 8
+  physical_device_count: 8
+  lanes_per_device: 3
+  logical_worker_count: 24
   batch_size: 256
   require_cuda: true
   accelerator_name_pattern: H100

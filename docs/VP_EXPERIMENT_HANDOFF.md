@@ -646,20 +646,35 @@ Extra `upstream` здесь нужен для matplotlib при построен
    pointwise FLIPD Kneedle с ambient-dimension fallback. E1/E5 используют
    target-free reference-mean Kneedle; отсутствие внутреннего knee запечатывает
    `selection_failed` без surrogate scale и без выдуманных метрик.
-6. Один 8-H100 cell-DAG запускает по одному независимому worker на GPU. Перед
-   оставшимися cells обязательны data gate и восемь полноразмерных production
-   canary cells (VP, VE, один posterior FM и NF на D=30 и Arrows D=3072). Эти
-   восемь cells входят в 429 и затем переиспользуются, а не обучаются повторно.
+6. Один 8-H100 cell-DAG запускает 24 независимых logical worker: по три
+   самостоятельных обучения с научным batch 256 на каждой физической H100.
+   Это multiplexing разных cells, а не увеличение batch отдельной модели и не
+   изменение бюджета 8192000 предъявлений. Перед оставшимися cells обязательны
+   data gate и 24 полноразмерные production canary cells: восемь quality cells
+   (VP, VE, один posterior FM и NF на D=30 и Arrows D=3072) плюс 16 настоящих
+   companion cells на D=30/256/784/1024. Все 24 входят в 429 и напрямую
+   переиспользуются full DAG; после PASS canary остаётся 405 обучений.
 7. Для FM cells с ambient dimension не выше 64 сохраняются exact trace и
    empirical oracle. Для D=256/784/1024/3072 применяется отдельно названная
    Hutchinson-16/64 prefix-stability проверка без заявления exact/oracle.
 8. Evaluation выполняется и checkpoint удаляется внутри каждой cell до seal.
    В full DAG stable incomplete directory и progress checkpoint обеспечивают
-   deterministic resume. Canary намеренно строже: незапечатанное обучение с
-   существующим progress checkpoint не может аттестовать полный 0→32000 ETA и
-   требует нового task-specific root с повторным полным замером; уже
-   запечатанные canary cells остаются переиспользуемыми. Comet для v2 по
-   умолчанию отключён.
+   deterministic resume. Canary намеренно строже: пока PASS report отсутствует,
+   наличие любой из 24 final/incomplete cell требует нового task-specific root.
+   Иначе reuse мог бы ложно занизить wall time и исказить GPU telemetry. После
+   PASS report full DAG валидирует identities и artifacts всех 24 cells и
+   переиспользует их. Comet для v2 по умолчанию отключён.
+
+Два первых operational attempt не дали научных строк. Task 9093 остановился на
+Hydra composition до обучения. Task 9098 запустил восемь quality trainings, но
+canary неверно трактовал выход VE `x0`-denoiser как score и повторно применял
+score-to-denoiser преобразование. При прямом использовании предсказанного
+`x0` тот же checkpoint проходит reconstruction gate; исправление закреплено
+unit-тестом. Ни одна cell task 9098 не была sealed, поэтому её partial outputs
+не переиспользуются. Одновременно measured mean utilization для трёх
+завершившихся D=30 trainings составлял лишь около 31--34%, что и мотивировало
+заранее зафиксированный 3-lane cell multiplexing без изменения batch отдельной
+модели. Эти измерения являются инженерной диагностикой, а не benchmark result.
 
 Это описание реализации, а не утверждение об успешном полном результате.
 Научные числа становятся допустимыми только после PASS canary, завершения всех

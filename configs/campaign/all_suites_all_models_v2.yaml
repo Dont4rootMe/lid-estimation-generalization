@@ -78,11 +78,13 @@ evaluation:
   nf_ols_log_step: 0.05
 
 canary_gate:
-  schema_version: 1
+  schema_version: 2
   required: true
-  protocol_id: vp-ve-fm-nf-quality-canary-v1
+  protocol_id: vp-ve-fm-nf-quality-canary-v2
   report_filename: canary_report.json
-  required_worker_count: 8
+  required_physical_device_count: 8
+  required_lanes_per_device: 3
+  required_logical_worker_count: 24
   required_batch_size: 256
   required_cell_keys:
     - e2/e2_uniform_pca/coefficients
@@ -92,6 +94,11 @@ canary_gate:
     - ve_diffusion
     - posterior_log_noise_affine_flow
     - scale_conditioned_nf
+  required_companion_cell_keys:
+    - e3/e3_gaussian_pca/coefficients
+    - e1/e1_sampled_fmnist_step1/dataset
+    - e4/e4_sphere_pca_radius1/coefficients
+    - e2/e2_uniform_pca/dataset
 
 resume:
   schema_version: 2

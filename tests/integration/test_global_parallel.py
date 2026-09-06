@@ -28,6 +28,7 @@ from experiments.global_parallel import (
     _prepare_campaign,
     _run_cell_task,
     _ThrottledEventForwarder,
+    _worker_device_layout,
     run_global_parallel_campaign,
     with_cell_dag_profile,
     with_h100_profile,
@@ -369,6 +370,27 @@ def test_h100_profile_is_explicit_and_legacy_default_is_unchanged() -> None:
     assert {
         plan.model["diagnostics"]["batch_size"] for plan in legacy_affine_plans
     } == {128}
+
+
+def test_v1_h100_profile_keeps_one_unique_device_per_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokens = tuple(f"GPU-{index}" for index in range(8))
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", ",".join(tokens))
+    layout = _worker_device_layout(H100_PROFILE, require_cuda=True)
+
+    assert len(layout) == 8
+    assert tuple(row["visible_device_token"] for row in layout) == tokens
+    assert tuple(row["physical_device_index"] for row in layout) == tuple(range(8))
+    assert {row["device_lane"] for row in layout} == {0}
+    assert all(row["multiplexed"] is False for row in layout)
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", ",".join(tokens[:-1] + tokens[:1]))
+    with pytest.raises(
+        global_campaign.GlobalCampaignError,
+        match="exactly 8 unique visible devices",
+    ):
+        _worker_device_layout(H100_PROFILE, require_cuda=True)
 
 
 def test_cell_dag_dependencies_follow_declared_references_including_paired_delta() -> (

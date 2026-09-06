@@ -16,7 +16,9 @@ from experiments import global_parallel as parallel
 H100_PROFILE_V2: Mapping[str, Any] = {
     "profile": campaign.EXECUTION_PROFILE_H100,
     "strategy": campaign.EXECUTION_STRATEGY_CELL_DAG,
-    "worker_count": 8,
+    "worker_count": campaign.H100_LOGICAL_WORKER_COUNT,
+    "physical_device_count": campaign.H100_PHYSICAL_DEVICE_COUNT,
+    "lanes_per_device": campaign.H100_LANES_PER_DEVICE,
     "training_batch_size_override": None,
     "evaluation_batch_size_override": 512,
 }

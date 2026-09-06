@@ -655,6 +655,9 @@ class _ThrottledEventForwarder:
 def _dag_worker_main(
     worker_slot: int,
     device_token: str | None,
+    physical_device_index: int,
+    device_lane: int,
+    multiplexed: bool,
     prepared: _PreparedCampaign,
     dependencies: ParallelDependencies,
     task_queue: Any,
@@ -663,6 +666,9 @@ def _dag_worker_main(
     require_cuda: bool,
 ) -> None:
     os.environ["LID_WORKER_SLOT"] = str(worker_slot)
+    if multiplexed:
+        os.environ["LID_PHYSICAL_DEVICE_INDEX"] = str(physical_device_index)
+        os.environ["LID_DEVICE_LANE"] = str(device_lane)
     if device_token is None:
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
         visible_device = "cpu-test-worker"
@@ -679,7 +685,10 @@ def _dag_worker_main(
                     "production worker must see exactly one available CUDA device"
                 )
             torch.cuda.set_device(0)
-            visible_device = f"{device_token}:{torch.cuda.get_device_name(0)}"
+            device_name = torch.cuda.get_device_name(0)
+            if multiplexed and "H100" not in device_name.upper():
+                raise RuntimeError("multiplexed H100 worker did not receive an H100")
+            visible_device = f"{device_token}:{device_name}"
         os.environ["LID_VISIBLE_DEVICE"] = visible_device
         while not stop_event.is_set():
             try:
@@ -722,27 +731,41 @@ def _dag_worker_main(
                 )
             finally:
                 events.flush()
-            result_queue.put(
-                {
-                    "kind": "completed",
-                    "worker_slot": worker_slot,
-                    "visible_device": visible_device,
-                    "payload": result,
-                }
-            )
+            message = {
+                "kind": "completed",
+                "worker_slot": worker_slot,
+                "visible_device": visible_device,
+                "payload": result,
+            }
+            if multiplexed:
+                message.update(
+                    {
+                        "physical_device_index": physical_device_index,
+                        "device_lane": device_lane,
+                        "visible_device_token": device_token,
+                    }
+                )
+            result_queue.put(message)
             task = None
     except BaseException as exc:  # noqa: BLE001 - process boundary reports all
         stop_event.set()
-        result_queue.put(
-            {
-                "kind": "failed",
-                "worker_slot": worker_slot,
-                "task": dict(task) if isinstance(task, Mapping) else None,
-                "exception_type": type(exc).__name__,
-                "message": str(exc),
-                "traceback": traceback.format_exc(),
-            }
-        )
+        message = {
+            "kind": "failed",
+            "worker_slot": worker_slot,
+            "task": dict(task) if isinstance(task, Mapping) else None,
+            "exception_type": type(exc).__name__,
+            "message": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+        if multiplexed:
+            message.update(
+                {
+                    "physical_device_index": physical_device_index,
+                    "device_lane": device_lane,
+                    "visible_device_token": device_token,
+                }
+            )
+        result_queue.put(message)
 
 
 def _device_tokens(worker_count: int, *, require_cuda: bool) -> list[str | None]:
@@ -759,6 +782,72 @@ def _device_tokens(worker_count: int, *, require_cuda: bool) -> list[str | None]
             f"H100 profile requires exactly {worker_count} unique visible devices"
         )
     return tokens
+
+
+def _execution_device_topology(
+    execution: Mapping[str, Any],
+) -> tuple[int, int, int, bool]:
+    """Resolve an optional logical-worker to physical-device topology."""
+
+    campaign = _campaign_api()
+    worker_count = execution.get("worker_count")
+    if type(worker_count) is not int or worker_count <= 0:
+        raise campaign.GlobalCampaignError(
+            "execution.worker_count must be a positive integer"
+        )
+    physical_present = "physical_device_count" in execution
+    lanes_present = "lanes_per_device" in execution
+    if physical_present != lanes_present:
+        raise campaign.GlobalCampaignError(
+            "execution device topology requires both physical_device_count "
+            "and lanes_per_device"
+        )
+    if not physical_present:
+        return worker_count, worker_count, 1, False
+    physical_count = execution["physical_device_count"]
+    lanes_per_device = execution["lanes_per_device"]
+    if type(physical_count) is not int or physical_count <= 0:
+        raise campaign.GlobalCampaignError(
+            "execution.physical_device_count must be a positive integer"
+        )
+    if type(lanes_per_device) is not int or lanes_per_device <= 0:
+        raise campaign.GlobalCampaignError(
+            "execution.lanes_per_device must be a positive integer"
+        )
+    if physical_count * lanes_per_device != worker_count:
+        raise campaign.GlobalCampaignError(
+            "execution worker_count must equal physical_device_count multiplied "
+            "by lanes_per_device"
+        )
+    return worker_count, physical_count, lanes_per_device, True
+
+
+def _worker_device_layout(
+    execution: Mapping[str, Any], *, require_cuda: bool
+) -> tuple[dict[str, Any], ...]:
+    """Map each logical worker slot to one isolated physical CUDA token."""
+
+    worker_count, physical_count, lanes_per_device, multiplexed = (
+        _execution_device_topology(execution)
+    )
+    if multiplexed and not require_cuda:
+        campaign = _campaign_api()
+        raise campaign.GlobalCampaignError(
+            "multiplexed device topology cannot disable CUDA checks"
+        )
+    physical_tokens = _device_tokens(physical_count, require_cuda=require_cuda)
+    return tuple(
+        {
+            "worker_slot": slot,
+            "physical_device_index": slot % physical_count,
+            "device_lane": slot // physical_count,
+            "visible_device_token": physical_tokens[slot % physical_count],
+            "physical_device_count": physical_count,
+            "lanes_per_device": lanes_per_device,
+            "multiplexed": multiplexed,
+        }
+        for slot in range(worker_count)
+    )
 
 
 def _terminate_workers(processes: Sequence[Any]) -> None:
@@ -781,17 +870,28 @@ def _persist_assignments(
     assignments: Mapping[tuple[int, int], Mapping[str, Any]],
 ) -> None:
     campaign = _campaign_api()
-
-    campaign._write_json(
-        _assignment_path(prepared),
-        {
-            "schema_version": 1,
-            "campaign_identity": prepared.campaign_identity,
-            "strategy": prepared.config["execution"]["strategy"],
-            "worker_count": int(prepared.config["execution"]["worker_count"]),
-            "assignments": [dict(assignments[key]) for key in sorted(assignments)],
-        },
+    execution = prepared.config["execution"]
+    worker_count, physical_count, lanes_per_device, multiplexed = (
+        _execution_device_topology(execution)
     )
+    payload = {
+        "schema_version": 2 if multiplexed else 1,
+        "campaign_identity": prepared.campaign_identity,
+        "strategy": execution["strategy"],
+        "worker_count": worker_count,
+        "assignments": [dict(assignments[key]) for key in sorted(assignments)],
+    }
+    if multiplexed:
+        payload.update(
+            {
+                "physical_device_count": physical_count,
+                "lanes_per_device": lanes_per_device,
+                "device_mapping_policy": (
+                    "worker_slot_modulo_physical_device_count_v1"
+                ),
+            }
+        )
+    campaign._write_json(_assignment_path(prepared), payload)
 
 
 def _resume_assignments(
@@ -803,22 +903,41 @@ def _resume_assignments(
     path = _assignment_path(prepared)
     assignments: dict[tuple[int, int], dict[str, Any]] = {}
     seen: set[tuple[int, int]] = set()
+    seen_dispatch_sequences: set[int] = set()
+    execution = prepared.config["execution"]
+    worker_count, physical_count, lanes_per_device, multiplexed = (
+        _execution_device_topology(execution)
+    )
     if path.exists():
         payload = campaign._load_json(path)
-        if (
-            set(payload)
-            != {
-                "schema_version",
-                "campaign_identity",
-                "strategy",
-                "worker_count",
-                "assignments",
+        expected_payload_fields = {
+            "schema_version",
+            "campaign_identity",
+            "strategy",
+            "worker_count",
+            "assignments",
+        }
+        if multiplexed:
+            expected_payload_fields |= {
+                "physical_device_count",
+                "lanes_per_device",
+                "device_mapping_policy",
             }
-            or payload.get("schema_version") != 1
+        if (
+            set(payload) != expected_payload_fields
+            or payload.get("schema_version") != (2 if multiplexed else 1)
             or payload.get("campaign_identity") != prepared.campaign_identity
-            or payload.get("strategy") != prepared.config["execution"]["strategy"]
-            or payload.get("worker_count")
-            != prepared.config["execution"]["worker_count"]
+            or payload.get("strategy") != execution["strategy"]
+            or payload.get("worker_count") != worker_count
+            or (
+                multiplexed
+                and (
+                    payload.get("physical_device_count") != physical_count
+                    or payload.get("lanes_per_device") != lanes_per_device
+                    or payload.get("device_mapping_policy")
+                    != "worker_slot_modulo_physical_device_count_v1"
+                )
+            )
             or not isinstance(payload.get("assignments"), list)
         ):
             raise campaign.GlobalCampaignError(
@@ -837,6 +956,12 @@ def _resume_assignments(
                 "ready_after_dispatch",
                 "status",
             }
+            if multiplexed:
+                expected_fields |= {
+                    "physical_device_index",
+                    "device_lane",
+                    "visible_device_token",
+                }
             if not isinstance(row, Mapping) or set(row) != expected_fields:
                 raise campaign.GlobalCampaignError("parallel assignment row is invalid")
             model_index = row.get("model_index")
@@ -864,11 +989,11 @@ def _resume_assignments(
             completed_row = (
                 status == "completed"
                 and type(worker_slot) is int
-                and 0 <= worker_slot < prepared.config["execution"]["worker_count"]
+                and 0 <= worker_slot < worker_count
                 and type(dispatch_sequence) is int
                 and dispatch_sequence > 0
                 and type(in_flight) is int
-                and 1 <= in_flight <= prepared.config["execution"]["worker_count"]
+                and 1 <= in_flight <= worker_count
                 and type(ready) is int
                 and ready >= 0
             )
@@ -879,6 +1004,30 @@ def _resume_assignments(
                 and in_flight is None
                 and ready is None
             )
+            if multiplexed and completed_row:
+                physical_device_index = row.get("physical_device_index")
+                device_lane = row.get("device_lane")
+                visible_token = row.get("visible_device_token")
+                visible_device = row.get("visible_device")
+                completed_row = (
+                    type(physical_device_index) is int
+                    and physical_device_index == worker_slot % physical_count
+                    and type(device_lane) is int
+                    and device_lane == worker_slot // physical_count
+                    and isinstance(visible_token, str)
+                    and bool(visible_token)
+                    and isinstance(visible_device, str)
+                    and visible_device.startswith(f"{visible_token}:")
+                )
+            if multiplexed and reconstructed_row:
+                reconstructed_row = all(
+                    row.get(field) is None
+                    for field in (
+                        "physical_device_index",
+                        "device_lane",
+                        "visible_device_token",
+                    )
+                )
             if (
                 row.get("model_variant") != prepared.plans[model_index].variant_id
                 or row.get("cell_key") != prepared.cells[cell_index].key
@@ -889,13 +1038,19 @@ def _resume_assignments(
                 raise campaign.GlobalCampaignError(
                     "parallel assignment row differs from its cell"
                 )
+            if completed_row:
+                if dispatch_sequence in seen_dispatch_sequences:
+                    raise campaign.GlobalCampaignError(
+                        "parallel assignment ledger repeats a dispatch sequence"
+                    )
+                seen_dispatch_sequences.add(dispatch_sequence)
             if key in completed:
                 assignments[key] = dict(row)
     for key in sorted(completed):
         if key in assignments:
             continue
         model_index, cell_index = key
-        assignments[key] = {
+        row = {
             "model_index": model_index,
             "model_variant": prepared.plans[model_index].variant_id,
             "cell_index": cell_index,
@@ -907,6 +1062,15 @@ def _resume_assignments(
             "ready_after_dispatch": None,
             "status": "reconstructed",
         }
+        if multiplexed:
+            row.update(
+                {
+                    "physical_device_index": None,
+                    "device_lane": None,
+                    "visible_device_token": None,
+                }
+            )
+        assignments[key] = row
     _persist_assignments(prepared, assignments)
     return assignments
 
@@ -947,8 +1111,9 @@ def _run_cell_dag_pool(
     if not pending:
         return states, assignments
 
-    worker_count = int(prepared.config["execution"]["worker_count"])
-    tokens = _device_tokens(worker_count, require_cuda=require_cuda)
+    execution = prepared.config["execution"]
+    layout = _worker_device_layout(execution, require_cuda=require_cuda)
+    worker_count = len(layout)
     context = mp.get_context("spawn")
     task_queue = context.Queue()
     result_queue = context.Queue()
@@ -959,7 +1124,10 @@ def _run_cell_dag_pool(
             name=f"lid-cell-worker-{slot}",
             args=(
                 slot,
-                tokens[slot],
+                layout[slot]["visible_device_token"],
+                int(layout[slot]["physical_device_index"]),
+                int(layout[slot]["device_lane"]),
+                bool(layout[slot]["multiplexed"]),
                 prepared,
                 dependencies,
                 task_queue,
@@ -1077,6 +1245,22 @@ def _run_cell_dag_pool(
                 )
             if kind != "completed" or not isinstance(message.get("payload"), Mapping):
                 raise campaign.GlobalCampaignError("invalid cell-worker result")
+            worker_slot = message.get("worker_slot")
+            if type(worker_slot) is not int or not 0 <= worker_slot < worker_count:
+                raise campaign.GlobalCampaignError(
+                    "cell worker reported an invalid logical slot"
+                )
+            worker_layout = layout[worker_slot]
+            if worker_layout["multiplexed"] and (
+                message.get("physical_device_index")
+                != worker_layout["physical_device_index"]
+                or message.get("device_lane") != worker_layout["device_lane"]
+                or message.get("visible_device_token")
+                != worker_layout["visible_device_token"]
+            ):
+                raise campaign.GlobalCampaignError(
+                    "cell worker reported a device mapping that differs from its slot"
+                )
             result = dict(message["payload"])
             key = (int(result["model_index"]), int(result["cell_index"]))
             if key not in in_flight or key not in pending:
@@ -1097,16 +1281,29 @@ def _run_cell_dag_pool(
                 model_index=model_index,
                 records=state["records"],
             )
-            assignments[key] = {
+            assignment = {
                 "model_index": model_index,
                 "model_variant": prepared.plans[model_index].variant_id,
                 "cell_index": cell_index,
                 "cell_key": prepared.cells[cell_index].key,
-                "worker_slot": int(message["worker_slot"]),
+                "worker_slot": worker_slot,
                 "visible_device": str(message["visible_device"]),
                 **dispatch,
                 "status": "completed",
             }
+            if worker_layout["multiplexed"]:
+                assignment.update(
+                    {
+                        "physical_device_index": int(
+                            worker_layout["physical_device_index"]
+                        ),
+                        "device_lane": int(worker_layout["device_lane"]),
+                        "visible_device_token": str(
+                            worker_layout["visible_device_token"]
+                        ),
+                    }
+                )
+            assignments[key] = assignment
             _persist_assignments(prepared, assignments)
             discover_ready()
             fill_workers()
@@ -1379,7 +1576,13 @@ def _seal_dag_models(
 
 
 def _probe_worker(
-    slot: int, token: str | None, require_cuda: bool, result_queue: Any
+    slot: int,
+    token: str | None,
+    physical_device_index: int,
+    device_lane: int,
+    multiplexed: bool,
+    require_cuda: bool,
+    result_queue: Any,
 ) -> None:
     if token is None:
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -1391,6 +1594,13 @@ def _probe_worker(
             "visible_token": token,
             "cuda_required": require_cuda,
         }
+        if multiplexed:
+            record.update(
+                {
+                    "physical_device_index": physical_device_index,
+                    "device_lane": device_lane,
+                }
+            )
         if require_cuda:
             import torch
 
@@ -1414,6 +1624,52 @@ def _probe_worker(
         )
 
 
+def _preflight_payload(
+    prepared: _PreparedCampaign,
+    *,
+    records: Sequence[Mapping[str, Any]],
+    layout: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    execution = prepared.config["execution"]
+    _, physical_count, lanes_per_device, multiplexed = _execution_device_topology(
+        execution
+    )
+    payload: dict[str, Any] = {
+        "schema_version": 2 if multiplexed else 1,
+        "campaign_identity": prepared.campaign_identity,
+        "execution": execution,
+        "workers": sorted(
+            (dict(record) for record in records), key=lambda row: int(row["slot"])
+        ),
+        "cell_count": len(prepared.cells),
+        "model_count": len(prepared.plans),
+        "task_count": len(prepared.cells) * len(prepared.plans),
+        "status": "ready",
+    }
+    if multiplexed:
+        payload.update(
+            {
+                "physical_device_count": physical_count,
+                "lanes_per_device": lanes_per_device,
+                "device_mapping_policy": (
+                    "worker_slot_modulo_physical_device_count_v1"
+                ),
+                "physical_devices": [
+                    {
+                        "physical_device_index": index,
+                        "visible_device_token": layout[index]["visible_device_token"],
+                        "worker_slots": [
+                            index + lane * physical_count
+                            for lane in range(lanes_per_device)
+                        ],
+                    }
+                    for index in range(physical_count)
+                ],
+            }
+        )
+    return payload
+
+
 def _run_preflight_only(
     prepared: _PreparedCampaign,
     *,
@@ -1428,15 +1684,25 @@ def _run_preflight_only(
         raise campaign.GlobalCampaignError(
             "parallel campaign state is not spawn-picklable"
         ) from exc
-    worker_count = int(prepared.config["execution"]["worker_count"])
-    tokens = _device_tokens(worker_count, require_cuda=require_cuda)
+    execution = prepared.config["execution"]
+    layout = _worker_device_layout(execution, require_cuda=require_cuda)
+    worker_count = len(layout)
+    _, _, _, multiplexed = _execution_device_topology(execution)
     context = mp.get_context("spawn")
     result_queue = context.Queue()
     processes = [
         context.Process(
             target=_probe_worker,
             name=f"lid-preflight-worker-{slot}",
-            args=(slot, tokens[slot], require_cuda, result_queue),
+            args=(
+                slot,
+                layout[slot]["visible_device_token"],
+                int(layout[slot]["physical_device_index"]),
+                int(layout[slot]["device_lane"]),
+                bool(layout[slot]["multiplexed"]),
+                require_cuda,
+                result_queue,
+            ),
         )
         for slot in range(worker_count)
     ]
@@ -1477,6 +1743,30 @@ def _run_preflight_only(
             slot = int(record["slot"])
             if not 0 <= slot < worker_count or slot in seen_slots:
                 raise campaign.GlobalCampaignError("duplicate preflight worker record")
+            expected = layout[slot]
+            if (
+                record.get("visible_token") != expected["visible_device_token"]
+                or record.get("cuda_required") is not require_cuda
+                or record.get("device_count") != (1 if require_cuda else 0)
+                or (
+                    multiplexed
+                    and (
+                        record.get("physical_device_index")
+                        != expected["physical_device_index"]
+                        or record.get("device_lane") != expected["device_lane"]
+                        or (
+                            require_cuda
+                            and (
+                                not isinstance(record.get("device_name"), str)
+                                or "H100" not in record["device_name"].upper()
+                            )
+                        )
+                    )
+                )
+            ):
+                raise campaign.GlobalCampaignError(
+                    "preflight worker device mapping differs from its logical slot"
+                )
             seen_slots.add(slot)
             records.append(dict(record))
         for process in processes:
@@ -1486,18 +1776,9 @@ def _run_preflight_only(
     except BaseException:
         _terminate_workers(processes)
         raise
+    payload = _preflight_payload(prepared, records=records, layout=layout)
     campaign._write_json(
-        Path(prepared.state_dir) / "parallel" / "preflight.json",
-        {
-            "schema_version": 1,
-            "campaign_identity": prepared.campaign_identity,
-            "execution": prepared.config["execution"],
-            "workers": sorted(records, key=lambda row: int(row["slot"])),
-            "cell_count": len(prepared.cells),
-            "model_count": len(prepared.plans),
-            "task_count": len(prepared.cells) * len(prepared.plans),
-            "status": "ready",
-        },
+        Path(prepared.state_dir) / "parallel" / "preflight.json", payload
     )
     return Path(prepared.campaign_root)
 

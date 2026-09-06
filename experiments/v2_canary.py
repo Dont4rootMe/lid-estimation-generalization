@@ -1,10 +1,13 @@
-"""Fail-closed pre-full quality and eight-H100 utilization canary.
+"""Fail-closed pre-full quality and multiplexed eight-H100 utilization canary.
 
-The canary trains eight *production* cells (four model variants on D30
-``e2_uniform_pca`` coefficients and D3072 ``e2_arrows`` images).  The resulting
-attestation is consumed by the v2 full campaign; this module never starts that
-campaign itself.  A failed or incomplete gate therefore stops the shell chain
-before any remaining full-matrix cell is scheduled.
+The canary trains 24 *production* cells as three independent lanes on each of
+eight H100s.  Eight cells (four model variants on D30 ``e2_uniform_pca``
+coefficients and D3072 ``e2_arrows`` images) carry the scientific quality
+diagnostics.  Sixteen additional production cells provide representative
+co-load and are sealed for reuse by the same 429-cell campaign.  The resulting
+attestation is consumed by the v2 full campaign; this module never starts the
+remaining campaign itself.  A failed or incomplete gate therefore stops the
+shell chain before any remaining full-matrix cell is scheduled.
 
 This file deliberately owns only the canary/report boundary.  Training and
 global-campaign identities remain authoritative in their respective modules.
@@ -38,11 +41,13 @@ import hydra
 import numpy as np
 from omegaconf import DictConfig, OmegaConf
 
-SCHEMA_VERSION = 1
-PROTOCOL_ID = "vp-ve-fm-nf-quality-canary-v1"
+SCHEMA_VERSION = 2
+PROTOCOL_ID = "vp-ve-fm-nf-quality-canary-v2"
 REPORT_FILENAME = "canary_report.json"
 EXPECTED_BATCH_SIZE = 256
 EXPECTED_WORKER_COUNT = 8
+EXPECTED_LANES_PER_DEVICE = 3
+EXPECTED_PROCESS_COUNT = EXPECTED_WORKER_COUNT * EXPECTED_LANES_PER_DEVICE
 EXPECTED_TRAINING_STEPS = 32000
 EXPECTED_CELL_KEYS = (
     "e2/e2_uniform_pca/coefficients",
@@ -60,6 +65,37 @@ EXPECTED_CELL_IDS = tuple(
     for cell_key in EXPECTED_CELL_KEYS
     for variant in EXPECTED_VARIANTS
 )
+EXPECTED_COMPANION_CELL_KEYS = (
+    "e3/e3_gaussian_pca/coefficients",
+    "e1/e1_sampled_fmnist_step1/dataset",
+    "e4/e4_sphere_pca_radius1/coefficients",
+    "e2/e2_uniform_pca/dataset",
+)
+EXPECTED_COMPANION_CELL_IDS = tuple(
+    f"{variant}/{cell_key}"
+    for cell_key in EXPECTED_COMPANION_CELL_KEYS
+    for variant in EXPECTED_VARIANTS
+)
+EXPECTED_ALL_CELL_IDS = EXPECTED_CELL_IDS + EXPECTED_COMPANION_CELL_IDS
+
+
+def _physical_device_for_cell(cell_id: str) -> int:
+    variant = cell_id.split("/", 1)[0]
+    variant_index = EXPECTED_VARIANTS.index(variant)
+    representation = cell_id.rsplit("/", 1)[-1]
+    return variant_index if representation == "coefficients" else 4 + variant_index
+
+
+EXPECTED_PROCESS_DEVICE_INDICES = tuple(
+    _physical_device_for_cell(cell_id) for cell_id in EXPECTED_ALL_CELL_IDS
+)
+if EXPECTED_PROCESS_DEVICE_INDICES != tuple(
+    process_index % EXPECTED_WORKER_COUNT
+    for process_index in range(EXPECTED_PROCESS_COUNT)
+):
+    raise RuntimeError(
+        "canary process-to-device schedule must be three full H100 lanes"
+    )
 REQUIRED_GATE_IDS = frozenset(
     {
         "source_provenance",
@@ -200,6 +236,7 @@ def validate_canary_config(config: Mapping[str, Any] | DictConfig) -> dict[str, 
             "registry",
             "reviewed_arrows_gate",
             "canary_cell_keys",
+            "companion_cell_keys",
             "arrows_dataset",
             "visual_sample_seed",
             "selection",
@@ -211,6 +248,8 @@ def validate_canary_config(config: Mapping[str, Any] | DictConfig) -> dict[str, 
         raise CanaryError("data.reviewed_arrows_gate must be a path string")
     if tuple(data["canary_cell_keys"]) != EXPECTED_CELL_KEYS:
         raise CanaryError("canary must use the exact D30/D3072 production cells")
+    if tuple(data["companion_cell_keys"]) != EXPECTED_COMPANION_CELL_KEYS:
+        raise CanaryError("canary utilization companions differ from the contract")
     if data["arrows_dataset"] != "e2_arrows":
         raise CanaryError("Arrows gate must inspect canonical e2_arrows")
     if isinstance(data["visual_sample_seed"], bool) or not isinstance(
@@ -244,7 +283,9 @@ def validate_canary_config(config: Mapping[str, Any] | DictConfig) -> dict[str, 
     execution = _exact_keys(
         top["execution"],
         {
-            "worker_count",
+            "physical_device_count",
+            "lanes_per_device",
+            "logical_worker_count",
             "batch_size",
             "require_cuda",
             "accelerator_name_pattern",
@@ -252,8 +293,12 @@ def validate_canary_config(config: Mapping[str, Any] | DictConfig) -> dict[str, 
         },
         field="execution",
     )
-    if execution["worker_count"] != EXPECTED_WORKER_COUNT:
-        raise CanaryError("canary requires exactly eight workers")
+    if execution["physical_device_count"] != EXPECTED_WORKER_COUNT:
+        raise CanaryError("canary requires exactly eight physical H100 devices")
+    if execution["lanes_per_device"] != EXPECTED_LANES_PER_DEVICE:
+        raise CanaryError("canary requires exactly three lanes per H100")
+    if execution["logical_worker_count"] != EXPECTED_PROCESS_COUNT:
+        raise CanaryError("canary requires exactly 24 logical workers")
     if execution["batch_size"] != EXPECTED_BATCH_SIZE:
         raise CanaryError("canary scientific batch_size must remain exactly 256")
     if execution["require_cuda"] is not True:
@@ -432,6 +477,14 @@ def _field(value: Any, name: str) -> Any:
     return getattr(value, name)
 
 
+def _diagnostic_subset_seed(cell_id: str, base_seed: int) -> int:
+    _, suite, dataset, representation = cell_id.split("/")
+    cell_key = f"{suite}/{dataset}/{representation}"
+    if cell_key not in EXPECTED_CELL_KEYS:
+        raise CanaryError("diagnostic cell is outside the paired quality design")
+    return base_seed + EXPECTED_CELL_KEYS.index(cell_key) * 1009
+
+
 def _json_safe(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {str(key): _json_safe(item) for key, item in value.items()}
@@ -561,8 +614,7 @@ def _reconstruction_quality(
                 (len(clean),), noise_ratio, device=clean.device, dtype=clean.dtype
             )
             noisy = clean + noise_ratio * noise
-            score = model(noisy, condition)
-            predicted = noisy + noise_ratio**2 * score
+            predicted = model(noisy, condition)
             identity = noisy
         elif variant_id == "posterior_log_noise_affine_flow":
             if (
@@ -1159,7 +1211,7 @@ class CanaryDiagnostics:
             raise CanaryError(
                 "production cell omitted declared canary lambda candidates"
             )
-        subset_seed = int(ev["trace_seed"]) + EXPECTED_CELL_IDS.index(cell_id) * 1009
+        subset_seed = _diagnostic_subset_seed(cell_id, int(ev["trace_seed"]))
         selection_count = int(ev["selection_query_count"][representation])
         selected_indices = _deterministic_subset(
             len(selection), selection_count, subset_seed
@@ -1709,7 +1761,9 @@ def validate_canary_report(
             "path",
             "sha256",
             "batch_size",
-            "worker_count",
+            "physical_device_count",
+            "lanes_per_device",
+            "logical_worker_count",
             "campaign_identity",
             "campaign_config_sha256",
             "input_inventory_sha256",
@@ -1733,9 +1787,13 @@ def validate_canary_report(
         raise CanaryError("canary config hash mismatch")
     if (
         config["batch_size"] != EXPECTED_BATCH_SIZE
-        or config["worker_count"] != EXPECTED_WORKER_COUNT
+        or config["physical_device_count"] != EXPECTED_WORKER_COUNT
+        or config["lanes_per_device"] != EXPECTED_LANES_PER_DEVICE
+        or config["logical_worker_count"] != EXPECTED_PROCESS_COUNT
     ):
-        raise CanaryError("report does not attest the required 8x batch-256 execution")
+        raise CanaryError(
+            "report does not attest the required 8x3-lane batch-256 execution"
+        )
     for expected, field in (
         (expected_campaign_identity, "campaign_identity"),
         (expected_campaign_config_sha256, "campaign_config_sha256"),
@@ -1865,13 +1923,27 @@ def validate_canary_report(
 
     telemetry = _exact_keys(
         top["utilization_probe"],
-        {"status", "scientific_result", "batch_size", "devices"},
+        {
+            "status",
+            "scientific_result",
+            "batch_size",
+            "physical_device_count",
+            "lanes_per_device",
+            "logical_worker_count",
+            "devices",
+            "companion_cells",
+        },
         field="utilization_probe",
     )
     if telemetry["status"] != "passed" or telemetry["scientific_result"] is not True:
         raise CanaryError("GPU telemetry must come from the eight scientific cells")
-    if telemetry["batch_size"] != EXPECTED_BATCH_SIZE:
-        raise CanaryError("telemetry batch size mismatch")
+    if (
+        telemetry["batch_size"] != EXPECTED_BATCH_SIZE
+        or telemetry["physical_device_count"] != EXPECTED_WORKER_COUNT
+        or telemetry["lanes_per_device"] != EXPECTED_LANES_PER_DEVICE
+        or telemetry["logical_worker_count"] != EXPECTED_PROCESS_COUNT
+    ):
+        raise CanaryError("telemetry batch or multiplexing contract mismatch")
     telemetry_devices = telemetry["devices"]
     if (
         not isinstance(telemetry_devices, list)
@@ -1929,14 +2001,78 @@ def validate_canary_report(
     if telemetry_uuids != uuids:
         raise CanaryError("telemetry UUIDs differ from preflight bindings")
 
+    companion_cells = telemetry["companion_cells"]
+    if not isinstance(companion_cells, list) or len(companion_cells) != len(
+        EXPECTED_COMPANION_CELL_IDS
+    ):
+        raise CanaryError("utilization probe must contain 16 production companions")
+    for offset, item in enumerate(companion_cells, start=len(EXPECTED_CELL_IDS)):
+        companion = _exact_keys(
+            item,
+            {
+                "cell_id",
+                "variant_id",
+                "suite_id",
+                "dataset",
+                "representation",
+                "status",
+                "process_index",
+                "physical_device_index",
+                "input_sha256",
+                "partition_sha256",
+                "training_config_sha256",
+                "checkpoint_sha256",
+                "production_identity_sha256",
+                "reusable_by_full_campaign",
+                "production_wall_seconds",
+                "artifacts",
+            },
+            field="utilization companion",
+        )
+        expected_id = EXPECTED_ALL_CELL_IDS[offset]
+        variant, suite, dataset, representation = expected_id.split("/")
+        if (
+            companion["cell_id"] != expected_id
+            or companion["variant_id"] != variant
+            or companion["suite_id"] != suite
+            or companion["dataset"] != dataset
+            or companion["representation"] != representation
+            or companion["status"] != "passed"
+            or companion["process_index"] != offset
+            or companion["physical_device_index"]
+            != EXPECTED_PROCESS_DEVICE_INDICES[offset]
+            or companion["reusable_by_full_campaign"] is not True
+        ):
+            raise CanaryError("utilization companion identity/status mismatch")
+        for name in (
+            "input_sha256",
+            "partition_sha256",
+            "training_config_sha256",
+            "checkpoint_sha256",
+            "production_identity_sha256",
+        ):
+            _sha(companion[name], field=f"companion.{name}")
+        if (
+            _finite_number(
+                companion["production_wall_seconds"],
+                field="companion production wall time",
+            )
+            <= 0
+            or not isinstance(companion["artifacts"], list)
+            or not companion["artifacts"]
+        ):
+            raise CanaryError("utilization companion evidence is incomplete")
+
     projection = _exact_keys(
         top["runtime_projection"],
         {
             "status",
             "physical_cell_count",
-            "worker_count",
+            "logical_worker_count",
+            "physical_device_count",
+            "lanes_per_device",
             "waves",
-            "maximum_canary_preseal_wall_seconds",
+            "maximum_observed_cell_wall_seconds",
             "safety_factor",
             "projected_campaign_hours",
             "maximum_allowed_hours",
@@ -1946,14 +2082,16 @@ def validate_canary_report(
     if (
         projection["status"] != "passed"
         or projection["physical_cell_count"] != 429
-        or projection["worker_count"] != EXPECTED_WORKER_COUNT
-        or projection["waves"] != math.ceil(429 / EXPECTED_WORKER_COUNT)
+        or projection["logical_worker_count"] != EXPECTED_PROCESS_COUNT
+        or projection["physical_device_count"] != EXPECTED_WORKER_COUNT
+        or projection["lanes_per_device"] != EXPECTED_LANES_PER_DEVICE
+        or projection["waves"] != math.ceil(429 / EXPECTED_PROCESS_COUNT)
         or projection["safety_factor"] != 2.0
         or projection["maximum_allowed_hours"] != 96.0
     ):
         raise CanaryError("runtime projection contract differs")
     maximum_wall = _finite_number(
-        projection["maximum_canary_preseal_wall_seconds"],
+        projection["maximum_observed_cell_wall_seconds"],
         field="runtime projection maximum wall time",
     )
     projected_hours = _finite_number(
@@ -2080,7 +2218,10 @@ def validate_canary_report(
         raise CanaryError("scientific cells were not bound one per H100 worker")
     if not math.isclose(
         maximum_wall,
-        max(float(cell["production_preseal_wall_seconds"]) for cell in cells),
+        max(
+            [float(cell["production_preseal_wall_seconds"]) for cell in cells]
+            + [float(cell["production_wall_seconds"]) for cell in companion_cells]
+        ),
         rel_tol=1.0e-12,
     ):
         raise CanaryError("runtime projection is not derived from canary cells")
@@ -2132,6 +2273,16 @@ def validate_canary_report(
         raise CanaryError(
             "reviewed Arrows contact sheet is absent from output inventory"
         )
+    output_by_path = {str(item["path"]): dict(item) for item in outputs}
+    for owner in [*cells, *companion_cells]:
+        for item in owner["artifacts"]:
+            artifact = _exact_keys(
+                item, {"path", "sha256", "size_bytes"}, field="cell artifact"
+            )
+            if output_by_path.get(str(artifact["path"])) != dict(artifact):
+                raise CanaryError(
+                    "cell artifact is absent from the hashed output inventory"
+                )
 
     report_path = root / REPORT_FILENAME
     if report_path.exists() and REPORT_FILENAME in seen_paths:
@@ -2583,7 +2734,9 @@ def _load_or_create_preseal_runtime(
 
 
 def _canary_worker_main(
-    worker_index: int,
+    process_index: int,
+    cell_id: str,
+    quality_worker_index: int | None,
     device_token: str,
     device: Mapping[str, Any],
     prepared: Any,
@@ -2592,7 +2745,7 @@ def _canary_worker_main(
     result_queue: Any,
 ) -> None:
     os.environ["CUDA_VISIBLE_DEVICES"] = device_token
-    os.environ["LID_WORKER_SLOT"] = str(worker_index)
+    os.environ["LID_WORKER_SLOT"] = str(process_index)
     try:
         import torch
 
@@ -2611,71 +2764,94 @@ def _canary_worker_main(
         result_queue.put(
             {
                 "kind": "ready",
-                "worker_index": worker_index,
+                "process_index": process_index,
+                "cell_id": cell_id,
                 "visible_device": visible,
                 "torch_version": torch.__version__,
             }
         )
         if not start_event.wait(timeout=120):
             raise CanaryError("worker start barrier timed out")
-        sampler = _DeviceSampler(
-            device=device,
-            interval_seconds=float(config["execution"]["telemetry_interval_seconds"]),
-        )
-        sampler.start()
-        measured_train = _MeasuredTrain(sampler, worker_index)
         cell_start_ns = time.time_ns()
+        sampler = None
+        dependencies = ParallelDependencies()
+        hook = None
+        if quality_worker_index is not None:
+            sampler = _DeviceSampler(
+                device=device,
+                interval_seconds=float(
+                    config["execution"]["telemetry_interval_seconds"]
+                ),
+            )
+            sampler.start()
+            measured_train = _MeasuredTrain(sampler, quality_worker_index)
+            dependencies = ParallelDependencies(train_fn=measured_train)
 
-        def hook(context: Mapping[str, Any], output_dir: Path) -> Mapping[str, Any]:
-            evidence = dict(CanaryDiagnostics(config)(context, output_dir))
-            training_runtime = _load_runtime_sidecar(
-                Path(_field(context, "checkpoint_path")),
-                worker_index=worker_index,
-            )
-            evidence["training_runtime"] = training_runtime
-            runtime_record = _load_or_create_preseal_runtime(
-                output_dir,
-                cell_id=str(evidence["cell_id"]),
-                cell_identity_sha256=str(evidence["cell_identity_sha256"]),
-                training_runtime=training_runtime,
-                worker_start_ns=cell_start_ns,
-            )
-            evidence["production_preseal_wall_seconds"] = runtime_record[
-                "production_preseal_wall_seconds"
-            ]
-            return evidence
+            def quality_hook(
+                context: Mapping[str, Any], output_dir: Path
+            ) -> Mapping[str, Any]:
+                evidence = dict(CanaryDiagnostics(config)(context, output_dir))
+                training_runtime = _load_runtime_sidecar(
+                    Path(_field(context, "checkpoint_path")),
+                    worker_index=quality_worker_index,
+                )
+                evidence["training_runtime"] = training_runtime
+                runtime_record = _load_or_create_preseal_runtime(
+                    output_dir,
+                    cell_id=str(evidence["cell_id"]),
+                    cell_identity_sha256=str(evidence["cell_identity_sha256"]),
+                    training_runtime=training_runtime,
+                    worker_start_ns=cell_start_ns,
+                )
+                evidence["production_preseal_wall_seconds"] = runtime_record[
+                    "production_preseal_wall_seconds"
+                ]
+                return evidence
+
+            hook = quality_hook
 
         def event_callback(event: str, payload: Mapping[str, Any]) -> None:
             result_queue.put(
                 {
                     "kind": "event",
-                    "worker_index": worker_index,
+                    "process_index": process_index,
                     "event": event,
                     "payload": _json_safe(payload),
                 }
             )
 
-        cell_id = EXPECTED_CELL_IDS[worker_index]
         variant, suite, dataset, representation = cell_id.split("/")
         try:
             result = run_prepared_v2_cell(
                 prepared,
                 model_variant=variant,
                 cell_key=f"{suite}/{dataset}/{representation}",
-                dependencies=ParallelDependencies(train_fn=measured_train),
+                dependencies=dependencies,
                 event_callback=event_callback,
                 pre_seal_hook=hook,
             )
         finally:
-            sampler.stop()
+            if sampler is not None:
+                sampler.stop()
+        cell_end_ns = time.time_ns()
         result_queue.put(
-            {"kind": "completed", "worker_index": worker_index, "result": result}
+            {
+                "kind": "completed",
+                "process_index": process_index,
+                "cell_id": cell_id,
+                "quality_worker_index": quality_worker_index,
+                "physical_device_index": int(device["worker_index"]),
+                "production_wall_seconds": (cell_end_ns - cell_start_ns)
+                / 1_000_000_000,
+                "result": result,
+            }
         )
     except BaseException as exc:  # noqa: BLE001 - process boundary must report all
         result_queue.put(
             {
                 "kind": "failed",
-                "worker_index": worker_index,
+                "process_index": process_index,
+                "cell_id": cell_id,
                 "exception_type": type(exc).__name__,
                 "message": str(exc),
                 "traceback": traceback.format_exc(),
@@ -2683,7 +2859,7 @@ def _canary_worker_main(
         )
 
 
-def _run_eight_cells(
+def _run_multiplexed_cells(
     prepared: Any,
     config: Mapping[str, Any],
     *,
@@ -2699,39 +2875,45 @@ def _run_eight_cells(
             name=f"v2-canary-{index}",
             args=(
                 index,
-                device_tokens[index],
-                devices[index],
+                EXPECTED_ALL_CELL_IDS[index],
+                index if index < len(EXPECTED_CELL_IDS) else None,
+                device_tokens[EXPECTED_PROCESS_DEVICE_INDICES[index]],
+                devices[EXPECTED_PROCESS_DEVICE_INDICES[index]],
                 prepared,
                 config,
                 start_event,
                 result_queue,
             ),
         )
-        for index in range(EXPECTED_WORKER_COUNT)
+        for index in range(EXPECTED_PROCESS_COUNT)
     ]
     for process in processes:
         process.start()
     ready: set[int] = set()
     completed: dict[int, dict[str, Any]] = {}
     try:
-        while len(ready) < EXPECTED_WORKER_COUNT:
+        while len(ready) < EXPECTED_PROCESS_COUNT:
             try:
                 message = result_queue.get(timeout=120)
             except queue.Empty as exc:
                 raise CanaryError("eight-H100 worker preflight timed out") from exc
             if message.get("kind") == "failed":
                 raise CanaryError(
-                    f"canary worker {message.get('worker_index')} failed preflight: "
+                    f"canary process {message.get('process_index')} failed preflight: "
                     f"{message.get('exception_type')}: {message.get('message')}"
                 )
             if message.get("kind") != "ready":
                 raise CanaryError("worker emitted data before the start barrier")
-            worker = int(message["worker_index"])
-            if worker in ready or message.get("torch_version") != "2.7.1+cu126":
+            worker = int(message["process_index"])
+            if (
+                worker in ready
+                or message.get("cell_id") != EXPECTED_ALL_CELL_IDS[worker]
+                or message.get("torch_version") != "2.7.1+cu126"
+            ):
                 raise CanaryError("worker preflight identity/runtime differs")
             ready.add(worker)
         start_event.set()
-        while len(completed) < EXPECTED_WORKER_COUNT:
+        while len(completed) < EXPECTED_PROCESS_COUNT:
             try:
                 message = result_queue.get(timeout=60)
             except queue.Empty:
@@ -2748,7 +2930,7 @@ def _run_eight_cells(
                 print(
                     json.dumps(
                         {
-                            "worker": message["worker_index"],
+                            "worker": message["process_index"],
                             "event": message["event"],
                             "payload": message["payload"],
                         },
@@ -2759,16 +2941,16 @@ def _run_eight_cells(
                 continue
             if kind == "failed":
                 raise CanaryError(
-                    f"canary worker {message.get('worker_index')} failed: "
+                    f"canary process {message.get('process_index')} failed: "
                     f"{message.get('exception_type')}: {message.get('message')}\n"
                     f"{message.get('traceback', '')}"
                 )
             if kind != "completed":
                 raise CanaryError("canary worker emitted an unknown message")
-            worker = int(message["worker_index"])
+            worker = int(message["process_index"])
             if worker in completed:
                 raise CanaryError("canary worker completed twice")
-            completed[worker] = dict(message["result"])
+            completed[worker] = dict(message)
         for process in processes:
             process.join(timeout=30)
         if any(process.exitcode != 0 for process in processes):
@@ -2784,7 +2966,7 @@ def _run_eight_cells(
                 process.kill()
                 process.join(timeout=5)
         raise
-    return [completed[index] for index in range(EXPECTED_WORKER_COUNT)]
+    return [completed[index] for index in range(EXPECTED_PROCESS_COUNT)]
 
 
 def _assert_expected_identity(name: str, actual: str) -> None:
@@ -2793,6 +2975,93 @@ def _assert_expected_identity(name: str, actual: str) -> None:
         raise CanaryError(f"{name} must contain an exact lowercase SHA-256")
     if actual != expected:
         raise CanaryError(f"{name} differs from prepared v2 campaign")
+
+
+def _assert_fresh_physical_canary_cells(*, campaign_root: Path, prepared: Any) -> None:
+    """Require fresh storage for all 24 physical canary trainings.
+
+    Logical readouts may share one sealed training, but timing and telemetry are
+    valid only when every physical canary cell starts without a reusable final
+    directory or its stable resume directory.
+    """
+
+    try:
+        from experiments.global_campaign_v2 import _expected_cell_directory
+    except (ImportError, AttributeError) as exc:
+        raise CanaryError(
+            "exact v2 production cell paths are unavailable; refusing canary launch"
+        ) from exc
+
+    plans = tuple(_field(prepared, "plans"))
+    cells = tuple(_field(prepared, "cells"))
+    plan_indices = {
+        str(_field(plan, "variant_id")): index for index, plan in enumerate(plans)
+    }
+    cell_indices = {str(_field(cell, "key")): index for index, cell in enumerate(cells)}
+    if len(plan_indices) != len(plans) or len(cell_indices) != len(cells):
+        raise CanaryError("v2 production matrix contains duplicate plan or cell keys")
+
+    expected_tasks = []
+    for cell_id in EXPECTED_ALL_CELL_IDS:
+        variant, suite, dataset, representation = cell_id.split("/")
+        expected_tasks.append((variant, f"{suite}/{dataset}/{representation}"))
+    if (
+        len(expected_tasks) != EXPECTED_PROCESS_COUNT
+        or len(set(expected_tasks)) != EXPECTED_PROCESS_COUNT
+    ):
+        raise CanaryError("internal physical canary cell inventory differs")
+
+    root = Path(campaign_root).resolve()
+    locations: dict[Path, str] = {}
+    conflicts: list[Path] = []
+    for variant, cell_key in expected_tasks:
+        try:
+            model_index = plan_indices[variant]
+            cell_index = cell_indices[cell_key]
+        except KeyError as exc:
+            raise CanaryError(
+                f"physical canary cell is absent from production matrix: "
+                f"{variant}/{cell_key}"
+            ) from exc
+        final_dir, _ = _expected_cell_directory(
+            campaign_root=root,
+            prepared=prepared,
+            model_index=model_index,
+            cell_index=cell_index,
+        )
+        final_dir = Path(final_dir)
+        try:
+            final_dir.relative_to(root)
+        except ValueError as exc:
+            raise CanaryError(
+                "exact production canary cell path escapes campaign root"
+            ) from exc
+        incomplete_dir = final_dir.with_name(f".{final_dir.name}.incomplete")
+        for location in (final_dir, incomplete_dir):
+            if location in locations:
+                raise CanaryError(
+                    "physical canary cells resolve to a duplicate production path"
+                )
+            locations[location] = f"{variant}/{cell_key}"
+            if os.path.lexists(location):
+                conflicts.append(location)
+
+    if len(locations) != 2 * EXPECTED_PROCESS_COUNT:
+        raise CanaryError(
+            "physical canary path coverage differs from the 24-cell design"
+        )
+    if conflicts:
+        rendered = [
+            path.relative_to(root).as_posix()
+            if path.is_relative_to(root)
+            else str(path)
+            for path in conflicts
+        ]
+        raise CanaryError(
+            "canary report is absent but exact physical canary cell storage already "
+            f"exists: {rendered}; use a fresh output root so reused sealed or partial "
+            "cells cannot undercount canary timing/telemetry"
+        )
 
 
 def _copy_exact(source: Path, destination: Path) -> None:
@@ -2985,9 +3254,96 @@ def _cell_report(
     return cell, artifacts
 
 
+def _companion_cell_report(
+    message: Mapping[str, Any],
+    *,
+    process_index: int,
+    campaign_root: Path,
+) -> tuple[dict[str, Any], list[Path]]:
+    from experiments.global_campaign_v2 import validate_global_cell
+
+    result = _field(message, "result")
+    if not isinstance(result, Mapping):
+        raise CanaryError("companion process result is not a mapping")
+    directory = Path(str(result.get("directory", ""))).resolve()
+    try:
+        directory.relative_to(campaign_root.resolve())
+    except ValueError as exc:
+        raise CanaryError(
+            "companion cell was sealed outside the campaign root"
+        ) from exc
+    errors = validate_global_cell(directory)
+    if errors:
+        raise CanaryError(f"sealed utilization companion is invalid: {errors}")
+    try:
+        summary = json.loads((directory / "summary.json").read_text(encoding="utf-8"))
+        identity = json.loads((directory / "identity.json").read_text(encoding="utf-8"))
+        attestation = json.loads(
+            (directory / "training_attestation.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CanaryError("sealed utilization companion is unreadable") from exc
+    expected_id = EXPECTED_ALL_CELL_IDS[process_index]
+    variant, suite, dataset, representation = expected_id.split("/")
+    if (
+        process_index < len(EXPECTED_CELL_IDS)
+        or message.get("cell_id") != expected_id
+        or message.get("quality_worker_index") is not None
+        or message.get("physical_device_index")
+        != EXPECTED_PROCESS_DEVICE_INDICES[process_index]
+        or summary.get("model_variant") != variant
+        or summary.get("suite_id") != suite
+        or summary.get("dataset") != dataset
+        or summary.get("representation") != representation
+        or summary.get("quality_diagnostics") != {"status": "not_requested"}
+    ):
+        raise CanaryError("utilization companion identity differs from assignment")
+    wall_seconds = _finite_number(
+        message.get("production_wall_seconds"), field="companion production wall time"
+    )
+    if wall_seconds <= 0:
+        raise CanaryError("companion production wall time must be positive")
+    partition = summary.get("partition")
+    partition_sha = (
+        partition.get("partition_sha256") if isinstance(partition, Mapping) else None
+    )
+    artifacts = sorted(path for path in directory.rglob("*") if path.is_file())
+    if not artifacts:
+        raise CanaryError("sealed utilization companion has no artifacts")
+    return (
+        {
+            "cell_id": expected_id,
+            "variant_id": variant,
+            "suite_id": suite,
+            "dataset": dataset,
+            "representation": representation,
+            "status": "passed",
+            "process_index": process_index,
+            "physical_device_index": int(message["physical_device_index"]),
+            "input_sha256": _sha(summary.get("input_sha256"), field="companion input"),
+            "partition_sha256": _sha(partition_sha, field="companion partition"),
+            "training_config_sha256": _sha(
+                attestation.get("training_config_sha256"),
+                field="companion training config",
+            ),
+            "checkpoint_sha256": _sha(
+                summary.get("checkpoint_sha256"), field="companion checkpoint"
+            ),
+            "production_identity_sha256": canonical_sha256(identity),
+            "reusable_by_full_campaign": True,
+            "production_wall_seconds": wall_seconds,
+            "artifacts": [
+                _output_record(path, root=campaign_root) for path in artifacts
+            ],
+        },
+        artifacts,
+    )
+
+
 def _gate_records(
     cells: Sequence[Mapping[str, Any]],
     *,
+    companion_cells: Sequence[Mapping[str, Any]],
     source: Mapping[str, Any],
     archive_sha256: str,
     arrows: Mapping[str, Any],
@@ -3011,12 +3367,15 @@ def _gate_records(
             "reviewed_gate_sha256": arrows["human_review"]["reviewed_gate_sha256"],
         },
         "eight_h100_workers": {
-            "worker_count": len(devices),
+            "physical_device_count": len(devices),
+            "lanes_per_device": EXPECTED_LANES_PER_DEVICE,
+            "logical_worker_count": EXPECTED_PROCESS_COUNT,
             "uuids": [row["uuid"] for row in devices],
         },
         "batch_256_contract": {
             "batch_size": EXPECTED_BATCH_SIZE,
-            "cells": len(cells),
+            "quality_cells": len(cells),
+            "companion_cells": len(companion_cells),
         },
         "gpu_utilization": {"devices": list(telemetry)},
         "runtime_projection": dict(runtime_projection),
@@ -3041,7 +3400,10 @@ def _gate_records(
         "production_cell_reuse": {
             "production_identity_sha256": [
                 cell["production_identity_sha256"] for cell in cells
-            ]
+            ],
+            "companion_identity_sha256": [
+                cell["production_identity_sha256"] for cell in companion_cells
+            ],
         },
         "output_integrity": {
             "output_count": len(outputs),
@@ -3057,7 +3419,7 @@ def _gate_records(
 
 
 def _run(config: Mapping[str, Any], *, config_path: Path) -> dict[str, Any]:
-    """Execute preflight and the eight exact production cells.
+    """Execute preflight and the 24 exact physical production cells.
 
     The full-cell materialization/reuse API is intentionally supplied by the
     v2 campaign module.  Import failure is a hard gate: running an independent
@@ -3111,6 +3473,11 @@ def _run(config: Mapping[str, Any], *, config_path: Path) -> dict[str, Any]:
         )
         return report
 
+    _assert_fresh_physical_canary_cells(
+        campaign_root=campaign_root,
+        prepared=prepared,
+    )
+
     archive = _resolve(root, validated["data"]["archive"], field="data.archive")
     archive_sha = file_sha256(archive)
     if archive_sha != validated["data"]["archive_sha256"]:
@@ -3126,22 +3493,33 @@ def _run(config: Mapping[str, Any], *, config_path: Path) -> dict[str, Any]:
         config_sha256=file_sha256(config_path),
     )
     device_tokens, devices = _visible_h100_devices()
-    results = _run_eight_cells(
+    results = _run_multiplexed_cells(
         prepared,
         validated,
         device_tokens=device_tokens,
         devices=devices,
     )
+    quality_results = results[: len(EXPECTED_CELL_IDS)]
+    companion_results = results[len(EXPECTED_CELL_IDS) :]
     cells: list[dict[str, Any]] = []
+    companion_cells: list[dict[str, Any]] = []
     artifact_paths: list[Path] = list(arrow_outputs)
-    for worker_index, result in enumerate(results):
+    for worker_index, message in enumerate(quality_results):
         cell, cell_artifacts = _cell_report(
-            result,
+            _field(message, "result"),
             worker_index=worker_index,
             campaign_root=campaign_root,
         )
         cells.append(cell)
         artifact_paths.extend(cell_artifacts)
+    for offset, message in enumerate(companion_results, start=len(EXPECTED_CELL_IDS)):
+        companion, companion_artifacts = _companion_cell_report(
+            message,
+            process_index=offset,
+            campaign_root=campaign_root,
+        )
+        companion_cells.append(companion)
+        artifact_paths.extend(companion_artifacts)
     for cell in cells:
         if cell["dataset"] != "e2_arrows":
             continue
@@ -3155,11 +3533,11 @@ def _run(config: Mapping[str, Any], *, config_path: Path) -> dict[str, Any]:
     telemetry = [
         dict(
             cell["artifacts"]
-            and cell_result["summary"]["quality_diagnostics"]["training_runtime"][
-                "device"
-            ]
+            and cell_result["result"]["summary"]["quality_diagnostics"][
+                "training_runtime"
+            ]["device"]
         )
-        for cell, cell_result in zip(cells, results)
+        for cell, cell_result in zip(cells, quality_results)
     ]
     gates = validated["gates"]
     for row in telemetry:
@@ -3175,9 +3553,10 @@ def _run(config: Mapping[str, Any], *, config_path: Path) -> dict[str, Any]:
                 f"worker {row['worker_index']} failed the H100 utilization gate"
             )
     maximum_wall_seconds = max(
-        float(cell["production_preseal_wall_seconds"]) for cell in cells
+        [float(cell["production_preseal_wall_seconds"]) for cell in cells]
+        + [float(cell["production_wall_seconds"]) for cell in companion_cells]
     )
-    waves = math.ceil(429 / EXPECTED_WORKER_COUNT)
+    waves = math.ceil(429 / EXPECTED_PROCESS_COUNT)
     safety_factor = float(gates["runtime_projection_safety_factor"])
     projected_hours = waves * maximum_wall_seconds * safety_factor / 3600.0
     maximum_allowed_hours = float(gates["maximum_projected_campaign_hours"])
@@ -3189,9 +3568,11 @@ def _run(config: Mapping[str, Any], *, config_path: Path) -> dict[str, Any]:
     runtime_projection = {
         "status": "passed",
         "physical_cell_count": 429,
-        "worker_count": EXPECTED_WORKER_COUNT,
+        "logical_worker_count": EXPECTED_PROCESS_COUNT,
+        "physical_device_count": EXPECTED_WORKER_COUNT,
+        "lanes_per_device": EXPECTED_LANES_PER_DEVICE,
         "waves": waves,
-        "maximum_canary_preseal_wall_seconds": maximum_wall_seconds,
+        "maximum_observed_cell_wall_seconds": maximum_wall_seconds,
         "safety_factor": safety_factor,
         "projected_campaign_hours": projected_hours,
         "maximum_allowed_hours": maximum_allowed_hours,
@@ -3208,7 +3589,9 @@ def _run(config: Mapping[str, Any], *, config_path: Path) -> dict[str, Any]:
             "path": config_path.resolve().relative_to(root.resolve()).as_posix(),
             "sha256": file_sha256(config_path),
             "batch_size": EXPECTED_BATCH_SIZE,
-            "worker_count": EXPECTED_WORKER_COUNT,
+            "physical_device_count": EXPECTED_WORKER_COUNT,
+            "lanes_per_device": EXPECTED_LANES_PER_DEVICE,
+            "logical_worker_count": EXPECTED_PROCESS_COUNT,
             "campaign_identity": prepared.campaign_identity,
             "campaign_config_sha256": prepared.config_sha,
             "input_inventory_sha256": prepared.input_inventory_sha,
@@ -3223,12 +3606,17 @@ def _run(config: Mapping[str, Any], *, config_path: Path) -> dict[str, Any]:
             "status": "passed",
             "scientific_result": True,
             "batch_size": EXPECTED_BATCH_SIZE,
+            "physical_device_count": EXPECTED_WORKER_COUNT,
+            "lanes_per_device": EXPECTED_LANES_PER_DEVICE,
+            "logical_worker_count": EXPECTED_PROCESS_COUNT,
             "devices": telemetry,
+            "companion_cells": companion_cells,
         },
         "runtime_projection": runtime_projection,
         "cells": cells,
         "gates": _gate_records(
             cells,
+            companion_cells=companion_cells,
             source=source,
             archive_sha256=archive_sha,
             arrows=arrows,
