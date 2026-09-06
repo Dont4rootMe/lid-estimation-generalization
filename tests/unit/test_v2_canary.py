@@ -21,9 +21,11 @@ from experiments.v2_canary import (
     PROTOCOL_ID,
     REQUIRED_GATE_IDS,
     SCHEMA_VERSION,
+    CanaryDiagnostics,
     CanaryError,
     _assert_fresh_physical_canary_cells,
     _diagnostic_subset_seed,
+    _lid_quality,
     _load_or_create_preseal_runtime,
     _load_runtime_sidecar,
     _MeasuredTrain,
@@ -94,9 +96,13 @@ def valid_report(tmp_path: Path) -> dict:
         for index in range(8)
     ]
     cells = []
+    cell_outputs = []
     for worker, cell_id in enumerate(EXPECTED_CELL_IDS):
         variant, suite, dataset, representation = cell_id.split("/")
         is_nf = variant == "scale_conditioned_nf"
+        is_low_dimensional = representation == "coefficients"
+        backend = "exact" if is_low_dimensional or is_nf else "hutchinson"
+        probes = 0 if backend == "exact" else 16
         cells.append(
             {
                 "cell_id": cell_id,
@@ -118,23 +124,131 @@ def valid_report(tmp_path: Path) -> dict:
                 "training_config_sha256": SHA,
                 "checkpoint_sha256": SHA,
                 "production_identity_sha256": SHA,
+                "production_selected_lambda": 1.0,
                 "reusable_by_full_campaign": True,
                 "production_preseal_wall_seconds": 3000.0,
                 "native_loss": {"status": "passed"},
                 "reconstruction": (
                     {"status": "not_applicable"} if is_nf else {"status": "passed"}
                 ),
-                "pointwise_lid": {"status": "passed"},
-                "reference_selector": {"status": "passed"},
+                "pointwise_lid": {
+                    "status": "passed" if is_low_dimensional else "diagnostic_only",
+                    "assessment_scope": (
+                        "blocking_exact_low_dim"
+                        if is_low_dimensional
+                        else "diagnostic_high_dim_benchmark_outcome"
+                    ),
+                    "accuracy_gate_applied": is_low_dimensional,
+                    "maximum_pointwise_mae": 5.0 if is_low_dimensional else None,
+                    "selection_role": "canary_oracle_envelope_not_production_selector",
+                    "query_sha256": SHA,
+                    "target_sha256": SHA,
+                    "query_count": 128 if is_low_dimensional else 32,
+                    "divergence_backend": backend,
+                    "trace_probes": probes,
+                    "selected_index": 1,
+                    "selected_lambda": 1.0,
+                    "selected_pointwise_mae": 1.0 if is_low_dimensional else 23.4259,
+                    "boundary_selected": False,
+                    "finite_fraction": 1.0,
+                    "arrays": evidence_record,
+                },
+                "reference_selector": {
+                    "status": "passed",
+                    "protocol_id": "held_out_reference_mean_kneedle_v2",
+                    "selection_uses_lid_targets": False,
+                    "query_sha256": SHA,
+                    "query_count": 128 if is_low_dimensional else 32,
+                    "divergence_backend": backend,
+                    "trace_probes": probes,
+                    "scales_sha256": SHA,
+                    "mean_curve_sha256": SHA,
+                    "selected_index": 1,
+                    "selected_lambda": 1.0,
+                    "diagnostics": {"status": "selected"},
+                    "arrays": evidence_record,
+                },
                 "nf_scale_bin_nll": (
                     {"status": "passed"} if is_nf else {"status": "not_applicable"}
                 ),
                 "trace_agreement": (
-                    {"status": "not_applicable"} if is_nf else {"status": "passed"}
+                    {"status": "not_applicable"}
+                    if is_nf
+                    else {
+                        "status": (
+                            "passed" if is_low_dimensional else "diagnostic_only"
+                        ),
+                        "assessment_scope": (
+                            "blocking_exact_low_dim"
+                            if is_low_dimensional
+                            else "diagnostic_high_dim_no_exact_claim"
+                        ),
+                        "accuracy_gate_applied": is_low_dimensional,
+                        "maximum_trace64_mae": 2.0 if is_low_dimensional else None,
+                        "maximum_trace64_to_trace16_ratio": (
+                            1.25 if is_low_dimensional else None
+                        ),
+                        "query_sha256": SHA,
+                        "target_sha256": SHA,
+                        "query_count": 4,
+                        "lambda": 1.0,
+                        "trace_seed": 123,
+                        "probe_prefix_shared": True,
+                        "single_batch_prefix_verified": True,
+                        "comparison": (
+                            "exact_vs_hutchinson16_64"
+                            if is_low_dimensional
+                            else "common_probe_hutchinson16_vs64_no_exact_claim"
+                        ),
+                        "hutchinson16_mae_vs_exact": (
+                            1.5 if is_low_dimensional else None
+                        ),
+                        "hutchinson64_mae_vs_exact": (
+                            1.0 if is_low_dimensional else None
+                        ),
+                        "trace64_to_trace16_mae_ratio": (
+                            2.0 / 3.0 if is_low_dimensional else None
+                        ),
+                        "hutchinson64_mae_vs_hutchinson16": 2.53735,
+                        "arrays": evidence_record,
+                    }
                 ),
                 "artifacts": [evidence_record],
             }
         )
+        cell = cells[-1]
+        quality = {
+            "production_selected_lambda": cell["production_selected_lambda"],
+            "native_loss": cell["native_loss"],
+            "reconstruction": cell["reconstruction"],
+            "pointwise_lid": cell["pointwise_lid"],
+            "reference_selector": cell["reference_selector"],
+            "nf_scale_bin_nll": cell["nf_scale_bin_nll"],
+            "trace_agreement": cell["trace_agreement"],
+        }
+        summary = {
+            "model_variant": variant,
+            "suite_id": suite,
+            "dataset": dataset,
+            "representation": representation,
+            "selected_scale": cell["production_selected_lambda"],
+            "quality_diagnostics": quality,
+        }
+        cell_dir = tmp_path / f"cell-{worker}"
+        cell_dir.mkdir()
+        for filename, payload in (
+            ("summary.json", summary),
+            ("quality_diagnostics.json", quality),
+        ):
+            path = cell_dir / filename
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            record = {
+                "path": path.relative_to(tmp_path).as_posix(),
+                "sha256": file_sha256(path),
+                "size_bytes": path.stat().st_size,
+            }
+            cell["artifacts"].append(record)
+            cell_outputs.append(record)
     companion_cells = []
     companion_outputs = []
     for process_index, cell_id in enumerate(
@@ -263,6 +377,7 @@ def valid_report(tmp_path: Path) -> dict:
                 "sha256": contact_digest,
                 "size_bytes": contact_sheet.stat().st_size,
             },
+            *cell_outputs,
             *companion_outputs,
         ],
         "failures": [],
@@ -470,6 +585,84 @@ def test_pass_attestation_checks_exact_devices_cells_and_output_hashes(
     with pytest.raises(CanaryError, match="exceeds the 96-hour gate"):
         validate_canary_report(over_budget, report_dir=tmp_path)
 
+    high_dimensional_quality_claim = copy.deepcopy(report)
+    image_cell = next(
+        cell
+        for cell in high_dimensional_quality_claim["cells"]
+        if cell["dataset"] == "e2_arrows"
+    )
+    image_cell["pointwise_lid"]["status"] = "passed"
+    with pytest.raises(CanaryError, match="pointwise LID assessment"):
+        validate_canary_report(high_dimensional_quality_claim, report_dir=tmp_path)
+
+    missing_trace_diagnostic = copy.deepcopy(report)
+    image_field_cell = next(
+        cell
+        for cell in missing_trace_diagnostic["cells"]
+        if cell["dataset"] == "e2_arrows"
+        and cell["variant_id"] != "scale_conditioned_nf"
+    )
+    image_field_cell["trace_agreement"]["status"] = "passed"
+    with pytest.raises(CanaryError, match="trace assessment"):
+        validate_canary_report(missing_trace_diagnostic, report_dir=tmp_path)
+
+    false_low_dimensional_mae = copy.deepcopy(report)
+    coefficient_cell = next(
+        cell
+        for cell in false_low_dimensional_mae["cells"]
+        if cell["representation"] == "coefficients"
+    )
+    coefficient_cell["pointwise_lid"]["selected_pointwise_mae"] = 1.0e99
+    with pytest.raises(CanaryError, match="pointwise gate did not pass"):
+        validate_canary_report(false_low_dimensional_mae, report_dir=tmp_path)
+
+    false_low_dimensional_trace = copy.deepcopy(report)
+    coefficient_field_cell = next(
+        cell
+        for cell in false_low_dimensional_trace["cells"]
+        if cell["representation"] == "coefficients"
+        and cell["variant_id"] != "scale_conditioned_nf"
+    )
+    coefficient_field_cell["trace_agreement"]["hutchinson64_mae_vs_exact"] = 1.0e99
+    with pytest.raises(CanaryError, match="trace gate did not pass"):
+        validate_canary_report(false_low_dimensional_trace, report_dir=tmp_path)
+
+    nonfinite_high_dimensional_trace = copy.deepcopy(report)
+    image_field_cell = next(
+        cell
+        for cell in nonfinite_high_dimensional_trace["cells"]
+        if cell["dataset"] == "e2_arrows"
+        and cell["variant_id"] != "scale_conditioned_nf"
+    )
+    image_field_cell["trace_agreement"]["hutchinson64_mae_vs_hutchinson16"] = float(
+        "nan"
+    )
+    with pytest.raises(CanaryError, match="must be finite"):
+        validate_canary_report(nonfinite_high_dimensional_trace, report_dir=tmp_path)
+
+    unbound_trace_scale = copy.deepcopy(report)
+    image_field_cell = next(
+        cell
+        for cell in unbound_trace_scale["cells"]
+        if cell["dataset"] == "e2_arrows"
+        and cell["variant_id"] != "scale_conditioned_nf"
+    )
+    image_field_cell["trace_agreement"]["lambda"] = 2.0
+    with pytest.raises(CanaryError, match="trace assessment contract"):
+        validate_canary_report(unbound_trace_scale, report_dir=tmp_path)
+
+    coordinated_report_scale_tamper = copy.deepcopy(report)
+    image_field_cell = next(
+        cell
+        for cell in coordinated_report_scale_tamper["cells"]
+        if cell["dataset"] == "e2_arrows"
+        and cell["variant_id"] != "scale_conditioned_nf"
+    )
+    image_field_cell["production_selected_lambda"] = 2.0
+    image_field_cell["trace_agreement"]["lambda"] = 2.0
+    with pytest.raises(CanaryError, match="retained production summary"):
+        validate_canary_report(coordinated_report_scale_tamper, report_dir=tmp_path)
+
     (tmp_path / "evidence.json").write_text('{"ok":false}\n', encoding="utf-8")
     with pytest.raises(CanaryError, match="size-mismatched|hash mismatch"):
         validate_canary_report(report, report_dir=tmp_path)
@@ -661,7 +854,7 @@ def test_image_trace_gate_uses_common_16_64_probes_without_exact(
         probes = int(kwargs["trace_probes"])
         seed = int(kwargs["trace_seed"])
         calls.append((backend, probes, seed))
-        return np.full(4, 1.0 + probes / 6400.0)
+        return np.full(4, 1.0 if probes == 16 else 3.53735)
 
     monkeypatch.setattr(models.training, "predict_lid", predict_lid)
     result = _trace_quality(
@@ -674,14 +867,203 @@ def test_image_trace_gate_uses_common_16_64_probes_without_exact(
         scale=1.0,
         trace_seed=123,
         batch_size=4,
+        maximum_mae=None,
+        maximum_ratio=None,
+        output_dir=tmp_path,
+    )
+    assert result["status"] == "diagnostic_only"
+    assert result["accuracy_gate_applied"] is False
+    assert result["comparison"] == "common_probe_hutchinson16_vs64_no_exact_claim"
+    assert calls == [("hutchinson", 16, 123), ("hutchinson", 64, 123)]
+    assert result["hutchinson16_mae_vs_exact"] is None
+    assert result["hutchinson64_mae_vs_hutchinson16"] == pytest.approx(2.53735)
+
+
+def test_low_dimensional_exact_trace_accuracy_remains_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import models.training
+
+    def predict_lid(*args: object, **kwargs: object) -> np.ndarray:
+        del args
+        return (
+            np.zeros(4) if kwargs["divergence_backend"] == "exact" else np.full(4, 3.0)
+        )
+
+    monkeypatch.setattr(models.training, "predict_lid", predict_lid)
+    result = _trace_quality(
+        object(),
+        np.zeros((4, 8), dtype=np.float32),
+        np.zeros(4),
+        variant_id="vp_diffusion",
+        family="vp_diffusion",
+        representation="coefficients",
+        scale=1.0,
+        trace_seed=123,
+        batch_size=4,
         maximum_mae=2.0,
         maximum_ratio=1.25,
         output_dir=tmp_path,
     )
+    assert result["status"] == "failed"
+    assert result["accuracy_gate_applied"] is True
+    assert result["hutchinson64_mae_vs_exact"] == 3.0
+
+
+def test_trace_prefix_assessment_rejects_multiple_inference_batches(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(CanaryError, match="one shared inference minibatch"):
+        _trace_quality(
+            object(),
+            np.zeros((5, 8), dtype=np.float32),
+            np.zeros(5),
+            variant_id="vp_diffusion",
+            family="vp_diffusion",
+            representation="dataset",
+            scale=1.0,
+            trace_seed=123,
+            batch_size=4,
+            maximum_mae=None,
+            maximum_ratio=None,
+            output_dir=tmp_path,
+        )
+
+
+@pytest.mark.parametrize(
+    ("representation", "maximum_mae", "expected_status"),
+    [
+        ("coefficients", 5.0, "failed"),
+        ("dataset", None, "diagnostic_only"),
+    ],
+)
+def test_pointwise_accuracy_only_blocks_exact_low_dimensional_canary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    representation: str,
+    maximum_mae: float | None,
+    expected_status: str,
+) -> None:
+    import models.training
+
+    def predict_lid(
+        _trained: object,
+        query: np.ndarray,
+        scale: float,
+        **_kwargs: object,
+    ) -> np.ndarray:
+        error = {1.0: 30.0, 2.0: 23.4259, 3.0: 40.0}[scale]
+        return np.full(len(query), error, dtype=np.float64)
+
+    monkeypatch.setattr(models.training, "predict_lid", predict_lid)
+    result, selected_scale = _lid_quality(
+        object(),
+        np.zeros((4, 8), dtype=np.float32),
+        np.zeros(4, dtype=np.float64),
+        variant_id="vp_diffusion",
+        family="vp_diffusion",
+        representation=representation,
+        scales=(1.0, 2.0, 3.0),
+        trace_seed=123,
+        batch_size=4,
+        maximum_mae=maximum_mae,
+        output_dir=tmp_path,
+    )
+    assert selected_scale == 2.0
+    assert result["selected_pointwise_mae"] == pytest.approx(23.4259)
+    assert result["status"] == expected_status
+    assert result["accuracy_gate_applied"] is (maximum_mae is not None)
+    assert result["boundary_selected"] is False
+
+
+def test_high_dimensional_pointwise_boundary_is_preserved_without_censoring(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import models.training
+
+    monkeypatch.setattr(
+        models.training,
+        "predict_lid",
+        lambda _trained, query, scale, **_kwargs: np.full(
+            len(query), scale, dtype=np.float64
+        ),
+    )
+    result, _ = _lid_quality(
+        object(),
+        np.zeros((4, 8), dtype=np.float32),
+        np.zeros(4, dtype=np.float64),
+        variant_id="vp_diffusion",
+        family="vp_diffusion",
+        representation="dataset",
+        scales=(1.0, 2.0, 3.0),
+        trace_seed=123,
+        batch_size=4,
+        maximum_mae=None,
+        output_dir=tmp_path,
+    )
+    assert result["status"] == "diagnostic_only"
+    assert result["boundary_selected"] is True
+
+
+def test_trace_assessment_uses_production_selected_lambda(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from experiments import v2_canary
+
+    observed: dict[str, float] = {}
+    monkeypatch.setattr(
+        v2_canary,
+        "_history_quality",
+        lambda trained, gates: {"status": "passed"},
+    )
+    monkeypatch.setattr(
+        v2_canary,
+        "_lid_quality",
+        lambda *args, **kwargs: ({"status": "diagnostic_only"}, 2.0),
+    )
+    monkeypatch.setattr(
+        v2_canary,
+        "_reconstruction_quality",
+        lambda *args, **kwargs: {"status": "passed"},
+    )
+
+    def trace_quality(*args: object, **kwargs: object) -> dict[str, str]:
+        del args
+        observed["scale"] = float(kwargs["scale"])
+        return {"status": "diagnostic_only"}
+
+    monkeypatch.setattr(v2_canary, "_trace_quality", trace_quality)
+    monkeypatch.setattr(
+        v2_canary,
+        "_reference_selector_quality",
+        lambda *args, **kwargs: {"status": "passed"},
+    )
+    config = canary_config()
+    scales = np.asarray(config["evaluation"]["lambda_grid"], dtype=np.float64)
+    production_selected_lambda = 0.5
+    result = CanaryDiagnostics(config)(
+        {
+            "trained": SimpleNamespace(preprocessing_sha256=SHA),
+            "model_variant": "vp_diffusion",
+            "family": "vp_diffusion",
+            "cell": SimpleNamespace(
+                suite_id="e2", dataset="e2_arrows", representation="dataset"
+            ),
+            "eval_batch_size": 4,
+            "partition": SimpleNamespace(
+                selection_features=np.zeros((40, 8), dtype=np.float32),
+                selection_target=np.full(40, 14.0),
+                fit_features=np.zeros((40, 8), dtype=np.float32),
+            ),
+            "candidate_scales": scales,
+            "production_selected_lambda": production_selected_lambda,
+            "cell_identity": {"sha256": SHA},
+        },
+        tmp_path,
+    )
     assert result["status"] == "passed"
-    assert result["comparison"] == "common_probe_hutchinson16_vs64_no_exact_claim"
-    assert calls == [("hutchinson", 16, 123), ("hutchinson", 64, 123)]
-    assert result["hutchinson16_mae_vs_exact"] is None
+    assert result["production_selected_lambda"] == production_selected_lambda
+    assert observed["scale"] == production_selected_lambda
 
 
 def test_ve_reconstruction_uses_x0_denoiser_output_directly(tmp_path: Path) -> None:
@@ -716,7 +1098,7 @@ def test_ve_reconstruction_uses_x0_denoiser_output_directly(tmp_path: Path) -> N
         np.testing.assert_array_equal(arrays["predicted"], np.ones((8, 3)))
 
 
-def test_reference_selector_failure_is_a_gate_not_a_type_error(
+def test_reference_selector_no_knee_is_preserved_without_censoring(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import experiments.global_campaign_v2
@@ -750,8 +1132,48 @@ def test_reference_selector_failure_is_a_gate_not_a_type_error(
         batch_size=4,
         output_dir=tmp_path,
     )
-    assert result["status"] == "failed"
+    assert result["status"] == "diagnostic_only"
     assert result["failure_reason"] == "no_knee"
+
+
+def test_reference_selector_structural_error_remains_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import experiments.global_campaign_v2
+    import models.training
+
+    monkeypatch.setattr(
+        experiments.global_campaign_v2,
+        "unknown_reference_lambdas",
+        lambda: np.asarray([0.5, 1.0, 2.0]),
+    )
+
+    def fail_selector(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise experiments.global_campaign_v2.GlobalCampaignError("invalid curve")
+
+    monkeypatch.setattr(
+        experiments.global_campaign_v2,
+        "select_unknown_reference_kneedle",
+        fail_selector,
+    )
+    monkeypatch.setattr(
+        models.training,
+        "predict_lid",
+        lambda *args, **kwargs: np.ones(4, dtype=np.float64),
+    )
+    result = _reference_selector_quality(
+        object(),
+        np.zeros((4, 3), dtype=np.float32),
+        variant_id="ve_diffusion",
+        family="gaussian_diffusion",
+        representation="coefficients",
+        trace_seed=9,
+        batch_size=4,
+        output_dir=tmp_path,
+    )
+    assert result["status"] == "failed"
+    assert result["error_type"] == "GlobalCampaignError"
 
 
 def test_reference_selector_uses_exact_common_lambda_endpoints(
@@ -793,6 +1215,6 @@ def test_reference_selector_uses_exact_common_lambda_endpoints(
         output_dir=tmp_path,
     )
 
-    assert result["status"] == "failed"
+    assert result["status"] == "diagnostic_only"
     assert observed[0] == experiments.global_campaign_v2.COMMON_LAMBDA_MIN
     assert observed[-1] == experiments.global_campaign_v2.COMMON_LAMBDA_MAX

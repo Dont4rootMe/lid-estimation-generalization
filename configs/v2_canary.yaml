@@ -1,5 +1,5 @@
-schema_version: 2
-protocol_id: vp-ve-fm-nf-quality-canary-v2
+schema_version: 3
+protocol_id: vp-ve-fm-nf-integrity-canary-v3
 output_root: ${oc.env:LID_V2_CANARY_OUTPUT_ROOT}
 
 data:
@@ -99,10 +99,10 @@ gates:
   maximum_best_to_initial_loss_ratio: 0.95
   maximum_tail_improvement_fraction: 0.10
   maximum_reconstruction_ratio: 0.90
-  maximum_pointwise_lid_mae: 5.0
+  maximum_low_dim_pointwise_lid_mae: 5.0
   minimum_nf_improved_bin_fraction: 0.50
-  maximum_trace64_mae: 2.0
-  maximum_trace64_to_trace16_ratio: 1.25
+  maximum_low_dim_trace64_mae: 2.0
+  maximum_low_dim_trace64_to_trace16_ratio: 1.25
 
 hydra:
   job:

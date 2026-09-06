@@ -16,6 +16,7 @@ from models.neural_fields import (
     ScaleConditionedNeuralField,
     exact_divergence,
     hutchinson_divergence,
+    rademacher_probes_like,
 )
 from models.normalizing_flow import (
     NF_DENSITY_CONTRACT,
@@ -132,6 +133,43 @@ def test_exact_and_hutchinson_divergence_match_diagonal_reference() -> None:
     torch.testing.assert_close(exact, expected)
     torch.testing.assert_close(estimate_a, expected)
     torch.testing.assert_close(estimate_b, estimate_a)
+
+
+def test_seeded_hutchinson_probe_counts_share_per_sample_prefix() -> None:
+    class LinearField(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.register_buffer(
+                "matrix",
+                torch.tensor(
+                    [
+                        [1.0, 2.0, 0.0, 0.0],
+                        [-3.0, 0.5, 1.0, 0.0],
+                        [0.0, 4.0, -2.0, 1.0],
+                        [2.0, 0.0, -1.0, 3.0],
+                    ]
+                ),
+            )
+
+        def forward(self, inputs, condition):  # type: ignore[no-untyped-def]
+            del condition
+            return inputs @ self.matrix.T
+
+    inputs = torch.randn(5, 4)
+    probes16 = rademacher_probes_like(inputs, num_probes=16, seed=23)
+    probes64 = rademacher_probes_like(inputs, num_probes=64, seed=23)
+
+    torch.testing.assert_close(probes16, probes64[:, :16], rtol=0.0, atol=0.0)
+    seeded = hutchinson_divergence(LinearField(), inputs, 0.5, num_probes=16, seed=23)
+    explicit_prefix = hutchinson_divergence(
+        LinearField(),
+        inputs,
+        0.5,
+        num_probes=16,
+        seed=None,
+        probes=probes64[:, :16],
+    )
+    torch.testing.assert_close(seeded, explicit_prefix, rtol=0.0, atol=0.0)
 
 
 @pytest.mark.parametrize(

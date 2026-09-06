@@ -255,7 +255,7 @@ def rademacher_probes_like(
     seed: int | None = None,
     generator: torch.Generator | None = None,
 ) -> Tensor:
-    """Create deterministic Rademacher probes with shape ``(B, P, ...)``."""
+    """Create deterministic nested-prefix probes with shape ``(B, P, ...)``."""
 
     if isinstance(num_probes, bool) or num_probes <= 0:
         raise ValueError("num_probes must be a positive integer")
@@ -271,12 +271,12 @@ def rademacher_probes_like(
     integer_probes = torch.randint(
         0,
         2,
-        (inputs.shape[0], num_probes, *inputs.shape[1:]),
+        (num_probes, inputs.shape[0], *inputs.shape[1:]),
         generator=generator,
         device=inputs.device,
         dtype=torch.int64,
     )
-    return integer_probes.to(dtype=inputs.dtype).mul_(2.0).sub_(1.0)
+    return integer_probes.movedim(0, 1).to(dtype=inputs.dtype).mul_(2.0).sub_(1.0)
 
 
 def hutchinson_divergence(

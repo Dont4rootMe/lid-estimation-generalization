@@ -656,7 +656,13 @@ Extra `upstream` здесь нужен для matplotlib при построен
    переиспользуются full DAG; после PASS canary остаётся 405 обучений.
 7. Для FM cells с ambient dimension не выше 64 сохраняются exact trace и
    empirical oracle. Для D=256/784/1024/3072 применяется отдельно названная
-   Hutchinson-16/64 prefix-stability проверка без заявления exact/oracle.
+   Hutchinson-16/64 prefix-stability диагностика без заявления exact/oracle.
+   В canary v3 точность LID и H16/H64 stability на Arrows D=3072 не являются
+   условием допуска модели в сравнительный benchmark: они обязательно
+   сохраняются как `diagnostic_only`. Жёсткая accuracy-проверка остаётся на
+   D=30 coefficients с exact divergence. Не-конечные значения и нарушения
+   integrity по-прежнему останавливают запуск; high-D boundary/no-knee
+   сохраняются как отрицательные исходы selector, а не фильтруют модель.
 8. Evaluation выполняется и checkpoint удаляется внутри каждой cell до seal.
    В full DAG stable incomplete directory и progress checkpoint обеспечивают
    deterministic resume. Canary намеренно строже: пока PASS report отсутствует,
@@ -688,6 +694,29 @@ reference grid дал вычисленную через VP roundtrip верхн�
 дубликаты и нарушение порядка по-прежнему отклоняются. Диапазон, число точек,
 selector и training budget не изменены. Root task 9113 не переиспользуется:
 исправленный commit требует новой identity и нового task-specific root.
+
+Четвёртый attempt, task 9131, подтвердил исправление границ и запустил все 24
+production canary worker с измеренной загрузкой H100 около 99%. Он остановился
+после полного обучения VP/Arrows: native loss уменьшился с 3838.417 до 513.001,
+а reconstruction ratio составил 0.37419, но основной LID readout дал
+train-selection MAE 21.9776 и canary-subset MAE 23.4259 при внутреннем
+`lambda=5.656854`. Это реальный отрицательный результат заявленного VP readout,
+а не причина удалять модель из сравнительной матрицы. Универсальный hard gate
+`MAE <= 5`, применённый к D=3072, создавал survivor bias: canary начинал
+отбирать только хорошо работающие методы вместо проверки исполнимости и
+целостности benchmark.
+
+Отдельный аудит task 9131 обнаружил и реализационный дефект trace evidence.
+Два независимых вызова с одинаковым seed и формами `(B,16,D)` и `(B,64,D)`
+не образовывали общий per-sample prefix при batch больше одного, хотя report
+утверждал обратное. Canary v3 генерирует Rademacher bank в probe-major порядке,
+так что H16 побитово совпадает с первыми 16 probes H64 для каждого объекта.
+Trace assessment теперь выполняется на масштабе, выбранном production
+supervised protocol, а не на отдельном oracle optimum диагностической сетки.
+Canary явно требует одну inference minibatch для H16/H64 prefix и report
+проверяет численные thresholds, конечность high-D discrepancy и равенство
+`summary.selected_scale = production_selected_lambda = trace.lambda`.
+Пороги не повышались post hoc; task 9131 и его root не переиспользуются.
 
 Это описание реализации, а не утверждение об успешном полном результате.
 Научные числа становятся допустимыми только после PASS canary, завершения всех

@@ -95,7 +95,7 @@ FM_EXACT_TRACE_MAX_AMBIENT_DIM = 64
 FM_HIGH_DIM_QUERY_SUBSET_SIZE = 8
 FM_HIGH_DIM_TRACE_PROBES = (16, 64)
 FM_HIGH_DIM_PROTOCOL = "hutchinson_prefix_stability_high_dimensional_v1"
-CANARY_PROTOCOL_ID = "vp-ve-fm-nf-quality-canary-v2"
+CANARY_PROTOCOL_ID = "vp-ve-fm-nf-integrity-canary-v3"
 CANARY_CELL_KEYS = (
     "e2/e2_uniform_pca/coefficients",
     "e2/e2_arrows/dataset",
@@ -555,7 +555,7 @@ def _validate_evaluation_config(evaluation: Mapping[str, Any]) -> None:
 
 def _validate_canary_gate_config(gate: Mapping[str, Any]) -> None:
     expected = {
-        "schema_version": 2,
+        "schema_version": 3,
         "required": True,
         "protocol_id": CANARY_PROTOCOL_ID,
         "report_filename": "canary_report.json",
@@ -1000,6 +1000,7 @@ def _validate_high_dim_fm_diagnostics(
         "trace_seed",
         "trace_probe_counts",
         "shared_rademacher_prefix",
+        "single_batch_prefix_verified",
         "scale_policy",
         "exact_trace_status",
         "oracle_status",
@@ -1028,11 +1029,13 @@ def _validate_high_dim_fm_diagnostics(
         or metadata.get("trace_seed") != 0
         or tuple(metadata.get("trace_probe_counts") or ()) != FM_HIGH_DIM_TRACE_PROBES
         or metadata.get("shared_rademacher_prefix") is not True
+        or metadata.get("single_batch_prefix_verified") is not True
         or metadata.get("scale_policy") != "actual_selection_grid"
         or metadata.get("exact_trace_status") != "skipped_cost_prohibitive"
         or metadata.get("oracle_status") != "skipped_cost_prohibitive"
         or not isinstance(diagnostics, Mapping)
         or metadata.get("batch_size") != diagnostics.get("batch_size")
+        or subset_indices.size > int(metadata.get("batch_size") or 0)
     ):
         errors.append("high-dimensional FM diagnostic binding differs")
     expected_scales = np.asarray(scales, dtype=np.float64)
@@ -1088,6 +1091,7 @@ def _validate_high_dim_fm_diagnostics(
         "scale_count": int(diagnostic_scales.size),
         "trace_probe_counts": list(FM_HIGH_DIM_TRACE_PROBES),
         "shared_rademacher_prefix": True,
+        "single_batch_prefix_verified": True,
         "exact_trace_status": "skipped_cost_prohibitive",
         "oracle_status": "skipped_cost_prohibitive",
         "aggregate_metrics": aggregate_metrics,
@@ -1161,6 +1165,11 @@ def run_known_affine_diagnostics(
     lambda_grid = np.ascontiguousarray(np.asarray(scales, dtype=np.float64))
     _assert_lambdas_supported(model, lambda_grid)
     diagnostics = _mapping(model.get("diagnostics"), field="v2 FM diagnostics")
+    diagnostic_batch_size = int(diagnostics["batch_size"])
+    if len(query) > diagnostic_batch_size:
+        raise GlobalCampaignError(
+            "high-dimensional FM prefix audit requires one inference minibatch"
+        )
     from models.training import predict_lid
 
     predictions: dict[int, npt.NDArray[np.float64]] = {}
@@ -1177,7 +1186,7 @@ def run_known_affine_diagnostics(
                         divergence_backend="hutchinson",
                         trace_probes=probes,
                         trace_seed=0,
-                        batch_size=int(diagnostics["batch_size"]),
+                        batch_size=diagnostic_batch_size,
                     )
                     for scale in lambda_grid
                 ]
@@ -1208,10 +1217,11 @@ def run_known_affine_diagnostics(
         "trace_seed": 0,
         "trace_probe_counts": list(FM_HIGH_DIM_TRACE_PROBES),
         "shared_rademacher_prefix": True,
+        "single_batch_prefix_verified": True,
         "scale_policy": "actual_selection_grid",
         "exact_trace_status": "skipped_cost_prohibitive",
         "oracle_status": "skipped_cost_prohibitive",
-        "batch_size": int(diagnostics["batch_size"]),
+        "batch_size": diagnostic_batch_size,
     }
     summary = {
         "schema_version": 1,
@@ -1222,6 +1232,7 @@ def run_known_affine_diagnostics(
         "scale_count": int(lambda_grid.size),
         "trace_probe_counts": list(FM_HIGH_DIM_TRACE_PROBES),
         "shared_rademacher_prefix": True,
+        "single_batch_prefix_verified": True,
         "exact_trace_status": "skipped_cost_prohibitive",
         "oracle_status": "skipped_cost_prohibitive",
         "aggregate_metrics": _hutchinson_stability_metrics(
@@ -2116,6 +2127,7 @@ def _run_cell(
             "candidate_scales": np.asarray(
                 sorted(set(all_candidate_lambdas)), dtype=np.float64
             ),
+            "production_selected_lambda": float(selected_lambda),
             "trace_seed": seed,
             "eval_batch_size": batch_size,
             "cell_identity": identity,

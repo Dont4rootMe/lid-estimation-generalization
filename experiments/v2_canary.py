@@ -1,9 +1,12 @@
-"""Fail-closed pre-full quality and multiplexed eight-H100 utilization canary.
+"""Fail-closed pre-full integrity and multiplexed eight-H100 utilization canary.
 
 The canary trains 24 *production* cells as three independent lanes on each of
 eight H100s.  Eight cells (four model variants on D30 ``e2_uniform_pca``
-coefficients and D3072 ``e2_arrows`` images) carry the scientific quality
-diagnostics.  Sixteen additional production cells provide representative
+coefficients and D3072 ``e2_arrows`` images) carry scientific diagnostics.
+Exact low-dimensional diagnostics are blocking regression gates.  High-
+dimensional benchmark accuracy and stochastic trace stability are preserved as
+non-blocking outcomes so the canary cannot censor a weak model before the
+comparison is run.  Sixteen additional production cells provide representative
 co-load and are sealed for reuse by the same 429-cell campaign.  The resulting
 attestation is consumed by the v2 full campaign; this module never starts the
 remaining campaign itself.  A failed or incomplete gate therefore stops the
@@ -41,14 +44,19 @@ import hydra
 import numpy as np
 from omegaconf import DictConfig, OmegaConf
 
-SCHEMA_VERSION = 2
-PROTOCOL_ID = "vp-ve-fm-nf-quality-canary-v2"
+SCHEMA_VERSION = 3
+PROTOCOL_ID = "vp-ve-fm-nf-integrity-canary-v3"
 REPORT_FILENAME = "canary_report.json"
 EXPECTED_BATCH_SIZE = 256
 EXPECTED_WORKER_COUNT = 8
 EXPECTED_LANES_PER_DEVICE = 3
 EXPECTED_PROCESS_COUNT = EXPECTED_WORKER_COUNT * EXPECTED_LANES_PER_DEVICE
 EXPECTED_TRAINING_STEPS = 32000
+EXPECTED_SELECTION_QUERY_COUNTS = {"coefficients": 128, "dataset": 32}
+EXPECTED_TRACE_QUERY_COUNT = 4
+MAXIMUM_LOW_DIM_POINTWISE_LID_MAE = 5.0
+MAXIMUM_LOW_DIM_TRACE64_MAE = 2.0
+MAXIMUM_LOW_DIM_TRACE64_TO_TRACE16_RATIO = 1.25
 EXPECTED_CELL_KEYS = (
     "e2/e2_uniform_pca/coefficients",
     "e2/e2_arrows/dataset",
@@ -107,10 +115,10 @@ REQUIRED_GATE_IDS = frozenset(
         "runtime_projection",
         "native_loss_quality",
         "reconstruction_quality",
-        "pointwise_lid_quality",
+        "pointwise_lid_assessment",
         "reference_selector_quality",
         "nf_scale_bin_nll",
-        "trace_agreement",
+        "trace_estimator_assessment",
         "production_cell_reuse",
         "output_integrity",
     }
@@ -397,7 +405,15 @@ def validate_canary_config(config: Mapping[str, Any] | DictConfig) -> dict[str, 
     )
     for name, count in selection_counts.items():
         _positive_int(count, field=f"evaluation.selection_query_count.{name}")
-    _positive_int(evaluation["trace_query_count"], field="evaluation.trace_query_count")
+    if selection_counts != EXPECTED_SELECTION_QUERY_COUNTS:
+        raise CanaryError("selection diagnostic sample sizes differ from the protocol")
+    if (
+        _positive_int(
+            evaluation["trace_query_count"], field="evaluation.trace_query_count"
+        )
+        != EXPECTED_TRACE_QUERY_COUNT
+    ):
+        raise CanaryError("trace diagnostic sample size differs from the protocol")
     if tuple(evaluation["trace_probes"]) != (16, 64):
         raise CanaryError("trace gate must compare exact against 16 and 64 probes")
     if isinstance(evaluation["trace_seed"], bool) or not isinstance(
@@ -437,10 +453,10 @@ def validate_canary_config(config: Mapping[str, Any] | DictConfig) -> dict[str, 
             "maximum_best_to_initial_loss_ratio",
             "maximum_tail_improvement_fraction",
             "maximum_reconstruction_ratio",
-            "maximum_pointwise_lid_mae",
+            "maximum_low_dim_pointwise_lid_mae",
             "minimum_nf_improved_bin_fraction",
-            "maximum_trace64_mae",
-            "maximum_trace64_to_trace16_ratio",
+            "maximum_low_dim_trace64_mae",
+            "maximum_low_dim_trace64_to_trace16_ratio",
         },
         field="gates",
     )
@@ -453,10 +469,10 @@ def validate_canary_config(config: Mapping[str, Any] | DictConfig) -> dict[str, 
         "maximum_best_to_initial_loss_ratio": (0, 1),
         "maximum_tail_improvement_fraction": (0, 1),
         "maximum_reconstruction_ratio": (0, 1),
-        "maximum_pointwise_lid_mae": (0, math.inf),
+        "maximum_low_dim_pointwise_lid_mae": (0, math.inf),
         "minimum_nf_improved_bin_fraction": (0, 1),
-        "maximum_trace64_mae": (0, math.inf),
-        "maximum_trace64_to_trace16_ratio": (0, math.inf),
+        "maximum_low_dim_trace64_mae": (0, math.inf),
+        "maximum_low_dim_trace64_to_trace16_ratio": (0, math.inf),
     }
     for name, (lower, upper) in bounded.items():
         value = _finite_number(gates[name], field=f"gates.{name}")
@@ -464,6 +480,13 @@ def validate_canary_config(config: Mapping[str, Any] | DictConfig) -> dict[str, 
             raise CanaryError(f"gates.{name} lies outside ({lower}, {upper}]")
     if gates["runtime_projection_safety_factor"] != 2.0:
         raise CanaryError("runtime projection safety factor must be exactly 2.0")
+    if (
+        gates["maximum_low_dim_pointwise_lid_mae"] != MAXIMUM_LOW_DIM_POINTWISE_LID_MAE
+        or gates["maximum_low_dim_trace64_mae"] != MAXIMUM_LOW_DIM_TRACE64_MAE
+        or gates["maximum_low_dim_trace64_to_trace16_ratio"]
+        != MAXIMUM_LOW_DIM_TRACE64_TO_TRACE16_RATIO
+    ):
+        raise CanaryError("exact low-dimensional quality thresholds differ")
     return dict(raw)
 
 
@@ -679,11 +702,19 @@ def _lid_quality(
     scales: Sequence[float],
     trace_seed: int,
     batch_size: int,
-    maximum_mae: float,
+    maximum_mae: float | None,
     output_dir: Path,
 ) -> tuple[dict[str, Any], float]:
     from models.training import predict_lid, predict_nf_lid_ols5
 
+    if representation == "coefficients":
+        if maximum_mae is None:
+            raise CanaryError("low-dimensional pointwise gate requires a threshold")
+    elif representation == "dataset":
+        if maximum_mae is not None:
+            raise CanaryError("high-dimensional pointwise assessment cannot hard-gate")
+    else:
+        raise CanaryError("pointwise assessment representation is unsupported")
     readout = (
         "fixed_likelihood_ols5" if variant_id == "scale_conditioned_nf" else "full"
     )
@@ -739,10 +770,25 @@ def _lid_quality(
         predictions=curve,
         candidate_mae=maes,
     )
-    passed = selected_mae <= maximum_mae and not boundary
+    accuracy_gate_applied = representation == "coefficients"
+    status = (
+        "passed"
+        if accuracy_gate_applied and not boundary and selected_mae <= maximum_mae
+        else "failed"
+        if accuracy_gate_applied
+        else "diagnostic_only"
+    )
     return (
         {
-            "status": "passed" if passed else "failed",
+            "status": status,
+            "assessment_scope": (
+                "blocking_exact_low_dim"
+                if accuracy_gate_applied
+                else "diagnostic_high_dim_benchmark_outcome"
+            ),
+            "accuracy_gate_applied": accuracy_gate_applied,
+            "maximum_pointwise_mae": maximum_mae,
+            "selection_role": "canary_oracle_envelope_not_production_selector",
             "query_sha256": array_sha256(query),
             "target_sha256": array_sha256(target),
             "query_count": len(query),
@@ -774,14 +820,18 @@ def _trace_quality(
     scale: float,
     trace_seed: int,
     batch_size: int,
-    maximum_mae: float,
-    maximum_ratio: float,
+    maximum_mae: float | None,
+    maximum_ratio: float | None,
     output_dir: Path,
 ) -> dict[str, Any]:
     from models.training import predict_lid
 
     if variant_id == "scale_conditioned_nf":
         return {"status": "not_applicable"}
+    if len(query) > batch_size:
+        raise CanaryError(
+            "trace prefix assessment requires one shared inference minibatch"
+        )
     methods = [
         ("hutchinson16", "hutchinson", 16),
         ("hutchinson64", "hutchinson", 64),
@@ -815,6 +865,8 @@ def _trace_quality(
         np.mean(np.abs(predictions["hutchinson64"] - predictions["hutchinson16"]))
     )
     if representation == "coefficients":
+        if maximum_mae is None or maximum_ratio is None:
+            raise CanaryError("low-dimensional trace gate requires exact thresholds")
         mae16 = float(
             np.mean(np.abs(predictions["hutchinson16"] - predictions["exact"]))
         )
@@ -825,10 +877,12 @@ def _trace_quality(
         passed = mae64 <= maximum_mae and ratio <= maximum_ratio
         comparison = "exact_vs_hutchinson16_64"
     else:
+        if maximum_mae is not None or maximum_ratio is not None:
+            raise CanaryError("high-dimensional trace assessment cannot hard-gate")
         mae16 = None
         mae64 = None
         ratio = None
-        passed = h16_h64_mae <= maximum_mae
+        passed = True
         comparison = "common_probe_hutchinson16_vs64_no_exact_claim"
     arrays_path = output_dir / "trace_agreement.npz"
     np.savez_compressed(
@@ -838,13 +892,28 @@ def _trace_quality(
         **predictions,
     )
     return {
-        "status": "passed" if passed else "failed",
+        "status": (
+            "passed"
+            if representation == "coefficients" and passed
+            else "failed"
+            if representation == "coefficients"
+            else "diagnostic_only"
+        ),
+        "assessment_scope": (
+            "blocking_exact_low_dim"
+            if representation == "coefficients"
+            else "diagnostic_high_dim_no_exact_claim"
+        ),
+        "accuracy_gate_applied": representation == "coefficients",
+        "maximum_trace64_mae": maximum_mae,
+        "maximum_trace64_to_trace16_ratio": maximum_ratio,
         "query_sha256": array_sha256(query),
         "target_sha256": array_sha256(target),
         "query_count": len(query),
         "lambda": scale,
         "trace_seed": trace_seed,
         "probe_prefix_shared": True,
+        "single_batch_prefix_verified": True,
         "comparison": comparison,
         "hutchinson16_mae_vs_exact": mae16,
         "hutchinson64_mae_vs_exact": mae64,
@@ -941,10 +1010,14 @@ def _reference_selector_quality(
         }
     if selected_index is None:
         return {
-            "status": "failed",
+            "status": "diagnostic_only",
+            "assessment_scope": "non_blocking_model_selection_outcome",
             "failure_reason": diagnostics.get("failure_reason", "selection_failed"),
             "selection_uses_lid_targets": False,
             "query_sha256": array_sha256(query),
+            "query_count": len(query),
+            "divergence_backend": backend,
+            "trace_probes": probes,
             "scales_sha256": array_sha256(scales),
             "mean_curve_sha256": array_sha256(mean_curve),
             "diagnostics": _json_safe(diagnostics),
@@ -1198,6 +1271,10 @@ class CanaryDiagnostics:
         candidate_scales = np.asarray(
             _field(context, "candidate_scales"), dtype=np.float64
         )
+        production_selected_lambda = _finite_number(
+            _field(context, "production_selected_lambda"),
+            field="context.production_selected_lambda",
+        )
         if (
             candidate_scales.ndim != 1
             or candidate_scales.size < 3
@@ -1206,6 +1283,10 @@ class CanaryDiagnostics:
             or np.any(np.diff(candidate_scales) <= 0)
         ):
             raise CanaryError("production candidate scales are invalid")
+        if production_selected_lambda <= 0 or production_selected_lambda not in set(
+            candidate_scales.tolist()
+        ):
+            raise CanaryError("production selected lambda is not a candidate scale")
         declared_grid = np.asarray(ev["lambda_grid"], dtype=np.float64)
         if not set(declared_grid.tolist()).issubset(set(candidate_scales.tolist())):
             raise CanaryError(
@@ -1228,6 +1309,7 @@ class CanaryDiagnostics:
             "selection_query_sha256": array_sha256(query),
             "trace_query_sha256": array_sha256(trace_query),
             "candidate_scales_sha256": array_sha256(candidate_scales),
+            "production_selected_lambda": production_selected_lambda,
             "cell_identity_sha256": canonical_sha256(_field(context, "cell_identity")),
             "preprocessing_sha256": _sha(
                 _field(trained, "preprocessing_sha256"),
@@ -1240,7 +1322,7 @@ class CanaryDiagnostics:
         if cached is not None:
             return cached
         native_loss = _history_quality(trained, gates)
-        lid_quality, selected_scale = _lid_quality(
+        lid_quality, _ = _lid_quality(
             trained,
             query,
             query_target,
@@ -1250,7 +1332,11 @@ class CanaryDiagnostics:
             scales=tuple(float(value) for value in candidate_scales),
             trace_seed=subset_seed + 2,
             batch_size=eval_batch_size,
-            maximum_mae=float(gates["maximum_pointwise_lid_mae"]),
+            maximum_mae=(
+                float(gates["maximum_low_dim_pointwise_lid_mae"])
+                if representation == "coefficients"
+                else None
+            ),
             output_dir=output_dir,
         )
         reconstruction = _reconstruction_quality(
@@ -1269,11 +1355,19 @@ class CanaryDiagnostics:
             variant_id=variant_id,
             family=family,
             representation=representation,
-            scale=selected_scale,
+            scale=production_selected_lambda,
             trace_seed=subset_seed + 4,
             batch_size=eval_batch_size,
-            maximum_mae=float(gates["maximum_trace64_mae"]),
-            maximum_ratio=float(gates["maximum_trace64_to_trace16_ratio"]),
+            maximum_mae=(
+                float(gates["maximum_low_dim_trace64_mae"])
+                if representation == "coefficients"
+                else None
+            ),
+            maximum_ratio=(
+                float(gates["maximum_low_dim_trace64_to_trace16_ratio"])
+                if representation == "coefficients"
+                else None
+            ),
             output_dir=output_dir,
         )
         reference_selector = _reference_selector_quality(
@@ -1316,6 +1410,7 @@ class CanaryDiagnostics:
             "trace_query_sha256": diagnostic_identity["trace_query_sha256"],
             "candidate_scales": candidate_scales.tolist(),
             "candidate_scales_sha256": diagnostic_identity["candidate_scales_sha256"],
+            "production_selected_lambda": production_selected_lambda,
             "cell_identity_sha256": diagnostic_identity["cell_identity_sha256"],
             "preprocessing_sha256": diagnostic_identity["preprocessing_sha256"],
             "native_loss": native_loss,
@@ -1678,6 +1773,355 @@ def load_reviewed_arrows_gate(
     if arrows.get("contact_sheet") != reviewed["contact_sheet"]:
         raise CanaryError("reviewed contact sheet is not bound to Arrows evidence")
     return dict(reviewed)
+
+
+def _validate_diagnostic_artifact(value: Any, *, field: str) -> Mapping[str, Any]:
+    record = _exact_keys(value, {"path", "sha256", "size_bytes"}, field=field)
+    relative = Path(str(record["path"]))
+    if relative.is_absolute() or ".." in relative.parts or relative.parent != Path("."):
+        raise CanaryError(f"{field} path must be a local relative filename")
+    _sha(record["sha256"], field=f"{field}.sha256")
+    _positive_int(record["size_bytes"], field=f"{field}.size_bytes")
+    return record
+
+
+def _validate_pointwise_assessment(
+    value: Any,
+    *,
+    variant_id: str,
+    representation: str,
+) -> Mapping[str, Any]:
+    record = _exact_keys(
+        value,
+        {
+            "status",
+            "assessment_scope",
+            "accuracy_gate_applied",
+            "maximum_pointwise_mae",
+            "selection_role",
+            "query_sha256",
+            "target_sha256",
+            "query_count",
+            "divergence_backend",
+            "trace_probes",
+            "selected_index",
+            "selected_lambda",
+            "selected_pointwise_mae",
+            "boundary_selected",
+            "finite_fraction",
+            "arrays",
+        },
+        field="pointwise LID assessment",
+    )
+    is_low_dimensional = representation == "coefficients"
+    expected_backend = (
+        "exact"
+        if is_low_dimensional or variant_id == "scale_conditioned_nf"
+        else "hutchinson"
+    )
+    expected_probes = 0 if expected_backend == "exact" else 16
+    expected_status = "passed" if is_low_dimensional else "diagnostic_only"
+    expected_scope = (
+        "blocking_exact_low_dim"
+        if is_low_dimensional
+        else "diagnostic_high_dim_benchmark_outcome"
+    )
+    if (
+        record["status"] != expected_status
+        or record["assessment_scope"] != expected_scope
+        or record["accuracy_gate_applied"] is not is_low_dimensional
+        or record["selection_role"] != "canary_oracle_envelope_not_production_selector"
+        or record["divergence_backend"] != expected_backend
+        or record["trace_probes"] != expected_probes
+        or record["query_count"] != EXPECTED_SELECTION_QUERY_COUNTS[representation]
+        or record["finite_fraction"] != 1.0
+        or not isinstance(record["boundary_selected"], bool)
+    ):
+        raise CanaryError("pointwise LID assessment contract differs")
+    _sha(record["query_sha256"], field="pointwise query SHA")
+    _sha(record["target_sha256"], field="pointwise target SHA")
+    if (
+        isinstance(record["selected_index"], bool)
+        or not isinstance(record["selected_index"], int)
+        or record["selected_index"] < 0
+        or _finite_number(record["selected_lambda"], field="pointwise selected lambda")
+        <= 0
+    ):
+        raise CanaryError("pointwise selected scale is invalid")
+    selected_mae = _finite_number(
+        record["selected_pointwise_mae"], field="pointwise selected MAE"
+    )
+    if selected_mae < 0:
+        raise CanaryError("pointwise selected MAE must be non-negative")
+    if is_low_dimensional:
+        maximum_mae = _finite_number(
+            record["maximum_pointwise_mae"], field="pointwise maximum MAE"
+        )
+        if (
+            maximum_mae != MAXIMUM_LOW_DIM_POINTWISE_LID_MAE
+            or selected_mae > maximum_mae
+            or record["boundary_selected"] is not False
+        ):
+            raise CanaryError("exact low-dimensional pointwise gate did not pass")
+    elif record["maximum_pointwise_mae"] is not None:
+        raise CanaryError("high-dimensional pointwise assessment has a hard threshold")
+    return _validate_diagnostic_artifact(record["arrays"], field="pointwise arrays")
+
+
+def _validate_trace_assessment(
+    value: Any,
+    *,
+    representation: str,
+    production_selected_lambda: float,
+) -> Mapping[str, Any]:
+    record = _exact_keys(
+        value,
+        {
+            "status",
+            "assessment_scope",
+            "accuracy_gate_applied",
+            "maximum_trace64_mae",
+            "maximum_trace64_to_trace16_ratio",
+            "query_sha256",
+            "target_sha256",
+            "query_count",
+            "lambda",
+            "trace_seed",
+            "probe_prefix_shared",
+            "single_batch_prefix_verified",
+            "comparison",
+            "hutchinson16_mae_vs_exact",
+            "hutchinson64_mae_vs_exact",
+            "trace64_to_trace16_mae_ratio",
+            "hutchinson64_mae_vs_hutchinson16",
+            "arrays",
+        },
+        field="trace assessment",
+    )
+    is_low_dimensional = representation == "coefficients"
+    expected_status = "passed" if is_low_dimensional else "diagnostic_only"
+    expected_scope = (
+        "blocking_exact_low_dim"
+        if is_low_dimensional
+        else "diagnostic_high_dim_no_exact_claim"
+    )
+    expected_comparison = (
+        "exact_vs_hutchinson16_64"
+        if is_low_dimensional
+        else "common_probe_hutchinson16_vs64_no_exact_claim"
+    )
+    if (
+        record["status"] != expected_status
+        or record["assessment_scope"] != expected_scope
+        or record["accuracy_gate_applied"] is not is_low_dimensional
+        or record["query_count"] != EXPECTED_TRACE_QUERY_COUNT
+        or record["probe_prefix_shared"] is not True
+        or record["single_batch_prefix_verified"] is not True
+        or record["comparison"] != expected_comparison
+        or _finite_number(record["lambda"], field="trace lambda")
+        != production_selected_lambda
+        or isinstance(record["trace_seed"], bool)
+        or not isinstance(record["trace_seed"], int)
+        or record["trace_seed"] < 0
+    ):
+        raise CanaryError("trace assessment contract differs")
+    _sha(record["query_sha256"], field="trace query SHA")
+    _sha(record["target_sha256"], field="trace target SHA")
+    disagreement = _finite_number(
+        record["hutchinson64_mae_vs_hutchinson16"],
+        field="H64 versus H16 MAE",
+    )
+    if disagreement < 0:
+        raise CanaryError("H64 versus H16 MAE must be non-negative")
+    if is_low_dimensional:
+        mae16 = _finite_number(
+            record["hutchinson16_mae_vs_exact"], field="H16 exact MAE"
+        )
+        mae64 = _finite_number(
+            record["hutchinson64_mae_vs_exact"], field="H64 exact MAE"
+        )
+        ratio = _finite_number(
+            record["trace64_to_trace16_mae_ratio"], field="H64/H16 ratio"
+        )
+        maximum_mae = _finite_number(
+            record["maximum_trace64_mae"], field="maximum H64 MAE"
+        )
+        maximum_ratio = _finite_number(
+            record["maximum_trace64_to_trace16_ratio"],
+            field="maximum H64/H16 ratio",
+        )
+        if (
+            min(mae16, mae64, ratio) < 0
+            or maximum_mae != MAXIMUM_LOW_DIM_TRACE64_MAE
+            or maximum_ratio != MAXIMUM_LOW_DIM_TRACE64_TO_TRACE16_RATIO
+            or mae64 > maximum_mae
+            or ratio > maximum_ratio
+        ):
+            raise CanaryError("exact low-dimensional trace gate did not pass")
+    elif any(
+        record[name] is not None
+        for name in (
+            "maximum_trace64_mae",
+            "maximum_trace64_to_trace16_ratio",
+            "hutchinson16_mae_vs_exact",
+            "hutchinson64_mae_vs_exact",
+            "trace64_to_trace16_mae_ratio",
+        )
+    ):
+        raise CanaryError("high-dimensional trace assessment makes an exact claim")
+    return _validate_diagnostic_artifact(record["arrays"], field="trace arrays")
+
+
+def _validate_reference_selector_assessment(
+    value: Any,
+    *,
+    variant_id: str,
+    representation: str,
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise CanaryError("reference-selector assessment must be a mapping")
+    common = {
+        "status",
+        "selection_uses_lid_targets",
+        "query_sha256",
+        "query_count",
+        "divergence_backend",
+        "trace_probes",
+        "scales_sha256",
+        "mean_curve_sha256",
+        "diagnostics",
+        "arrays",
+    }
+    if value.get("status") == "passed":
+        expected = common | {"protocol_id", "selected_index", "selected_lambda"}
+    elif value.get("status") == "diagnostic_only":
+        expected = common | {"assessment_scope", "failure_reason"}
+    else:
+        raise CanaryError("reference-selector assessment did not execute cleanly")
+    record = _exact_keys(value, expected, field="reference-selector assessment")
+    expected_backend = (
+        "exact"
+        if representation == "coefficients" or variant_id == "scale_conditioned_nf"
+        else "hutchinson"
+    )
+    expected_probes = 0 if expected_backend == "exact" else 16
+    if (
+        record["selection_uses_lid_targets"] is not False
+        or record["query_count"] != EXPECTED_SELECTION_QUERY_COUNTS[representation]
+        or record["divergence_backend"] != expected_backend
+        or record["trace_probes"] != expected_probes
+        or not isinstance(record["diagnostics"], Mapping)
+    ):
+        raise CanaryError("reference-selector assessment contract differs")
+    for name in ("query_sha256", "scales_sha256", "mean_curve_sha256"):
+        _sha(record[name], field=f"reference selector {name}")
+    if record["status"] == "passed":
+        if (
+            record["protocol_id"] != "held_out_reference_mean_kneedle_v2"
+            or isinstance(record["selected_index"], bool)
+            or not isinstance(record["selected_index"], int)
+            or record["selected_index"] <= 0
+            or _finite_number(
+                record["selected_lambda"], field="reference selected lambda"
+            )
+            <= 0
+            or record["diagnostics"].get("status") != "selected"
+        ):
+            raise CanaryError("reference-selector selected result is invalid")
+    elif (
+        record["assessment_scope"] != "non_blocking_model_selection_outcome"
+        or not isinstance(record["failure_reason"], str)
+        or not record["failure_reason"]
+        or record["diagnostics"].get("status") != "selection_failed"
+    ):
+        raise CanaryError("reference-selector diagnostic outcome is invalid")
+    return _validate_diagnostic_artifact(
+        record["arrays"], field="reference-selector arrays"
+    )
+
+
+def _load_retained_cell_json(
+    artifacts: Any,
+    *,
+    filename: str,
+    report_root: Path,
+) -> Mapping[str, Any]:
+    if not isinstance(artifacts, list):
+        raise CanaryError("cell artifacts must be a list")
+    matches = [
+        item
+        for item in artifacts
+        if isinstance(item, Mapping)
+        and Path(str(item.get("path", ""))).name == filename
+    ]
+    if len(matches) != 1:
+        raise CanaryError(f"cell must retain exactly one {filename}")
+    record = _exact_keys(
+        matches[0], {"path", "sha256", "size_bytes"}, field=f"cell {filename}"
+    )
+    relative = Path(str(record["path"]))
+    if relative.is_absolute() or ".." in relative.parts:
+        raise CanaryError(f"cell {filename} path is unsafe")
+    path = (report_root / relative).resolve()
+    try:
+        path.relative_to(report_root.resolve())
+    except ValueError as exc:
+        raise CanaryError(f"cell {filename} escapes report root") from exc
+    if (
+        not path.is_file()
+        or path.stat().st_size != record["size_bytes"]
+        or file_sha256(path) != record["sha256"]
+    ):
+        raise CanaryError(f"retained cell {filename} changed")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CanaryError(f"retained cell {filename} is unreadable") from exc
+    if not isinstance(value, Mapping):
+        raise CanaryError(f"retained cell {filename} must contain a mapping")
+    return value
+
+
+def _validate_cell_report_artifact_binding(
+    cell: Mapping[str, Any], *, report_root: Path
+) -> None:
+    summary = _load_retained_cell_json(
+        cell["artifacts"], filename="summary.json", report_root=report_root
+    )
+    quality = _load_retained_cell_json(
+        cell["artifacts"],
+        filename="quality_diagnostics.json",
+        report_root=report_root,
+    )
+    embedded_quality = summary.get("quality_diagnostics")
+    if not isinstance(embedded_quality, Mapping) or embedded_quality != quality:
+        raise CanaryError("retained summary and quality diagnostics differ")
+    production_selected_lambda = cell["production_selected_lambda"]
+    if (
+        summary.get("model_variant") != cell["variant_id"]
+        or summary.get("suite_id") != cell["suite_id"]
+        or summary.get("dataset") != cell["dataset"]
+        or summary.get("representation") != cell["representation"]
+        or summary.get("selected_scale") != production_selected_lambda
+        or quality.get("production_selected_lambda") != production_selected_lambda
+    ):
+        raise CanaryError("canary report is not bound to retained production summary")
+    for field in (
+        "native_loss",
+        "reconstruction",
+        "pointwise_lid",
+        "reference_selector",
+        "nf_scale_bin_nll",
+        "trace_agreement",
+    ):
+        if quality.get(field) != cell[field]:
+            raise CanaryError(f"canary report {field} differs from retained evidence")
+    trace = quality["trace_agreement"]
+    if cell["variant_id"] != "scale_conditioned_nf" and (
+        not isinstance(trace, Mapping)
+        or trace.get("lambda") != production_selected_lambda
+    ):
+        raise CanaryError("retained trace is not bound to production selected scale")
 
 
 def validate_canary_report(
@@ -2130,6 +2574,7 @@ def validate_canary_report(
                 "training_config_sha256",
                 "checkpoint_sha256",
                 "production_identity_sha256",
+                "production_selected_lambda",
                 "reusable_by_full_campaign",
                 "production_preseal_wall_seconds",
                 "native_loss",
@@ -2165,6 +2610,12 @@ def validate_canary_report(
             "production_identity_sha256",
         ):
             _sha(cell[name], field=f"cell.{name}")
+        production_selected_lambda = _finite_number(
+            cell["production_selected_lambda"],
+            field="cell.production_selected_lambda",
+        )
+        if production_selected_lambda <= 0:
+            raise CanaryError("cell production selected lambda must be positive")
         if cell["reusable_by_full_campaign"] is not True:
             raise CanaryError("canary cell is not reusable by the full campaign")
         if (
@@ -2175,18 +2626,35 @@ def validate_canary_report(
             <= 0
         ):
             raise CanaryError("cell production pre-seal wall time is invalid")
-        for gate_name in (
-            "native_loss",
-            "pointwise_lid",
-            "reference_selector",
-            "trace_agreement",
+        native_loss = cell["native_loss"]
+        if (
+            not isinstance(native_loss, Mapping)
+            or native_loss.get("status") != "passed"
         ):
-            subgate = cell[gate_name]
-            if not isinstance(subgate, Mapping) or subgate.get("status") not in {
-                "passed",
-                "not_applicable",
-            }:
-                raise CanaryError(f"cell {cell['cell_id']} has invalid {gate_name}")
+            raise CanaryError(f"cell {cell['cell_id']} has invalid native loss gate")
+        pointwise_artifact = _validate_pointwise_assessment(
+            cell["pointwise_lid"],
+            variant_id=cell["variant_id"],
+            representation=cell["representation"],
+        )
+        reference_artifact = _validate_reference_selector_assessment(
+            cell["reference_selector"],
+            variant_id=cell["variant_id"],
+            representation=cell["representation"],
+        )
+        trace = cell["trace_agreement"]
+        if cell["variant_id"] == "scale_conditioned_nf":
+            if trace != {"status": "not_applicable"}:
+                raise CanaryError(
+                    "NF trace assessment must be explicitly not applicable"
+                )
+            trace_artifact = None
+        else:
+            trace_artifact = _validate_trace_assessment(
+                trace,
+                representation=cell["representation"],
+                production_selected_lambda=production_selected_lambda,
+            )
         if cell["variant_id"] in {
             "vp_diffusion",
             "ve_diffusion",
@@ -2212,6 +2680,26 @@ def validate_canary_report(
         artifacts = cell["artifacts"]
         if not isinstance(artifacts, list) or not artifacts:
             raise CanaryError("cell must retain hashed reusable artifacts")
+        artifact_fingerprints = {
+            (
+                Path(str(item.get("path", ""))).name,
+                item.get("sha256"),
+                item.get("size_bytes"),
+            )
+            for item in artifacts
+            if isinstance(item, Mapping)
+        }
+        for embedded in (pointwise_artifact, reference_artifact, trace_artifact):
+            if embedded is None:
+                continue
+            fingerprint = (
+                Path(str(embedded["path"])).name,
+                embedded["sha256"],
+                embedded["size_bytes"],
+            )
+            if fingerprint not in artifact_fingerprints:
+                raise CanaryError("cell diagnostic artifact is not retained by report")
+        _validate_cell_report_artifact_binding(cell, report_root=root)
     if tuple(observed_ids) != EXPECTED_CELL_IDS:
         raise CanaryError("cell order/coverage differs from approved canary design")
     if len({cell["worker_index"] for cell in cells}) != EXPECTED_WORKER_COUNT:
@@ -3181,6 +3669,27 @@ def _cell_report(
         raise CanaryError(
             "sealed production cell identity differs from worker assignment"
         )
+    production_selected_lambda = _finite_number(
+        quality.get("production_selected_lambda"),
+        field="quality production selected lambda",
+    )
+    summary_selected_lambda = _finite_number(
+        summary.get("selected_scale"), field="summary selected scale"
+    )
+    if (
+        production_selected_lambda <= 0
+        or summary_selected_lambda != production_selected_lambda
+    ):
+        raise CanaryError(
+            "quality diagnostics are not bound to production selected scale"
+        )
+    trace_quality = quality.get("trace_agreement")
+    if variant != "scale_conditioned_nf" and (
+        not isinstance(trace_quality, Mapping)
+        or _finite_number(trace_quality.get("lambda"), field="trace lambda")
+        != production_selected_lambda
+    ):
+        raise CanaryError("trace assessment is not bound to production selected scale")
     runtime = quality.get("training_runtime")
     if (
         not isinstance(runtime, Mapping)
@@ -3238,6 +3747,7 @@ def _cell_report(
             summary.get("checkpoint_sha256"), field="cell checkpoint"
         ),
         "production_identity_sha256": canonical_sha256(identity),
+        "production_selected_lambda": production_selected_lambda,
         "reusable_by_full_campaign": True,
         "production_preseal_wall_seconds": _finite_number(
             quality.get("production_preseal_wall_seconds"),
@@ -3385,7 +3895,7 @@ def _gate_records(
         "reconstruction_quality": {
             "cell_evidence": [cell["reconstruction"] for cell in cells]
         },
-        "pointwise_lid_quality": {
+        "pointwise_lid_assessment": {
             "cell_evidence": [cell["pointwise_lid"] for cell in cells]
         },
         "reference_selector_quality": {
@@ -3394,7 +3904,7 @@ def _gate_records(
         "nf_scale_bin_nll": {
             "cell_evidence": [cell["nf_scale_bin_nll"] for cell in cells]
         },
-        "trace_agreement": {
+        "trace_estimator_assessment": {
             "cell_evidence": [cell["trace_agreement"] for cell in cells]
         },
         "production_cell_reuse": {
