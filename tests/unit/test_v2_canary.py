@@ -48,6 +48,39 @@ def canary_config() -> dict:
     return yaml.safe_load((ROOT / "configs/v2_canary.yaml").read_text())
 
 
+@pytest.mark.parametrize("tail", [[8.0, 6.0, 4.0], [4.0, 4.0, 4.0]])
+def test_improving_loss_is_reported_without_failing_campaign(tail: list[float]) -> None:
+    from experiments.v2_canary import _history_quality
+
+    trained = {
+        "history": [{"validation_loss": value} for value in [9.0, *tail]],
+        "weights_metadata": {
+            "initial": {"step": 0, "examples_seen": 0, "validation_loss": 10.0}
+        },
+    }
+    result = _history_quality(trained, canary_config()["gates"])
+    assert result["status"] == "passed"
+    assert result["plateau_gate_applied"] is False
+    assert result["convergence_status"] == (
+        "still_improving_at_budget" if tail[0] > tail[-1] else "plateau_detected"
+    )
+
+
+def test_native_loss_gate_still_rejects_nonlearning_and_nonfinite() -> None:
+    from experiments.v2_canary import _history_quality
+
+    trained = {
+        "history": [{"validation_loss": 10.0}] * 4,
+        "weights_metadata": {
+            "initial": {"step": 0, "examples_seen": 0, "validation_loss": 10.0}
+        },
+    }
+    assert _history_quality(trained, canary_config()["gates"])["status"] == "failed"
+    trained["history"][-1] = {"validation_loss": float("nan")}
+    with pytest.raises(CanaryError, match="non-finite"):
+        _history_quality(trained, canary_config()["gates"])
+
+
 def valid_report(tmp_path: Path) -> dict:
     evidence = tmp_path / "evidence.json"
     evidence.write_text('{"ok":true}\n', encoding="utf-8")
@@ -751,14 +784,14 @@ def test_partial_training_resume_cannot_attest_shortened_full_cell_wall_time(
     ) -> dict[str, object]:
         nonlocal called
         called = True
-        callback({"step": 31500})
-        callback({"step": 32000})
+        callback({"step": 127500})
+        callback({"step": 128000})
         return {"config": {"validation_interval_steps": 500}}
 
     monkeypatch.setattr(models.training, "train_model", resumed_train)
     measured = _MeasuredTrain(Sampler(), worker_index=0)
     checkpoint = tmp_path / "checkpoint.pt"
-    with pytest.raises(CanaryError, match="full 0-to-32000-step training"):
+    with pytest.raises(CanaryError, match="full 0-to-128000-step training"):
         measured(
             "vp_diffusion",
             object(),
@@ -791,7 +824,7 @@ def test_checkpoint_only_resume_preseal_includes_original_training_and_downtime(
     checkpoint = tmp_path / "checkpoint.pt"
     checkpoint.write_bytes(b"complete")
     assert not (tmp_path / "training_progress.pt").exists()
-    processed_examples = 32000 * 256
+    processed_examples = 128000 * 256
     training_start_ns = 1_000_000_000
     training_end_ns = 5_000_000_000
     sidecar = {
@@ -799,7 +832,7 @@ def test_checkpoint_only_resume_preseal_includes_original_training_and_downtime(
         "scientific_result": True,
         "batch_size": 256,
         "starting_step": 0,
-        "final_step": 32000,
+        "final_step": 128000,
         "processed_examples": processed_examples,
         "training_start_time_ns": training_start_ns,
         "training_end_time_ns": training_end_ns,

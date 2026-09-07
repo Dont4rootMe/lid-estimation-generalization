@@ -1,5 +1,5 @@
-schema_version: 3
-protocol_id: vp-ve-fm-nf-integrity-canary-v3
+schema_version: 4
+protocol_id: vp-ve-fm-nf-integrity-canary-v4
 output_root: ${oc.env:LID_V2_CANARY_OUTPUT_ROOT}
 
 data:
@@ -38,7 +38,7 @@ execution:
 training:
   campaign_config: configs/global_campaign_v2.yaml
   mode: fixed_steps_v1
-  steps: 32000
+  steps: 128000
   vp_warmup_steps: 500
   other_warmup_steps: 0
   validation_interval_steps: 500

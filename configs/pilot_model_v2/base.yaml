@@ -17,7 +17,7 @@ training:
   device: cuda
   epochs: 100
   training_mode: fixed_steps_v1
-  steps: 32000
+  steps: 128000
   warmup_steps: 0
   validation_interval_steps: 500
   batch_size: 256

@@ -95,7 +95,7 @@ FM_EXACT_TRACE_MAX_AMBIENT_DIM = 64
 FM_HIGH_DIM_QUERY_SUBSET_SIZE = 8
 FM_HIGH_DIM_TRACE_PROBES = (16, 64)
 FM_HIGH_DIM_PROTOCOL = "hutchinson_prefix_stability_high_dimensional_v1"
-CANARY_PROTOCOL_ID = "vp-ve-fm-nf-integrity-canary-v3"
+CANARY_PROTOCOL_ID = "vp-ve-fm-nf-integrity-canary-v4"
 CANARY_CELL_KEYS = (
     "e2/e2_uniform_pca/coefficients",
     "e2/e2_arrows/dataset",
@@ -302,7 +302,7 @@ def _resolved_model(variant_id: str, path_value: str, seed: int) -> dict[str, An
         ) from exc
     if (
         materialized["training_mode"] != "fixed_steps_v1"
-        or materialized["steps"] != 32000
+        or materialized["steps"] != 128000
         or materialized["batch_size"] != 256
         or materialized["warmup_steps"] != (500 if variant_id == "vp_diffusion" else 0)
         or materialized["gradient_clip_norm"]
@@ -555,7 +555,7 @@ def _validate_evaluation_config(evaluation: Mapping[str, Any]) -> None:
 
 def _validate_canary_gate_config(gate: Mapping[str, Any]) -> None:
     expected = {
-        "schema_version": 3,
+        "schema_version": 4,
         "required": True,
         "protocol_id": CANARY_PROTOCOL_ID,
         "report_filename": "canary_report.json",
@@ -1667,9 +1667,9 @@ def _training_attestation(
     )
     history = _training_history_attestation(trained)
     weights = history["weights"]
-    total_examples = 32000 * 256
+    total_examples = 128000 * 256
     if (
-        weights["final"]["step"] != 32000
+        weights["final"]["step"] != 128000
         or weights["final"]["examples_seen"] != total_examples
     ):
         raise GlobalCampaignError("v2 final weights do not exhaust the fixed budget")
@@ -2508,8 +2508,8 @@ def validate_global_cell(
                     or not isinstance(final, Mapping)
                     or selected.get("kind") != "validation_best"
                     or final.get("kind") != "final"
-                    or final.get("step") != 32000
-                    or final.get("examples_seen") != 32000 * 256
+                    or final.get("step") != 128000
+                    or final.get("examples_seen") != 128000 * 256
                     or selected.get("examples_seen") != selected.get("step", -1) * 256
                 ):
                     errors.append("v2 fixed-step weight metadata differs")

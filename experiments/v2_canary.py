@@ -44,14 +44,14 @@ import hydra
 import numpy as np
 from omegaconf import DictConfig, OmegaConf
 
-SCHEMA_VERSION = 3
-PROTOCOL_ID = "vp-ve-fm-nf-integrity-canary-v3"
+SCHEMA_VERSION = 4
+PROTOCOL_ID = "vp-ve-fm-nf-integrity-canary-v4"
 REPORT_FILENAME = "canary_report.json"
 EXPECTED_BATCH_SIZE = 256
 EXPECTED_WORKER_COUNT = 8
 EXPECTED_LANES_PER_DEVICE = 3
 EXPECTED_PROCESS_COUNT = EXPECTED_WORKER_COUNT * EXPECTED_LANES_PER_DEVICE
-EXPECTED_TRAINING_STEPS = 32000
+EXPECTED_TRAINING_STEPS = 128000
 EXPECTED_SELECTION_QUERY_COUNTS = {"coefficients": 128, "dataset": 32}
 EXPECTED_TRACE_QUERY_COUNT = 4
 MAXIMUM_LOW_DIM_POINTWISE_LID_MAE = 5.0
@@ -345,7 +345,7 @@ def validate_canary_config(config: Mapping[str, Any] | DictConfig) -> dict[str, 
         raise CanaryError("training.campaign_config must name the v2 production config")
     steps = _positive_int(training["steps"], field="training.steps")
     if steps != EXPECTED_TRAINING_STEPS:
-        raise CanaryError("canary must use the exact 32000-step production budget")
+        raise CanaryError("canary must use the exact 128000-step production budget")
     vp_warmup = training["vp_warmup_steps"]
     if (
         isinstance(vp_warmup, bool)
@@ -561,9 +561,8 @@ def _history_quality(trained: Any, gates: Mapping[str, Any]) -> dict[str, Any]:
     tail_size = max(3, math.ceil(len(validation) / 4))
     tail = validation[-tail_size:]
     tail_improvement = max(0.0, float((tail[0] - tail[-1]) / max(abs(tail[0]), 1e-12)))
-    passed = best_ratio <= float(
-        gates["maximum_best_to_initial_loss_ratio"]
-    ) and tail_improvement <= float(gates["maximum_tail_improvement_fraction"])
+    passed = best_ratio <= float(gates["maximum_best_to_initial_loss_ratio"])
+    plateau_threshold = float(gates["maximum_tail_improvement_fraction"])
     return {
         "status": "passed" if passed else "failed",
         "initial_step": 0,
@@ -573,6 +572,13 @@ def _history_quality(trained: Any, gates: Mapping[str, Any]) -> dict[str, Any]:
         "best_to_initial_ratio": best_ratio,
         "tail_count": tail_size,
         "tail_improvement_fraction": tail_improvement,
+        "convergence_status": (
+            "plateau_detected"
+            if tail_improvement <= plateau_threshold
+            else "still_improving_at_budget"
+        ),
+        "plateau_gate_applied": False,
+        "plateau_diagnostic_threshold": plateau_threshold,
         "history_sha256": canonical_sha256(history),
     }
 
@@ -3026,7 +3032,7 @@ class _MeasuredTrain:
             and Path(progress_checkpoint_path).exists()
         ):
             raise CanaryError(
-                "canary ETA requires a fresh full 0-to-32000-step training; "
+                "canary ETA requires a fresh full 0-to-128000-step training; "
                 "partial progress cannot attest full-cell runtime"
             )
         first_step: int | None = None
@@ -3058,7 +3064,7 @@ class _MeasuredTrain:
         starting_step = max(0, first_step - interval)
         if starting_step != 0 or final_step != EXPECTED_TRAINING_STEPS:
             raise CanaryError(
-                "canary ETA requires a measured full 0-to-32000-step training"
+                "canary ETA requires a measured full 0-to-128000-step training"
             )
         processed_examples = (final_step - starting_step) * EXPECTED_BATCH_SIZE
         runtime = self.sampler.summarize(
@@ -3106,7 +3112,7 @@ def _load_runtime_sidecar(
         or device.get("worker_index") != worker_index
     ):
         raise CanaryError(
-            "canary training runtime sidecar is not a full 0-to-32000-step timing"
+            "canary training runtime sidecar is not a full 0-to-128000-step timing"
         )
     start_ns = value.get("training_start_time_ns")
     end_ns = value.get("training_end_time_ns")

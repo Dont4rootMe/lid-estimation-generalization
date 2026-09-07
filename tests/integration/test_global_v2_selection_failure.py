@@ -85,13 +85,13 @@ def _train(
 def _load(path: Path, *, device: str):
     del device
     config = json.loads(path.read_text(encoding="utf-8"))
-    total = 32000 * 256
+    total = 128000 * 256
     return SimpleNamespace(
         config=config,
         checkpoint_sha256=sha256_path(path),
         history=(
             {
-                "step": 32000,
+                "step": 128000,
                 "examples_seen": total,
                 "train_loss": 0.5,
                 "validation_loss": 0.4,
@@ -108,13 +108,13 @@ def _load(path: Path, *, device: str):
             },
             "selected": {
                 "kind": "validation_best",
-                "step": 32000,
+                "step": 128000,
                 "examples_seen": total,
                 "state_sha256": "1" * 64,
             },
             "final": {
                 "kind": "final",
-                "step": 32000,
+                "step": 128000,
                 "examples_seen": total,
                 "state_sha256": "2" * 64,
             },

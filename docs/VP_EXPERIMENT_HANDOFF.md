@@ -627,14 +627,21 @@ Extra `upstream` здесь нужен для matplotlib при построен
 
 ## 9. Статус production-реализации v2
 
-На 6 сентября 2026 кодом зафиксирован следующий отдельный контур:
+На 7 сентября 2026 кодом зафиксирован следующий отдельный контур:
 
 1. Матрица содержит 11 физических вариантов и 39 cells на вариант:
    35 canonical и 4 generated E3/E4, всего 429 независимых обучений.
 2. Все vector-field family используют bottleneck
    `[1024, 512, 256, 256, 128, 128]`; ширина conditional RealNVP выбирается
    детерминированно по ambient dimension с допуском 10% по parameter count.
-3. Бюджет равен 32000 optimizer steps при batch 256 без early stopping.
+3. По запросу автора после task 9138 бюджет увеличен с 32000 до 128000
+   optimizer steps при batch 256 без early stopping (32768000 предъявлений).
+   Оценивается checkpoint с минимальным native loss на held-out train-selection.
+   Canary v4 сохраняет `convergence_status`, tail improvement и threshold;
+   отсутствие плато само по себе больше не блокирует результат. Бюджет конечен:
+   `still_improving_at_budget` нельзя называть доказанной сходимостью. Это новый
+   протокол и новая campaign identity, старые 32000-step pilot/canary timings
+   не используются как evidence нового обучения.
    VP использует AdamW, `lr=1e-4`, `weight_decay=0.01`, 500-step warmup и
    cosine decay; остальные семейства сохраняют свой объявленный native loss и
    используют `lr=2e-4`, `weight_decay=1e-6`.
@@ -649,7 +656,7 @@ Extra `upstream` здесь нужен для matplotlib при построен
 6. Один 8-H100 cell-DAG запускает 24 независимых logical worker: по три
    самостоятельных обучения с научным batch 256 на каждой физической H100.
    Это multiplexing разных cells, а не увеличение batch отдельной модели и не
-   изменение бюджета 8192000 предъявлений. Перед оставшимися cells обязательны
+   изменение batch отдельной модели. Перед оставшимися cells обязательны
    data gate и 24 полноразмерные production canary cells: восемь quality cells
    (VP, VE, один posterior FM и NF на D=30 и Arrows D=3072) плюс 16 настоящих
    companion cells на D=30/256/784/1024. Все 24 входят в 429 и напрямую
@@ -657,7 +664,7 @@ Extra `upstream` здесь нужен для matplotlib при построен
 7. Для FM cells с ambient dimension не выше 64 сохраняются exact trace и
    empirical oracle. Для D=256/784/1024/3072 применяется отдельно названная
    Hutchinson-16/64 prefix-stability диагностика без заявления exact/oracle.
-   В canary v3 точность LID и H16/H64 stability на Arrows D=3072 не являются
+   В canary v4 точность LID и H16/H64 stability на Arrows D=3072 не являются
    условием допуска модели в сравнительный benchmark: они обязательно
    сохраняются как `diagnostic_only`. Жёсткая accuracy-проверка остаётся на
    D=30 coefficients с exact divergence. Не-конечные значения и нарушения

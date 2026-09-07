@@ -94,6 +94,16 @@ Hutchinson на small-D fixture является обязательным тес
 
 ## Compute budget
 
+The production v2 continuation approved on 2026-09-07 uses 128,000 optimizer
+steps per cell at batch size 256 (32,768,000 presented examples), increased
+from the unsuccessful 32,000-step canary attempts. The minimum native-loss
+checkpoint on the disjoint train-selection subset is evaluated. The v4 canary
+reports loss-tail improvement and whether a plateau was observed, but continued
+improvement at the budget is not a rejection criterion. The finite budget does
+not establish convergence; any `still_improving_at_budget` outcome remains
+explicit. No test metric chooses the training budget or checkpoint. The new
+source/config/campaign identities prevent mixing the two budgets.
+
 The benchmark paper reports roughly 4–22 GPU-hours for FLIPD/LIDL on many
 single datasets, up to several days for diffusion NB, and 10 days on 8 GPUs for
 Arrows NB. A complete new four-family, multi-seed matrix is therefore a cluster
