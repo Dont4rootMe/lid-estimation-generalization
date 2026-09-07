@@ -3,9 +3,8 @@
 The canary trains 24 *production* cells as three independent lanes on each of
 eight H100s.  Eight cells (four model variants on D30 ``e2_uniform_pca``
 coefficients and D3072 ``e2_arrows`` images) carry scientific diagnostics.
-Exact low-dimensional diagnostics are blocking regression gates.  High-
-dimensional benchmark accuracy and stochastic trace stability are preserved as
-non-blocking outcomes so the canary cannot censor a weak model before the
+Both low- and high-dimensional accuracy and trace stability are non-blocking
+outcomes so the canary cannot censor a weak model before the
 comparison is run.  Sixteen additional production cells provide representative
 co-load and are sealed for reuse by the same 429-cell campaign.  The resulting
 attestation is consumed by the v2 full campaign; this module never starts the
@@ -44,8 +43,8 @@ import hydra
 import numpy as np
 from omegaconf import DictConfig, OmegaConf
 
-SCHEMA_VERSION = 4
-PROTOCOL_ID = "vp-ve-fm-nf-integrity-canary-v4"
+SCHEMA_VERSION = 5
+PROTOCOL_ID = "vp-ve-fm-nf-integrity-canary-v5"
 REPORT_FILENAME = "canary_report.json"
 EXPECTED_BATCH_SIZE = 256
 EXPECTED_WORKER_COUNT = 8
@@ -557,14 +556,16 @@ def _history_quality(trained: Any, gates: Mapping[str, Any]) -> dict[str, Any]:
     )
     best = float(validation.min())
     final = float(validation[-1])
-    best_ratio = best / initial_loss
+    best_ratio = best / max(abs(initial_loss), 1e-12)
     tail_size = max(3, math.ceil(len(validation) / 4))
     tail = validation[-tail_size:]
     tail_improvement = max(0.0, float((tail[0] - tail[-1]) / max(abs(tail[0]), 1e-12)))
     passed = best_ratio <= float(gates["maximum_best_to_initial_loss_ratio"])
     plateau_threshold = float(gates["maximum_tail_improvement_fraction"])
     return {
-        "status": "passed" if passed else "failed",
+        "status": "diagnostic_only",
+        "quality_gate_applied": False,
+        "historical_threshold_met": passed,
         "initial_step": 0,
         "initial_validation_loss": initial_loss,
         "best_validation_loss": best,
@@ -683,7 +684,9 @@ def _reconstruction_quality(
         predicted=np.asarray(predicted.detach().cpu(), dtype=np.float32),
     )
     return {
-        "status": "passed" if ratio <= maximum_ratio else "failed",
+        "status": "diagnostic_only",
+        "quality_gate_applied": False,
+        "historical_threshold_met": ratio <= maximum_ratio,
         "lambda": float(noise_ratio),
         "reconstruction_mse": reconstruction_mse,
         "identity_mse": identity_mse,
@@ -776,20 +779,14 @@ def _lid_quality(
         predictions=curve,
         candidate_mae=maes,
     )
-    accuracy_gate_applied = representation == "coefficients"
-    status = (
-        "passed"
-        if accuracy_gate_applied and not boundary and selected_mae <= maximum_mae
-        else "failed"
-        if accuracy_gate_applied
-        else "diagnostic_only"
-    )
+    accuracy_gate_applied = False
+    status = "diagnostic_only"
     return (
         {
             "status": status,
             "assessment_scope": (
-                "blocking_exact_low_dim"
-                if accuracy_gate_applied
+                "diagnostic_low_dim_benchmark_outcome"
+                if representation == "coefficients"
                 else "diagnostic_high_dim_benchmark_outcome"
             ),
             "accuracy_gate_applied": accuracy_gate_applied,
@@ -880,7 +877,6 @@ def _trace_quality(
             np.mean(np.abs(predictions["hutchinson64"] - predictions["exact"]))
         )
         ratio = mae64 / max(mae16, 1e-12)
-        passed = mae64 <= maximum_mae and ratio <= maximum_ratio
         comparison = "exact_vs_hutchinson16_64"
     else:
         if maximum_mae is not None or maximum_ratio is not None:
@@ -888,7 +884,6 @@ def _trace_quality(
         mae16 = None
         mae64 = None
         ratio = None
-        passed = True
         comparison = "common_probe_hutchinson16_vs64_no_exact_claim"
     arrays_path = output_dir / "trace_agreement.npz"
     np.savez_compressed(
@@ -898,19 +893,13 @@ def _trace_quality(
         **predictions,
     )
     return {
-        "status": (
-            "passed"
-            if representation == "coefficients" and passed
-            else "failed"
-            if representation == "coefficients"
-            else "diagnostic_only"
-        ),
+        "status": "diagnostic_only",
         "assessment_scope": (
-            "blocking_exact_low_dim"
+            "diagnostic_low_dim_exact_comparison"
             if representation == "coefficients"
             else "diagnostic_high_dim_no_exact_claim"
         ),
-        "accuracy_gate_applied": representation == "coefficients",
+        "accuracy_gate_applied": False,
         "maximum_trace64_mae": maximum_mae,
         "maximum_trace64_to_trace16_ratio": maximum_ratio,
         "query_sha256": array_sha256(query),
@@ -1147,9 +1136,9 @@ def _nf_scale_bin_quality(
         bins=np.asarray(bins, dtype=np.float64),
     )
     return {
-        "status": "passed"
-        if improved_fraction >= minimum_improved_fraction
-        else "failed",
+        "status": "diagnostic_only",
+        "quality_gate_applied": False,
+        "historical_threshold_met": improved_fraction >= minimum_improved_fraction,
         "reference": "train_fit_diagonal_gaussian_with_matching_noise",
         "query_sha256": array_sha256(query),
         "query_count": len(query),
@@ -1826,16 +1815,16 @@ def _validate_pointwise_assessment(
         else "hutchinson"
     )
     expected_probes = 0 if expected_backend == "exact" else 16
-    expected_status = "passed" if is_low_dimensional else "diagnostic_only"
+    expected_status = "diagnostic_only"
     expected_scope = (
-        "blocking_exact_low_dim"
+        "diagnostic_low_dim_benchmark_outcome"
         if is_low_dimensional
         else "diagnostic_high_dim_benchmark_outcome"
     )
     if (
         record["status"] != expected_status
         or record["assessment_scope"] != expected_scope
-        or record["accuracy_gate_applied"] is not is_low_dimensional
+        or record["accuracy_gate_applied"] is not False
         or record["selection_role"] != "canary_oracle_envelope_not_production_selector"
         or record["divergence_backend"] != expected_backend
         or record["trace_probes"] != expected_probes
@@ -1863,12 +1852,8 @@ def _validate_pointwise_assessment(
         maximum_mae = _finite_number(
             record["maximum_pointwise_mae"], field="pointwise maximum MAE"
         )
-        if (
-            maximum_mae != MAXIMUM_LOW_DIM_POINTWISE_LID_MAE
-            or selected_mae > maximum_mae
-            or record["boundary_selected"] is not False
-        ):
-            raise CanaryError("exact low-dimensional pointwise gate did not pass")
+        if maximum_mae != MAXIMUM_LOW_DIM_POINTWISE_LID_MAE:
+            raise CanaryError("pointwise historical diagnostic threshold differs")
     elif record["maximum_pointwise_mae"] is not None:
         raise CanaryError("high-dimensional pointwise assessment has a hard threshold")
     return _validate_diagnostic_artifact(record["arrays"], field="pointwise arrays")
@@ -1905,9 +1890,9 @@ def _validate_trace_assessment(
         field="trace assessment",
     )
     is_low_dimensional = representation == "coefficients"
-    expected_status = "passed" if is_low_dimensional else "diagnostic_only"
+    expected_status = "diagnostic_only"
     expected_scope = (
-        "blocking_exact_low_dim"
+        "diagnostic_low_dim_exact_comparison"
         if is_low_dimensional
         else "diagnostic_high_dim_no_exact_claim"
     )
@@ -1919,7 +1904,7 @@ def _validate_trace_assessment(
     if (
         record["status"] != expected_status
         or record["assessment_scope"] != expected_scope
-        or record["accuracy_gate_applied"] is not is_low_dimensional
+        or record["accuracy_gate_applied"] is not False
         or record["query_count"] != EXPECTED_TRACE_QUERY_COUNT
         or record["probe_prefix_shared"] is not True
         or record["single_batch_prefix_verified"] is not True
@@ -1960,10 +1945,8 @@ def _validate_trace_assessment(
             min(mae16, mae64, ratio) < 0
             or maximum_mae != MAXIMUM_LOW_DIM_TRACE64_MAE
             or maximum_ratio != MAXIMUM_LOW_DIM_TRACE64_TO_TRACE16_RATIO
-            or mae64 > maximum_mae
-            or ratio > maximum_ratio
         ):
-            raise CanaryError("exact low-dimensional trace gate did not pass")
+            raise CanaryError("trace diagnostic values or historical thresholds differ")
     elif any(
         record[name] is not None
         for name in (
@@ -2442,12 +2425,6 @@ def validate_canary_report(
             raise CanaryError("telemetry percentile lies outside [0, 100]")
         if not 0 <= device["peak_memory_mib"] <= device["memory_total_mib"]:
             raise CanaryError("telemetry peak memory exceeds device memory")
-        if (
-            device["mean_gpu_utilization_percent"] < 70.0
-            or device["p50_gpu_utilization_percent"] < 60.0
-            or device["peak_memory_mib"] / device["memory_total_mib"] > 0.95
-        ):
-            raise CanaryError("telemetry does not meet the fixed H100 utilization gate")
     if telemetry_uuids != uuids:
         raise CanaryError("telemetry UUIDs differ from preflight bindings")
 
@@ -2551,12 +2528,10 @@ def validate_canary_report(
     expected_hours = (
         projection["waves"] * maximum_wall * projection["safety_factor"] / 3600.0
     )
-    if (
-        maximum_wall <= 0
-        or not math.isclose(projected_hours, expected_hours, rel_tol=1.0e-12)
-        or projected_hours > projection["maximum_allowed_hours"]
+    if maximum_wall <= 0 or not math.isclose(
+        projected_hours, expected_hours, rel_tol=1.0e-12
     ):
-        raise CanaryError("runtime projection exceeds the 96-hour gate")
+        raise CanaryError("runtime projection is not derived from measured time")
 
     cells = top["cells"]
     if not isinstance(cells, list) or len(cells) != len(EXPECTED_CELL_IDS):
@@ -2635,7 +2610,8 @@ def validate_canary_report(
         native_loss = cell["native_loss"]
         if (
             not isinstance(native_loss, Mapping)
-            or native_loss.get("status") != "passed"
+            or native_loss.get("status") != "diagnostic_only"
+            or native_loss.get("quality_gate_applied") is not False
         ):
             raise CanaryError(f"cell {cell['cell_id']} has invalid native loss gate")
         pointwise_artifact = _validate_pointwise_assessment(
@@ -2668,7 +2644,8 @@ def validate_canary_report(
         }:
             if (
                 not isinstance(cell["reconstruction"], Mapping)
-                or cell["reconstruction"].get("status") != "passed"
+                or cell["reconstruction"].get("status") != "diagnostic_only"
+                or cell["reconstruction"].get("quality_gate_applied") is not False
             ):
                 raise CanaryError(
                     f"cell {cell['cell_id']} lacks reconstruction evidence"
@@ -2678,7 +2655,8 @@ def validate_canary_report(
         if cell["variant_id"] == "scale_conditioned_nf":
             if (
                 not isinstance(cell["nf_scale_bin_nll"], Mapping)
-                or cell["nf_scale_bin_nll"].get("status") != "passed"
+                or cell["nf_scale_bin_nll"].get("status") != "diagnostic_only"
+                or cell["nf_scale_bin_nll"].get("quality_gate_applied") is not False
             ):
                 raise CanaryError(f"cell {cell['cell_id']} lacks NF NLL-bin evidence")
         elif cell["nf_scale_bin_nll"] != {"status": "not_applicable"}:
@@ -4056,18 +4034,6 @@ def _run(config: Mapping[str, Any], *, config_path: Path) -> dict[str, Any]:
         for cell, cell_result in zip(cells, quality_results)
     ]
     gates = validated["gates"]
-    for row in telemetry:
-        if (
-            row["mean_gpu_utilization_percent"]
-            < gates["minimum_mean_gpu_utilization_percent"]
-            or row["p50_gpu_utilization_percent"]
-            < gates["minimum_p50_gpu_utilization_percent"]
-            or row["peak_memory_mib"] / row["memory_total_mib"]
-            > gates["maximum_memory_fraction"]
-        ):
-            raise CanaryError(
-                f"worker {row['worker_index']} failed the H100 utilization gate"
-            )
     maximum_wall_seconds = max(
         [float(cell["production_preseal_wall_seconds"]) for cell in cells]
         + [float(cell["production_wall_seconds"]) for cell in companion_cells]
@@ -4076,11 +4042,6 @@ def _run(config: Mapping[str, Any], *, config_path: Path) -> dict[str, Any]:
     safety_factor = float(gates["runtime_projection_safety_factor"])
     projected_hours = waves * maximum_wall_seconds * safety_factor / 3600.0
     maximum_allowed_hours = float(gates["maximum_projected_campaign_hours"])
-    if projected_hours > maximum_allowed_hours:
-        raise CanaryError(
-            f"conservative full-campaign projection {projected_hours:.3f}h exceeds "
-            f"{maximum_allowed_hours:.3f}h"
-        )
     runtime_projection = {
         "status": "passed",
         "physical_cell_count": 429,

@@ -78,9 +78,9 @@ evaluation:
   nf_ols_log_step: 0.05
 
 canary_gate:
-  schema_version: 4
+  schema_version: 5
   required: true
-  protocol_id: vp-ve-fm-nf-integrity-canary-v4
+  protocol_id: vp-ve-fm-nf-integrity-canary-v5
   report_filename: canary_report.json
   required_physical_device_count: 8
   required_lanes_per_device: 3

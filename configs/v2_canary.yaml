@@ -1,5 +1,5 @@
-schema_version: 4
-protocol_id: vp-ve-fm-nf-integrity-canary-v4
+schema_version: 5
+protocol_id: vp-ve-fm-nf-integrity-canary-v5
 output_root: ${oc.env:LID_V2_CANARY_OUTPUT_ROOT}
 
 data:
@@ -90,6 +90,8 @@ evaluation:
     - [2.0, 16.0]
     - [16.0, 64.0]
 
+# Historical quality/utilization thresholds are diagnostics, never launch vetoes.
+# Source, data, finite-output, coverage and artifact-integrity checks remain strict.
 gates:
   minimum_mean_gpu_utilization_percent: 70.0
   minimum_p50_gpu_utilization_percent: 60.0

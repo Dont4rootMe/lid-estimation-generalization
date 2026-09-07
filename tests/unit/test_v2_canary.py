@@ -59,14 +59,14 @@ def test_improving_loss_is_reported_without_failing_campaign(tail: list[float]) 
         },
     }
     result = _history_quality(trained, canary_config()["gates"])
-    assert result["status"] == "passed"
+    assert result["status"] == "diagnostic_only"
     assert result["plateau_gate_applied"] is False
     assert result["convergence_status"] == (
         "still_improving_at_budget" if tail[0] > tail[-1] else "plateau_detected"
     )
 
 
-def test_native_loss_gate_still_rejects_nonlearning_and_nonfinite() -> None:
+def test_native_loss_records_nonlearning_but_rejects_nonfinite() -> None:
     from experiments.v2_canary import _history_quality
 
     trained = {
@@ -75,13 +75,114 @@ def test_native_loss_gate_still_rejects_nonlearning_and_nonfinite() -> None:
             "initial": {"step": 0, "examples_seen": 0, "validation_loss": 10.0}
         },
     }
-    assert _history_quality(trained, canary_config()["gates"])["status"] == "failed"
+    result = _history_quality(trained, canary_config()["gates"])
+    assert result["status"] == "diagnostic_only"
+    assert result["quality_gate_applied"] is False
+    assert result["historical_threshold_met"] is False
     trained["history"][-1] = {"validation_loss": float("nan")}
     with pytest.raises(CanaryError, match="non-finite"):
         _history_quality(trained, canary_config()["gates"])
 
 
-def valid_report(tmp_path: Path) -> dict:
+@pytest.mark.parametrize("initial_loss", [0.0, -1.0, 1.0])
+def test_native_loss_finite_zero_or_signed_initial_is_diagnostic(
+    initial_loss: float,
+) -> None:
+    from experiments.v2_canary import _history_quality
+
+    result = _history_quality(
+        {
+            "history": [{"validation_loss": 10.0}] * 4,
+            "weights_metadata": {
+                "initial": {
+                    "step": 0,
+                    "examples_seen": 0,
+                    "validation_loss": initial_loss,
+                }
+            },
+        },
+        canary_config()["gates"],
+    )
+    assert result["status"] == "diagnostic_only"
+    assert np.isfinite(result["best_to_initial_ratio"])
+
+
+@pytest.mark.parametrize("nonfinite", [False, True])
+def test_nf_losing_every_bin_is_recorded_but_nonfinite_is_rejected(
+    tmp_path: Path, nonfinite: bool
+) -> None:
+    import torch
+
+    from experiments.v2_canary import _nf_scale_bin_quality
+
+    class PoorNF(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(1))
+
+        def log_prob(self, query, epsilon):
+            return torch.full((len(query),), float("nan") if nonfinite else -1e6)
+
+    query = np.ones((8, 3), dtype=np.float32)
+    trained = {
+        "model": PoorNF(),
+        "normalization_mean": np.zeros(3),
+        "normalization_scale": 1.0,
+    }
+
+    def run():
+        return _nf_scale_bin_quality(
+            trained,
+            query,
+            query,
+            bins=canary_config()["evaluation"]["nf_scale_bins"],
+            seed=7,
+            minimum_improved_fraction=0.5,
+            output_dir=tmp_path,
+        )
+
+    if nonfinite:
+        with pytest.raises(CanaryError, match="non-finite"):
+            run()
+    else:
+        result = run()
+        assert result["status"] == "diagnostic_only"
+        assert result["quality_gate_applied"] is False
+        assert result["historical_threshold_met"] is False
+        assert result["improved_bin_fraction"] == 0.0
+
+
+def test_poor_reconstruction_does_not_stop_campaign(tmp_path: Path) -> None:
+    import torch
+
+    class PoorDenoiser(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(1))
+
+        def forward(self, query, condition):
+            return torch.full_like(query, 100.0)
+
+    result = _reconstruction_quality(
+        {
+            "model": PoorDenoiser(),
+            "normalization_mean": np.zeros(3),
+            "normalization_scale": 1.0,
+            "config": {},
+        },
+        np.ones((8, 3), dtype=np.float32),
+        variant_id="ve_diffusion",
+        noise_ratio=0.5,
+        seed=7,
+        maximum_ratio=0.9,
+        output_dir=tmp_path,
+    )
+    assert result["status"] == "diagnostic_only"
+    assert result["historical_threshold_met"] is False
+    assert result["reconstruction_mse"] == 9801.0
+
+
+def valid_report(tmp_path: Path, *, weak_models: bool = False) -> dict:
     evidence = tmp_path / "evidence.json"
     evidence.write_text('{"ok":true}\n', encoding="utf-8")
     digest = hashlib.sha256(evidence.read_bytes()).hexdigest()
@@ -160,18 +261,23 @@ def valid_report(tmp_path: Path) -> dict:
                 "production_selected_lambda": 1.0,
                 "reusable_by_full_campaign": True,
                 "production_preseal_wall_seconds": 3000.0,
-                "native_loss": {"status": "passed"},
+                "native_loss": {
+                    "status": "diagnostic_only",
+                    "quality_gate_applied": False,
+                },
                 "reconstruction": (
-                    {"status": "not_applicable"} if is_nf else {"status": "passed"}
+                    {"status": "not_applicable"}
+                    if is_nf
+                    else {"status": "diagnostic_only", "quality_gate_applied": False}
                 ),
                 "pointwise_lid": {
-                    "status": "passed" if is_low_dimensional else "diagnostic_only",
+                    "status": "diagnostic_only",
                     "assessment_scope": (
-                        "blocking_exact_low_dim"
+                        "diagnostic_low_dim_benchmark_outcome"
                         if is_low_dimensional
                         else "diagnostic_high_dim_benchmark_outcome"
                     ),
-                    "accuracy_gate_applied": is_low_dimensional,
+                    "accuracy_gate_applied": False,
                     "maximum_pointwise_mae": 5.0 if is_low_dimensional else None,
                     "selection_role": "canary_oracle_envelope_not_production_selector",
                     "query_sha256": SHA,
@@ -202,21 +308,21 @@ def valid_report(tmp_path: Path) -> dict:
                     "arrays": evidence_record,
                 },
                 "nf_scale_bin_nll": (
-                    {"status": "passed"} if is_nf else {"status": "not_applicable"}
+                    {"status": "diagnostic_only", "quality_gate_applied": False}
+                    if is_nf
+                    else {"status": "not_applicable"}
                 ),
                 "trace_agreement": (
                     {"status": "not_applicable"}
                     if is_nf
                     else {
-                        "status": (
-                            "passed" if is_low_dimensional else "diagnostic_only"
-                        ),
+                        "status": ("diagnostic_only"),
                         "assessment_scope": (
-                            "blocking_exact_low_dim"
+                            "diagnostic_low_dim_exact_comparison"
                             if is_low_dimensional
                             else "diagnostic_high_dim_no_exact_claim"
                         ),
-                        "accuracy_gate_applied": is_low_dimensional,
+                        "accuracy_gate_applied": False,
                         "maximum_trace64_mae": 2.0 if is_low_dimensional else None,
                         "maximum_trace64_to_trace16_ratio": (
                             1.25 if is_low_dimensional else None
@@ -250,6 +356,19 @@ def valid_report(tmp_path: Path) -> dict:
             }
         )
         cell = cells[-1]
+        if weak_models:
+            cell["native_loss"]["historical_threshold_met"] = False
+            cell["pointwise_lid"]["selected_pointwise_mae"] = 1e6
+            cell["pointwise_lid"]["boundary_selected"] = True
+            if is_nf:
+                cell["nf_scale_bin_nll"]["improved_bin_fraction"] = 0.2
+                cell["nf_scale_bin_nll"]["historical_threshold_met"] = False
+            else:
+                cell["reconstruction"]["ratio_to_better_trivial"] = 100.0
+                cell["reconstruction"]["historical_threshold_met"] = False
+                if is_low_dimensional:
+                    cell["trace_agreement"]["hutchinson64_mae_vs_exact"] = 1e6
+                    cell["trace_agreement"]["trace64_to_trace16_mae_ratio"] = 1e6 / 1.5
         quality = {
             "production_selected_lambda": cell["production_selected_lambda"],
             "native_loss": cell["native_loss"],
@@ -569,6 +688,20 @@ def test_freshness_preflight_requires_new_root_for_existing_physical_cell(
         )
 
 
+def test_report_accepts_weak_models_low_utilization_and_long_runtime(
+    tmp_path: Path,
+) -> None:
+    report = valid_report(tmp_path, weak_models=True)
+    for device in report["utilization_probe"]["devices"]:
+        device["mean_gpu_utilization_percent"] = 5.0
+        device["p50_gpu_utilization_percent"] = 0.0
+        device["peak_memory_mib"] = device["memory_total_mib"]
+    report["cells"][0]["production_preseal_wall_seconds"] = 10000.0
+    report["runtime_projection"]["maximum_observed_cell_wall_seconds"] = 10000.0
+    report["runtime_projection"]["projected_campaign_hours"] = 100.0
+    assert validate_canary_report(report, report_dir=tmp_path)["status"] == "passed"
+
+
 def test_pass_attestation_checks_exact_devices_cells_and_output_hashes(
     tmp_path: Path,
 ) -> None:
@@ -615,7 +748,7 @@ def test_pass_attestation_checks_exact_devices_cells_and_output_hashes(
     over_budget["runtime_projection"]["projected_campaign_hours"] = (
         18 * 9601.0 * 2.0 / 3600.0
     )
-    with pytest.raises(CanaryError, match="exceeds the 96-hour gate"):
+    with pytest.raises(CanaryError, match="not derived from canary cells"):
         validate_canary_report(over_budget, report_dir=tmp_path)
 
     high_dimensional_quality_claim = copy.deepcopy(report)
@@ -646,7 +779,7 @@ def test_pass_attestation_checks_exact_devices_cells_and_output_hashes(
         if cell["representation"] == "coefficients"
     )
     coefficient_cell["pointwise_lid"]["selected_pointwise_mae"] = 1.0e99
-    with pytest.raises(CanaryError, match="pointwise gate did not pass"):
+    with pytest.raises(CanaryError, match="differs from retained evidence"):
         validate_canary_report(false_low_dimensional_mae, report_dir=tmp_path)
 
     false_low_dimensional_trace = copy.deepcopy(report)
@@ -657,7 +790,7 @@ def test_pass_attestation_checks_exact_devices_cells_and_output_hashes(
         and cell["variant_id"] != "scale_conditioned_nf"
     )
     coefficient_field_cell["trace_agreement"]["hutchinson64_mae_vs_exact"] = 1.0e99
-    with pytest.raises(CanaryError, match="trace gate did not pass"):
+    with pytest.raises(CanaryError, match="differs from retained evidence"):
         validate_canary_report(false_low_dimensional_trace, report_dir=tmp_path)
 
     nonfinite_high_dimensional_trace = copy.deepcopy(report)
@@ -912,7 +1045,7 @@ def test_image_trace_gate_uses_common_16_64_probes_without_exact(
     assert result["hutchinson64_mae_vs_hutchinson16"] == pytest.approx(2.53735)
 
 
-def test_low_dimensional_exact_trace_accuracy_remains_blocking(
+def test_low_dimensional_exact_trace_accuracy_is_diagnostic(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import models.training
@@ -938,8 +1071,8 @@ def test_low_dimensional_exact_trace_accuracy_remains_blocking(
         maximum_ratio=1.25,
         output_dir=tmp_path,
     )
-    assert result["status"] == "failed"
-    assert result["accuracy_gate_applied"] is True
+    assert result["status"] == "diagnostic_only"
+    assert result["accuracy_gate_applied"] is False
     assert result["hutchinson64_mae_vs_exact"] == 3.0
 
 
@@ -966,11 +1099,11 @@ def test_trace_prefix_assessment_rejects_multiple_inference_batches(
 @pytest.mark.parametrize(
     ("representation", "maximum_mae", "expected_status"),
     [
-        ("coefficients", 5.0, "failed"),
+        ("coefficients", 5.0, "diagnostic_only"),
         ("dataset", None, "diagnostic_only"),
     ],
 )
-def test_pointwise_accuracy_only_blocks_exact_low_dimensional_canary(
+def test_pointwise_accuracy_never_blocks_a_finite_benchmark_outcome(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     representation: str,
@@ -1005,12 +1138,13 @@ def test_pointwise_accuracy_only_blocks_exact_low_dimensional_canary(
     assert selected_scale == 2.0
     assert result["selected_pointwise_mae"] == pytest.approx(23.4259)
     assert result["status"] == expected_status
-    assert result["accuracy_gate_applied"] is (maximum_mae is not None)
+    assert result["accuracy_gate_applied"] is False
     assert result["boundary_selected"] is False
 
 
-def test_high_dimensional_pointwise_boundary_is_preserved_without_censoring(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("representation", ["coefficients", "dataset"])
+def test_pointwise_boundary_is_preserved_without_censoring(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, representation: str
 ) -> None:
     import models.training
 
@@ -1027,11 +1161,11 @@ def test_high_dimensional_pointwise_boundary_is_preserved_without_censoring(
         np.zeros(4, dtype=np.float64),
         variant_id="vp_diffusion",
         family="vp_diffusion",
-        representation="dataset",
+        representation=representation,
         scales=(1.0, 2.0, 3.0),
         trace_seed=123,
         batch_size=4,
-        maximum_mae=None,
+        maximum_mae=5.0 if representation == "coefficients" else None,
         output_dir=tmp_path,
     )
     assert result["status"] == "diagnostic_only"
@@ -1125,7 +1259,7 @@ def test_ve_reconstruction_uses_x0_denoiser_output_directly(tmp_path: Path) -> N
         maximum_ratio=0.9,
         output_dir=tmp_path,
     )
-    assert result["status"] == "passed"
+    assert result["status"] == "diagnostic_only"
     assert result["reconstruction_mse"] == 0.0
     with np.load(tmp_path / "reconstruction.npz") as arrays:
         np.testing.assert_array_equal(arrays["predicted"], np.ones((8, 3)))

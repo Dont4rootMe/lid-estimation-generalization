@@ -95,7 +95,7 @@ FM_EXACT_TRACE_MAX_AMBIENT_DIM = 64
 FM_HIGH_DIM_QUERY_SUBSET_SIZE = 8
 FM_HIGH_DIM_TRACE_PROBES = (16, 64)
 FM_HIGH_DIM_PROTOCOL = "hutchinson_prefix_stability_high_dimensional_v1"
-CANARY_PROTOCOL_ID = "vp-ve-fm-nf-integrity-canary-v4"
+CANARY_PROTOCOL_ID = "vp-ve-fm-nf-integrity-canary-v5"
 CANARY_CELL_KEYS = (
     "e2/e2_uniform_pca/coefficients",
     "e2/e2_arrows/dataset",
@@ -555,7 +555,7 @@ def _validate_evaluation_config(evaluation: Mapping[str, Any]) -> None:
 
 def _validate_canary_gate_config(gate: Mapping[str, Any]) -> None:
     expected = {
-        "schema_version": 4,
+        "schema_version": 5,
         "required": True,
         "protocol_id": CANARY_PROTOCOL_ID,
         "report_filename": "canary_report.json",

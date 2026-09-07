@@ -94,6 +94,20 @@ Hutchinson на small-D fixture является обязательным тес
 
 ## Compute budget
 
+Author decision, 2026-09-07: canary v5 separates benchmark outcomes from
+execution integrity at every dimension. Native-loss improvement/plateau,
+reconstruction relative to trivial predictors, pointwise MAE/boundary selection,
+NF versus Gaussian bin wins, and exact/H16/H64 accuracy are non-blocking
+diagnostics. Historical thresholds remain recorded for interpretation, not
+acceptance. GPU utilization, memory headroom and the 96-hour runtime projection
+also cannot veto the full matrix. A canary PASS means complete, structurally
+valid evidence, not good models, convergence, or baseline superiority.
+Non-finite outputs, incorrect source/input identities, split leakage, missing
+coverage and corrupt artifacts still fail closed. Analytic/unit regression
+tests remain mandatory. No-knee remains an explicit selection-failed outcome;
+it is not replaced with fabricated metrics. Training budget, selectors,
+inline evaluation and checkpoint retention are unchanged.
+
 The production v2 continuation approved on 2026-09-07 uses 128,000 optimizer
 steps per cell at batch size 256 (32,768,000 presented examples), increased
 from the unsuccessful 32,000-step canary attempts. The minimum native-loss

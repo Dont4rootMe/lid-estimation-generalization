@@ -324,6 +324,15 @@ Fixed examples-seen отделяет нехватку уникальных да�
 
 ### Что считать достаточным качеством перед full launch
 
+**Изменение по прямому решению автора 2026-09-07:** следующий список сохраняется
+как историческая рекомендация по анализу обучения, не как допуск модели в
+benchmark. Canary v5 записывает качество на любой размерности без блокировки
+полной матрицы: native loss, reconstruction, MAE, NF/Gaussian и trace agreement
+являются diagnostics. Произвольные пороги 10%, 50%, MAE 5 и т. п. были добавлены
+при реализации, а не взяты из upstream benchmark. Низкая utilization и высокий
+ETA также не останавливают job. Блокируют только ошибки корректности и
+целостности; слабый результат нельзя исключать из сравнения.
+
 Проверить VP и хотя бы один FM на одном аналитическом коэффициентном наборе и
 одном IDR image наборе, NF — на том же image наборе. Не запускать seed sweep.
 
@@ -637,7 +646,7 @@ Extra `upstream` здесь нужен для matplotlib при построен
 3. По запросу автора после task 9138 бюджет увеличен с 32000 до 128000
    optimizer steps при batch 256 без early stopping (32768000 предъявлений).
    Оценивается checkpoint с минимальным native loss на held-out train-selection.
-   Canary v4 сохраняет `convergence_status`, tail improvement и threshold;
+   Canary v5 сохраняет `convergence_status`, tail improvement и threshold;
    отсутствие плато само по себе больше не блокирует результат. Бюджет конечен:
    `still_improving_at_budget` нельзя называть доказанной сходимостью. Это новый
    протокол и новая campaign identity, старые 32000-step pilot/canary timings
@@ -664,10 +673,10 @@ Extra `upstream` здесь нужен для matplotlib при построен
 7. Для FM cells с ambient dimension не выше 64 сохраняются exact trace и
    empirical oracle. Для D=256/784/1024/3072 применяется отдельно названная
    Hutchinson-16/64 prefix-stability диагностика без заявления exact/oracle.
-   В canary v4 точность LID и H16/H64 stability на Arrows D=3072 не являются
+   В canary v5 точность LID и H16/H64 stability на любой размерности не являются
    условием допуска модели в сравнительный benchmark: они обязательно
-   сохраняются как `diagnostic_only`. Жёсткая accuracy-проверка остаётся на
-   D=30 coefficients с exact divergence. Не-конечные значения и нарушения
+   сохраняются как `diagnostic_only`, включая D=30 coefficients с exact
+   divergence. Не-конечные значения и нарушения
    integrity по-прежнему останавливают запуск; high-D boundary/no-knee
    сохраняются как отрицательные исходы selector, а не фильтруют модель.
 8. Evaluation выполняется и checkpoint удаляется внутри каждой cell до seal.
