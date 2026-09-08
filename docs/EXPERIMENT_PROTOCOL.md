@@ -94,6 +94,28 @@ Hutchinson на small-D fixture является обязательным тес
 
 ## Compute budget
 
+Maintenance continuation, 2026-09-08: task 9201 stopped in an auxiliary FM
+ratio, not a model-quality gate. Diagnostic schema v3 explicitly represents
+undefined endpoint/posterior trace ratios. Only the two ratio arrays may
+contain NaN, and the validator independently recomputes their exact masks:
+zero denominator, including cancellation within 32 float64 eps times the sum
+of the two endpoint terms. JSON reports the undefined count and statistics
+over defined values only. Raw fields, LID predictions and their metrics remain
+finite-only. The v2 validator remains available for unchanged sealed evidence.
+
+The task-specific maintenance importer permits exactly 147 validated cells
+from commit 03c12b04561575fbef5c89c6876138bf7d7c2e44 / campaign
+92fe3436909e3bf28427c380fdaa463e7f652c9d884f8ffe28cdc02cd11ff2b7.
+Inputs, model configurations, training budget, selectors and readouts are
+unchanged. Cells are copied byte-for-byte into a new source-bound root;
+original run IDs/source hashes remain intact and the 282 newly executed cells
+use the new source hash. The final manifest binds the immutable import lineage
+under state/ and the original canary report. It does not claim that the old
+canary measured new training. Fresh GPU-worker preflight and a replay of the
+previously failing checkpoint diagnostics precede the remaining DAG. The replay
+is engineering evidence, not an additional benchmark result. Incomplete cells
+are not imported as results or silently counted as finished.
+
 Author decision, 2026-09-07: canary v5 separates benchmark outcomes from
 execution integrity at every dimension. Native-loss improvement/plateau,
 reconstruction relative to trivial predictors, pointwise MAE/boundary selection,

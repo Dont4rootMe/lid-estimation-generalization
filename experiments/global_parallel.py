@@ -324,6 +324,17 @@ def _expected_cell(
 ) -> tuple[Path, dict[str, Any]]:
     campaign = _campaign_api()
 
+    resolver = getattr(campaign, "resolve_reused_cell", None)
+    if callable(resolver):
+        reused = resolver(
+            prepared,
+            campaign_root=Path(prepared.campaign_root),
+            model_index=model_index,
+            cell_index=cell_index,
+        )
+        if reused is not None:
+            return reused
+
     plan = prepared.plans[model_index]
     cell = prepared.cells[cell_index]
     identity = campaign._cell_identity(

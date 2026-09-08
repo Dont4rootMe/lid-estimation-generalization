@@ -3,10 +3,12 @@ from __future__ import annotations
 import csv
 import io
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from experiments import global_campaign_v2 as campaign
 from experiments.metrics import known_lid_metrics
@@ -173,18 +175,32 @@ def _run(
     )
 
 
+@pytest.mark.parametrize("variant", campaign.APPROVED_MODEL_VARIANTS)
+@pytest.mark.parametrize("target_policy", ["sample_size", "paired_delta"])
 def test_no_knee_is_sealed_and_propagated_without_surrogate_predictions(
     tmp_path: Path,
+    monkeypatch,
+    variant,
+    target_policy,
 ) -> None:
+    from models import training
+
+    monkeypatch.setattr(
+        training,
+        "predict_nf_lid_ols5",
+        lambda trained, query, scale, **kwargs: np.ones(len(query)),
+    )
     config = campaign.validate_global_campaign_config(
         campaign.compose_global_campaign_v2_config()
     )
     plan = next(
-        item
-        for item in campaign.model_plans(config)
-        if item.variant_id == "ve_diffusion"
+        item for item in campaign.model_plans(config) if item.variant_id == variant
     )
-    reference = _cell("reference", "reference")
+    reference = replace(
+        _cell("reference", "reference"),
+        target_policy=target_policy,
+        suite_id="e1" if target_policy == "sample_size" else "e5",
+    )
     reference_dir, reference_summary = _run(tmp_path, config, plan, reference)
 
     selection = reference_summary["protocols"][campaign.UNKNOWN_REFERENCE_PROTOCOL][
@@ -198,7 +214,11 @@ def test_no_knee_is_sealed_and_propagated_without_surrogate_predictions(
     assert not (reference_dir / "checkpoint.pt").exists()
     assert campaign.validate_global_cell(reference_dir) == []
 
-    dependent = _cell("dependent", "reference")
+    dependent = replace(
+        _cell("dependent", "reference"),
+        target_policy=target_policy,
+        suite_id=reference.suite_id,
+    )
     dependent_dir, dependent_summary = _run(
         tmp_path,
         config,

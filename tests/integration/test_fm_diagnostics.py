@@ -561,6 +561,71 @@ def test_validator_rejects_resealed_pre_attestation_v1_artifact(
     assert "invalid metadata protocol" in errors
 
 
+@pytest.mark.parametrize("variant_id", VARIANTS)
+@pytest.mark.parametrize("dimension", [3, 30, 64])
+def test_all_schedules_seal_undefined_ratios_without_losing_predictions(
+    tmp_path: Path, variant_id: str, dimension: int
+) -> None:
+    from experiments.global_campaign_v2 import COMMON_LAMBDA_MAX, COMMON_LAMBDA_MIN
+
+    rng = np.random.default_rng(81)
+    query = rng.normal(size=(8, dimension)).astype(np.float32)
+    reference = rng.normal(size=(12, dimension)).astype(np.float32)
+    target = np.array([0, dimension, dimension * 2 / 3, 1] * 2, dtype=float)
+    scales = [COMMON_LAMBDA_MIN, 0.5, np.sqrt(0.5), 1.0, 2.0, COMMON_LAMBDA_MAX]
+    output = run_fm_diagnostics(
+        tmp_path / variant_id,
+        variant_id=variant_id,
+        outer_selection_curve_sha256=OUTER_SELECTION_CURVE_SHA256,
+        trained=SimpleNamespace(checkpoint_sha256=CHECKPOINT_SHA256),
+        query=query,
+        query_model_space=query,
+        target=target,
+        oracle_reference_model_space=reference,
+        scales=scales,
+        config=_config(),
+        primitive_fn=_AnalyticPrimitive(variant_id),
+    )
+    assert validate_fm_diagnostics(output) == []
+    ratio = np.load(output / "arrays/endpoint_jacobian_ratio.npy")
+    q_ratio = np.load(output / "arrays/posterior_trace_ratio.npy")
+    assert np.isnan(ratio).any()
+    assert np.isnan(q_ratio[target == 0]).all()
+    for name in ["response", "full", "fm_to_score", "velocity_divergence"]:
+        assert np.isfinite(np.load(output / f"arrays/{name}.npy")).all()
+    summary = json.loads((output / "summary.json").read_text())
+    assert any(
+        row["endpoint"]["learned_over_required_ratio"]["n_undefined"] > 0
+        for row in summary["per_scale"]
+    )
+    ratio[np.isfinite(ratio)] = np.nan
+    np.save(output / "arrays/endpoint_jacobian_ratio.npy", ratio)
+    _reseal(output)
+    assert any(
+        "endpoint_jacobian_ratio formula mismatch" in e
+        for e in validate_fm_diagnostics(output)
+    )
+
+
+def test_finite_legacy_v2_diagnostics_still_validate(tmp_path: Path) -> None:
+    output, _ = _run(tmp_path, "posterior_rectified_flow")
+    metadata_path = output / "metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.update(
+        schema_version=2, protocol="train-selection-independent-affine-fm-debug-v2"
+    )
+    metadata_path.write_text(json.dumps(metadata))
+    arrays = diagnostics_module._load_arrays(output, schema_version=2)
+    summary = diagnostics_module._expected_summary(metadata=metadata, arrays=arrays)
+    (output / "summary.json").write_text(json.dumps(summary))
+    manifest_path = output / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest.update(schema_version=2, protocol=metadata["protocol"])
+    manifest_path.write_text(json.dumps(manifest))
+    _reseal(output)
+    assert validate_fm_diagnostics(output) == []
+
+
 @pytest.mark.parametrize(
     "variant_id,schedule,parameterization",
     (

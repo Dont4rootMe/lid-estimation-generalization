@@ -803,6 +803,17 @@ Launcher сначала запускает `experiments.v2_canary`, а full DAG 
 
 ## Источники и границы воспроизведения
 
+Исключение для diagnostic-only maintenance после task 9201: переменная
+`LID_V2_RESUME_FROM` указывает на его полный campaign root. Тот же launcher
+проверяет неизменные source-input/config bindings, копирует ровно 147 полностью
+проверенных sealed cells вместе с original canary evidence, повторяет
+диагностику на сохранённом failed-cell checkpoint и проверяет 24 GPU workers.
+Затем выполняется оставшаяся часть единой 429-cell DAG. Старый root не
+изменяется. В `state/resume_lineage.json` и финальном `campaign.json`
+сохраняется различие исходного и нового source SHA; это не общий bypass для
+reuse после изменений моделей, данных или научного протокола. Итоговые
+CSV/aggregate остаются едиными для всей матрицы, без отдельных FM/NF follow-up.
+
 - [Benchmark, Appendix F и Sections 3.7–3.9](https://proceedings.iclr.cc/paper_files/paper/2026/file/286888e6329c0af52777830ce2af00a5-Paper-Conference.pdf).
 - [Репозиторий данных LID-Benchmarks](https://github.com/DominikFilipiak/LID-Benchmarks),
   pinned revision `2dcb8e41015f53413ff1ddd049bb006c81a5df52`.

@@ -71,4 +71,11 @@ assert importlib.metadata.version("kneed") == "0.8.6"
 assert importlib.metadata.version("pillow") == "11.3.0"
 assert torch.__version__ == "2.7.1+cu126"
 PY
+if [[ -n "${LID_V2_RESUME_FROM:-}" ]]; then
+  "${UV_PROJECT_ENVIRONMENT}/bin/python" -m experiments.v2_resume \
+    --from-campaign "${LID_V2_RESUME_FROM}" --output-root "${job_root}/campaign" \
+    --replay-failed-diagnostics
+  exec "${UV_PROJECT_ENVIRONMENT}/bin/python" -m experiments.global_parallel_v2 \
+    --output-root "${job_root}/campaign" --preflight-only
+fi
 exec "${UV_PROJECT_ENVIRONMENT}/bin/python" -m experiments.v2_canary

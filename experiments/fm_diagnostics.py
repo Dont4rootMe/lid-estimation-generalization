@@ -29,8 +29,9 @@ import numpy.typing as npt
 
 from experiments.run_manifest import canonical_json, sha256_path
 
-FM_DIAGNOSTIC_SCHEMA_VERSION = 2
-FM_DIAGNOSTIC_PROTOCOL = "train-selection-independent-affine-fm-debug-v2"
+FM_DIAGNOSTIC_SCHEMA_VERSION = 3
+FM_DIAGNOSTIC_PROTOCOL = "train-selection-independent-affine-fm-debug-v3"
+_RATIO_ARRAYS = {"endpoint_jacobian_ratio", "posterior_trace_ratio"}
 PROBE_KIND = "rademacher"
 SUPPORTED_VARIANTS = {
     "direct_rectified_flow": ("rectified", "direct_velocity"),
@@ -775,6 +776,37 @@ def _distribution(value: npt.ArrayLike) -> dict[str, float | int]:
     }
 
 
+def _diagnostic_ratio(numerator, denominator, *, cancellation_scale=None):
+    numerator = np.asarray(numerator, dtype=np.float64)
+    denominator = np.asarray(denominator, dtype=np.float64)
+    if not np.isfinite(numerator).all() or not np.isfinite(denominator).all():
+        raise FloatingPointError("non-finite diagnostic ratio primitive")
+    threshold = 0.0
+    if cancellation_scale is not None:
+        threshold = 32.0 * np.finfo(np.float64).eps * cancellation_scale
+    return np.divide(
+        numerator,
+        denominator,
+        out=np.full_like(denominator, np.nan),
+        where=np.abs(denominator) > threshold,
+    )
+
+
+def _ratio_distribution(value, *, schema_version=FM_DIAGNOSTIC_SCHEMA_VERSION):
+    if schema_version == 2:
+        return _distribution(value)
+    array = np.asarray(value, dtype=np.float64)
+    if np.isinf(array).any():
+        raise FloatingPointError("infinite diagnostic ratio")
+    defined = array[np.isfinite(array)]
+    return {
+        "n_total": int(array.size),
+        "n_undefined": int(np.isnan(array).sum()),
+        "undefined_reason": "zero_required_divergence_with_roundoff_tolerance",
+        "defined_values": _distribution(defined) if defined.size else None,
+    }
+
+
 def _prediction_metrics(
     prediction: npt.ArrayLike, target: npt.ArrayLike
 ) -> dict[str, Any]:
@@ -1169,7 +1201,8 @@ def _write_json(path: Path, value: Mapping[str, Any]) -> None:
 
 def _save_npy(path: Path, value: npt.ArrayLike) -> None:
     array = np.asarray(value)
-    if not np.issubdtype(array.dtype, np.number) or not np.isfinite(array).all():
+    allowed = ~np.isinf(array) if path.stem in _RATIO_ARRAYS else np.isfinite(array)
+    if not np.issubdtype(array.dtype, np.number) or not allowed.all():
         raise ValueError(f"refusing to save invalid numeric array {path.name}")
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -1435,17 +1468,17 @@ def run_fm_diagnostics(
             ambient_dim * point.alpha_log_derivative
             - point.log_noise_ratio_derivative * (truth - ambient_dim)
         )
-        endpoint_ratio = np.divide(
+        endpoint_ratio = _diagnostic_ratio(
             primary.velocity_divergence,
             required_velocity_divergence,
-            out=np.full_like(required_velocity_divergence, np.nan),
-            where=required_velocity_divergence != 0.0,
+            cancellation_scale=(
+                abs(ambient_dim * point.alpha_log_derivative)
+                + np.abs(point.log_noise_ratio_derivative * (truth - ambient_dim))
+            ),
         )
-        if not np.isfinite(endpoint_ratio).all():
-            raise FloatingPointError("endpoint required divergence is zero/non-finite")
         required_posterior_divergence = truth / point.alpha
-        posterior_trace_ratio = primary.posterior_divergence / (
-            required_posterior_divergence
+        posterior_trace_ratio = _diagnostic_ratio(
+            primary.posterior_divergence, required_posterior_divergence
         )
 
         primary_columns["posterior_mean"].append(primary.posterior_mean)
@@ -1612,11 +1645,11 @@ def run_fm_diagnostics(
                     "required_velocity_divergence": _distribution(
                         required_velocity_divergence
                     ),
-                    "learned_over_required_ratio": _distribution(endpoint_ratio),
+                    "learned_over_required_ratio": _ratio_distribution(endpoint_ratio),
                     "required_posterior_divergence": _distribution(
                         required_posterior_divergence
                     ),
-                    "posterior_learned_over_required_ratio": _distribution(
+                    "posterior_learned_over_required_ratio": _ratio_distribution(
                         posterior_trace_ratio
                     ),
                 },
@@ -1752,7 +1785,9 @@ def run_fm_diagnostics(
     return directory
 
 
-def _load_arrays(directory: Path) -> dict[str, np.ndarray]:
+def _load_arrays(
+    directory: Path, *, schema_version=FM_DIAGNOSTIC_SCHEMA_VERSION
+) -> dict[str, np.ndarray]:
     array_dir = directory / "arrays"
     actual = (
         {path.stem for path in array_dir.glob("*.npy")} if array_dir.is_dir() else set()
@@ -1767,7 +1802,12 @@ def _load_arrays(directory: Path) -> dict[str, np.ndarray]:
         arrays[name] = np.load(array_dir / f"{name}.npy", allow_pickle=False)
         if not np.issubdtype(arrays[name].dtype, np.number):
             raise ValueError(f"{name}.npy is not numeric")
-        if not np.isfinite(arrays[name]).all():
+        allowed = (
+            ~np.isinf(arrays[name])
+            if schema_version == 3 and name in _RATIO_ARRAYS
+            else np.isfinite(arrays[name])
+        )
+        if not allowed.all():
             raise ValueError(f"{name}.npy contains non-finite values")
     return arrays
 
@@ -1912,12 +1952,14 @@ def _expected_summary(
                 },
                 "endpoint": {
                     "required_velocity_divergence": _distribution(required),
-                    "learned_over_required_ratio": _distribution(endpoint_ratio),
+                    "learned_over_required_ratio": _ratio_distribution(
+                        endpoint_ratio, schema_version=metadata["schema_version"]
+                    ),
                     "required_posterior_divergence": _distribution(
                         required_posterior_divergence
                     ),
-                    "posterior_learned_over_required_ratio": _distribution(
-                        posterior_trace_ratio
+                    "posterior_learned_over_required_ratio": _ratio_distribution(
+                        posterior_trace_ratio, schema_version=metadata["schema_version"]
                     ),
                 },
                 "exact_vs_hutchinson": {
@@ -1975,8 +2017,8 @@ def _expected_summary(
             }
         )
     return {
-        "schema_version": FM_DIAGNOSTIC_SCHEMA_VERSION,
-        "protocol": FM_DIAGNOSTIC_PROTOCOL,
+        "schema_version": metadata["schema_version"],
+        "protocol": metadata["protocol"],
         "variant_id": variant_id,
         "schedule": schedule_name,
         "parameterization": SUPPORTED_VARIANTS[variant_id][1],
@@ -2007,9 +2049,17 @@ def validate_fm_diagnostics(output_dir: Path) -> list[str]:
     }
     if set(manifest) != expected_manifest_fields:
         errors.append("FM diagnostic manifest fields mismatch")
-    if manifest.get("schema_version") != FM_DIAGNOSTIC_SCHEMA_VERSION:
+    if manifest.get("schema_version") not in {2, 3}:
         errors.append("unsupported FM diagnostic manifest schema")
-    if manifest.get("protocol") != FM_DIAGNOSTIC_PROTOCOL:
+    if (
+        manifest.get("protocol")
+        not in {
+            "train-selection-independent-affine-fm-debug-v2",
+            FM_DIAGNOSTIC_PROTOCOL,
+        }
+        or manifest.get("protocol")
+        != f"train-selection-independent-affine-fm-debug-v{manifest.get('schema_version')}"
+    ):
         errors.append("unsupported FM diagnostic protocol")
     if manifest.get("metadata_sha256") != sha256_path(directory / "metadata.json"):
         errors.append("metadata SHA mismatch")
@@ -2045,9 +2095,14 @@ def validate_fm_diagnostics(output_dir: Path) -> list[str]:
     }
     if set(metadata) != expected_metadata_fields:
         errors.append("FM diagnostic metadata fields mismatch")
-    if metadata.get("schema_version") != FM_DIAGNOSTIC_SCHEMA_VERSION:
+    if metadata.get("schema_version") not in {2, 3} or metadata.get(
+        "schema_version"
+    ) != manifest.get("schema_version"):
         errors.append("unsupported FM diagnostic metadata schema")
-    if metadata.get("protocol") != FM_DIAGNOSTIC_PROTOCOL:
+    if metadata.get("protocol") not in {
+        "train-selection-independent-affine-fm-debug-v2",
+        FM_DIAGNOSTIC_PROTOCOL,
+    } or metadata.get("protocol") != manifest.get("protocol"):
         errors.append("invalid metadata protocol")
     try:
         config = validate_fm_diagnostic_config(metadata.get("config", {}))
@@ -2099,7 +2154,7 @@ def validate_fm_diagnostics(output_dir: Path) -> list[str]:
         errors.append(f"forbidden validation/test diagnostic artifacts: {forbidden}")
 
     try:
-        arrays = _load_arrays(directory)
+        arrays = _load_arrays(directory, schema_version=metadata.get("schema_version"))
     except (OSError, TypeError, ValueError) as exc:
         errors.append(f"invalid FM diagnostic arrays: {exc}")
         arrays = None
@@ -2240,9 +2295,20 @@ def validate_fm_diagnostics(output_dir: Path) -> list[str]:
             ambient_dim * point.alpha_log_derivative
             - point.log_noise_ratio_derivative * (target - ambient_dim)
         )
-        expected_ratio = arrays["velocity_divergence"][:, index] / expected_required
         expected_required_q = target / point.alpha
-        expected_q_ratio = q_div / expected_required_q
+        if metadata["schema_version"] == 2:
+            expected_ratio = arrays["velocity_divergence"][:, index] / expected_required
+            expected_q_ratio = q_div / expected_required_q
+        else:
+            expected_ratio = _diagnostic_ratio(
+                arrays["velocity_divergence"][:, index],
+                expected_required,
+                cancellation_scale=(
+                    abs(ambient_dim * point.alpha_log_derivative)
+                    + np.abs(point.log_noise_ratio_derivative * (target - ambient_dim))
+                ),
+            )
+            expected_q_ratio = _diagnostic_ratio(q_div, expected_required_q)
         ideal_reconstructed_q = (
             (point.alpha_log_derivative + point.log_noise_ratio_derivative)
             * point.alpha
@@ -2384,7 +2450,13 @@ def validate_fm_diagnostics(output_dir: Path) -> list[str]:
                 expected_q_ratio,
             ),
         ):
-            if not np.allclose(actual, expected, rtol=1e-10, atol=1e-10):
+            if not np.allclose(
+                actual,
+                expected,
+                rtol=1e-10,
+                atol=1e-10,
+                equal_nan=metadata["schema_version"] == 3 and name in _RATIO_ARRAYS,
+            ):
                 errors.append(f"{name} formula mismatch at scale index {index}")
         dtype = np.float32 if compute_dtype == "float32" else np.float64
         numeric_alpha, numeric_beta = _numeric_schedule_alpha_beta(

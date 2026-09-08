@@ -3461,9 +3461,36 @@ def _aggregate_macros(aggregate: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def resolve_reused_cell(
+    prepared: Any, *, campaign_root: Path, model_index: int, cell_index: int
+):
+    from experiments.v2_resume import reused_cell
+
+    return reused_cell(
+        prepared,
+        campaign_root=campaign_root,
+        model_index=model_index,
+        cell_index=cell_index,
+    )
+
+
 def _expected_cell_directory(
-    *, campaign_root: Path, prepared: Any, model_index: int, cell_index: int
+    *,
+    campaign_root: Path,
+    prepared: Any,
+    model_index: int,
+    cell_index: int,
+    allow_reuse: bool = True,
 ) -> tuple[Path, dict[str, Any]]:
+    if allow_reuse:
+        reused = resolve_reused_cell(
+            prepared,
+            campaign_root=campaign_root,
+            model_index=model_index,
+            cell_index=cell_index,
+        )
+        if reused is not None:
+            return reused
     plan = prepared.plans[model_index]
     cell = prepared.cells[cell_index]
 
@@ -3496,6 +3523,15 @@ def _expected_cell_directory(
 
 
 def _load_bound_canary_report(path: Path, prepared: Any) -> dict[str, Any]:
+    from experiments.v2_resume import (
+        load_lineage,
+        load_predecessor_canary,
+        validate_lineage,
+    )
+
+    if load_lineage(path.parent) is not None:
+        validate_lineage(path.parent, prepared)
+        return load_predecessor_canary(path, prepared)
     project_root = Path(getattr(prepared, "project_root", repository_root())).resolve()
     canary_config = project_root / "configs/v2_canary.yaml"
     if not canary_config.is_file():
@@ -3571,7 +3607,7 @@ def final_manifest_extras(*, campaign_root: Path, prepared: Any) -> dict[str, An
         prepared.config["campaign"]["canary_gate"]["report_filename"]
     )
     _load_bound_canary_report(report_path, prepared)
-    return {
+    extras = {
         "physical_training_count": EXPECTED_PHYSICAL_TRAININGS,
         "canonical_cells_per_model": 35,
         "generated_extension_cells_per_model": 4,
@@ -3583,6 +3619,18 @@ def final_manifest_extras(*, campaign_root: Path, prepared: Any) -> dict[str, An
         "canary_report_path": report_path.relative_to(campaign_root).as_posix(),
         "canary_report_sha256": sha256_path(report_path),
     }
+    from experiments.v2_resume import LINEAGE_FILENAME, load_lineage
+
+    lineage = load_lineage(campaign_root)
+    if lineage is not None:
+        extras["resume_lineage"] = {
+            "path": LINEAGE_FILENAME,
+            "sha256": sha256_path(campaign_root / LINEAGE_FILENAME),
+            "reused_cell_count": len(lineage["reused_cells"]),
+            "new_training_count": EXPECTED_PHYSICAL_TRAININGS
+            - len(lineage["reused_cells"]),
+        }
+    return extras
 
 
 def validate_global_campaign(
@@ -3635,6 +3683,23 @@ def validate_global_campaign(
         "canary_report_path",
         "canary_report_sha256",
     }
+    from experiments.v2_resume import LINEAGE_FILENAME, load_lineage
+
+    lineage = None
+    try:
+        lineage = load_lineage(root)
+    except GlobalCampaignError as exc:
+        errors.append(str(exc))
+    if "resume_lineage" in manifest or lineage is not None:
+        required.add("resume_lineage")
+        if lineage is None or manifest.get("resume_lineage") != {
+            "path": LINEAGE_FILENAME,
+            "sha256": sha256_path(root / LINEAGE_FILENAME),
+            "reused_cell_count": len(lineage["reused_cells"]),
+            "new_training_count": EXPECTED_PHYSICAL_TRAININGS
+            - len(lineage["reused_cells"]),
+        }:
+            errors.append("v2 resume lineage binding differs")
     if set(manifest) != required:
         errors.append("v2 final campaign manifest fields differ")
     if manifest.get("schema_version") != GLOBAL_FINAL_MANIFEST_SCHEMA_VERSION:
