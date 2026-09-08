@@ -232,3 +232,30 @@ def test_lineage_hash_is_in_final_manifest(imported, monkeypatch):
         "reused_cell_count": 147,
         "new_training_count": 282,
     }
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_import_reads_array_inventory_before_scanning_cells(
+    tmp_path, monkeypatch, changed
+):
+    original = tmp_path / "original"
+    target = tmp_path / "target"
+    original.mkdir()
+    target.mkdir()
+    (original / "input_inventory.json").write_text('[{"cell":"source"}]')
+    (target / "input_inventory.json").write_text(
+        '[{"cell":"changed"}]' if changed else '[{"cell":"source"}]'
+    )
+    prepared = SimpleNamespace(
+        campaign_root=str(target), project_root=str(ROOT), plans=()
+    )
+    monkeypatch.setattr(v2_resume, "source_compatibility", lambda root: {})
+    monkeypatch.setattr(v2_resume, "load_predecessor_canary", lambda *args: {})
+    expected = (
+        "input inventory differs"
+        if changed
+        else "expected 147 sealed predecessors, found 0"
+    )
+    with pytest.raises(campaign.GlobalCampaignError, match=expected):
+        v2_resume.import_sealed_cells(prepared, original)
+    assert not (target / "runs").exists()

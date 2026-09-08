@@ -232,8 +232,10 @@ def import_sealed_cells(prepared: Any, predecessor_root: Path) -> dict[str, Any]
     compatibility = source_compatibility(Path(prepared.project_root))
     report = load_predecessor_canary(predecessor_root / "canary_report.json", prepared)
     if not campaign._same_json(
-        campaign._load_json(predecessor_root / "input_inventory.json"),
-        campaign._load_json(root / "input_inventory.json"),
+        json.loads(
+            (predecessor_root / "input_inventory.json").read_text(encoding="utf-8")
+        ),
+        json.loads((root / "input_inventory.json").read_text(encoding="utf-8")),
     ):
         raise campaign.GlobalCampaignError("predecessor input inventory differs")
     original = SimpleNamespace(**vars(prepared))
