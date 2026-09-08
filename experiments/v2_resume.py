@@ -69,7 +69,7 @@ def source_compatibility(root: Path) -> dict[str, Any]:
                 capture_output=True,
             ).stdout
         ),
-        "scope": "diagnostic_ratios_and_immutable_cell_import_only",
+        "scope": "diagnostic_ratios_immutable_cell_import_and_worker_preflight",
     }
 
 

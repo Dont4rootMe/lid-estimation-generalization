@@ -116,6 +116,13 @@ previously failing checkpoint diagnostics precede the remaining DAG. The replay
 is engineering evidence, not an additional benchmark result. Incomplete cells
 are not imported as results or silently counted as finished.
 
+Task 9326 passed the failed-checkpoint GPU diagnostic replay, then exposed a
+worker-preflight race before training: an empty result queue was incorrectly
+treated as failure when an already reported worker had exited successfully.
+Preflight now waits for all exact worker reports for at most 300 seconds;
+nonzero exits still fail immediately, and missing/duplicate/misbound reports
+remain errors. This coordination fix changes no training or scientific gate.
+
 Author decision, 2026-09-07: canary v5 separates benchmark outcomes from
 execution integrity at every dimension. Native-loss improvement/plateau,
 reconstruction relative to trivial predictors, pointwise MAE/boundary selection,

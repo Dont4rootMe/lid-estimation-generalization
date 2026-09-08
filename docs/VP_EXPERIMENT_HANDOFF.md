@@ -814,6 +814,14 @@ Launcher сначала запускает `experiments.v2_canary`, а full DAG 
 reuse после изменений моделей, данных или научного протокола. Итоговые
 CSV/aggregate остаются едиными для всей матрицы, без отдельных FM/NF follow-up.
 
+Task 9326 прошла GPU replay исходного failed checkpoint, но завершилась до
+обучения из-за race в preflight: уже отчитавшийся worker с exit 0 ошибочно
+считался аварийным при паузе в очереди отчётов. Maintenance включает исправление
+этой координации: до 300 секунд на все 24 точных отчёта, немедленный отказ при
+nonzero exit, прежний отказ при пропущенном или неверно связанном отчёте.
+Проверка рабочего пула не ослабляется: в отличие от одноразовых probe workers,
+обучающие workers должны оставаться живыми до команды shutdown координатора.
+
 - [Benchmark, Appendix F и Sections 3.7–3.9](https://proceedings.iclr.cc/paper_files/paper/2026/file/286888e6329c0af52777830ce2af00a5-Paper-Conference.pdf).
 - [Репозиторий данных LID-Benchmarks](https://github.com/DominikFilipiak/LID-Benchmarks),
   pinned revision `2dcb8e41015f53413ff1ddd049bb006c81a5df52`.

@@ -1721,21 +1721,26 @@ def _run_preflight_only(
         process.start()
     records: list[dict[str, Any]] = []
     seen_slots: set[int] = set()
-    deadline = time.monotonic() + 60.0
+    deadline = time.monotonic() + 300.0
     try:
         while len(records) < worker_count:
             timeout = min(1.0, deadline - time.monotonic())
             if timeout <= 0:
-                raise campaign.GlobalCampaignError("parallel preflight timed out")
+                missing = sorted(set(range(worker_count)) - seen_slots)
+                raise campaign.GlobalCampaignError(
+                    f"parallel preflight timed out waiting for workers {missing}"
+                )
             try:
                 message = result_queue.get(timeout=timeout)
             except queue.Empty:
                 exited = [
-                    process for process in processes if process.exitcode is not None
+                    process
+                    for process in processes
+                    if process.exitcode not in {None, 0}
                 ]
                 if exited:
                     raise campaign.GlobalCampaignError(
-                        "preflight worker exited without a valid report: "
+                        "preflight worker exited unsuccessfully: "
                         + ", ".join(
                             f"{process.name}={process.exitcode}" for process in exited
                         )
