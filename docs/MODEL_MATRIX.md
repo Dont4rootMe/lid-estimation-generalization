@@ -41,6 +41,26 @@ corresponding model exposes the required fields and assumptions.
 These cases must be labelled `negative_control`, not presented as failed
 versions of the proposed valid NF interfaces.
 
+## Реализованная completed-study matrix
+
+Теоретическая interface matrix выше шире одной конкретной кампании. В
+завершённой learned-study фактически обучены десять baseline configurations:
+
+| Группа | Реализованные variants | Primary / secondary readouts |
+|---|---|---|
+| Vanilla/control | diffusion, legacy rectified flow, scale-conditioned NF, Schrödinger bridge | primary `full`/`fixed_likelihood`; RF/SB также `response` |
+| Independent affine FM | 3 schedules × direct/posterior = 6 variants | primary `full`; secondary `response`, `fm_to_score` |
+
+Каждый baseline variant покрывает 39 cells с validation и test: 390 физических
+trainings. Supplemental NF follow-up добавляет 78 C0 trainings и три logical
+result variants: seed2/autograd, seed2/OLS5 и seed3/OLS5. Итого consolidated
+table содержит 13 logical variants, но это не 13 независимых математических
+семейств и не 13 × 39 независимых checkpoint.
+
+Точная таксономия, row accounting и результаты находятся в
+[`EXPERIMENT_RESULTS.md`](EXPERIMENT_RESULTS.md); NF selection — в
+[`NF_CAMPAIGN.md`](NF_CAMPAIGN.md).
+
 ## Explicitly outside the confirmatory matrix
 
 VAE, arbitrary nonlinear interpolants, non-Brownian bridges, Stable Diffusion

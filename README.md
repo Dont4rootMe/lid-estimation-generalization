@@ -1,5 +1,9 @@
 # LID estimation experiments
 
+> Для агентов и новых участников проекта: единая карта контекста находится в
+> [`docs/agent/README.md`](docs/agent/README.md), а обязательные правила — в
+> [`AGENTS.md`](AGENTS.md).
+
 Воспроизводимый экспериментальный контур для статьи **Endpoint Channels Reveal
 Local Dimension: Diffusions, Flow Matching, Bridges, and Calibrated Normalizing
 Flows** и набора **Why We Need New Benchmarks for Local Intrinsic Dimension

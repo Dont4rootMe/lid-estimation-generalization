@@ -49,8 +49,9 @@ Arrows. Поэтому stratified error-vs-radius/edge/position plots **не** �
 - The canonical source train split is deterministically partitioned into
   disjoint optimizer-fit and train-selection subsets.
 - The train-selection subset is never used in optimizer batches; it may monitor
-  target-free training loss, then its LID targets select the minimum-MAE
-  scale/time after training.
+  target-free training loss. Known-LID cells select minimum-MAE scale/time from
+  source-train targets; E1/E5 use their target-free reference-stability
+  criteria after training.
 - Ties resolve by the family-specific Hydra policy. The chosen candidate index
   is frozen before validation or test features/targets are accessed.
 - The full train-selection curve is stored. Validation and test each execute
@@ -77,20 +78,33 @@ config и связываются с результатом через его SHA
 - 100% requested matrix coverage, no silently skipped cells;
 - 100% finite target inputs; finite prediction fraction reported and at least
   the declared threshold;
-- scale/time chosen only from held-out source-train targets, with zero optimizer
-  overlap and no validation/test target access before the index is frozen;
+- scale/time chosen only from the task-specific held-out source-train criterion,
+  with zero optimizer overlap and no validation/test target access before the
+  index is frozen;
 - output checksum verification succeeds;
 - model checkpoint/config SHA present for learned cells;
 - canonical exact archive and regenerated fallback never aggregated together;
 - representation transformations and any normalization are part of dataset
   identity.
 
-Эти gates относятся к одной model/seed Hydra matrix. Покрытие полного
-семейства моделей и seeds нужно проверять отдельным study-level manifest до
-публикации общей таблицы; текущий runner не объявляет несколько независимых
-Hydra jobs одной завершённой study. Аналогично, agreement exact trace и
-Hutchinson на small-D fixture является обязательным тестом внешнего exporter,
-если он заявляет stochastic trace, но пока не проверяется этим репозиторием.
+На уровне завершённой study manifest дополнительно обязан подтверждать полное
+покрытие model variants × cells, физические trainings, logical result variants,
+row counts, split/readout joins и output SHA. Scope содержит 35 canonical cells;
+headline scoring использует `split=test`, reported primary readout и 33
+nontrivial cells; E1/E5 anchors не считаются отдельными scoring cells, хотя E1
+reference anchor сохраняется как нулевая граница AUC. При этом predeclared
+baseline/FM primary нужно отличать от validation-selected frozen NF logical
+variants. Generated E3/E4, alternate readouts и validation-selected candidates
+показываются с явной маркировкой. Реализованный manifest и фактические
+результаты описаны в
+[`EXPERIMENT_RESULTS.md`](EXPERIMENT_RESULTS.md).
+
+Базовые gates относятся к одной model/seed Hydra matrix. Production
+`experiments.global_parallel` дополнительно строит и проверяет study-level
+manifest всей кампании; произвольный набор независимых Hydra jobs без такого
+manifest нельзя объявлять завершённой study. Аналогично, agreement exact trace
+и Hutchinson на small-D fixture является обязательным тестом внешнего exporter,
+если он заявляет stochastic trace, но пока не проверяется базовым runner.
 
 ## Compute budget
 

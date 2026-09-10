@@ -38,15 +38,16 @@ the controlled comparison as if only the network output had changed.
 The public model scale is always the physical noise ratio
 `lambda = beta / alpha`, irrespective of the schedule's native time. Training
 uses `log(lambda)` conditioning and log-uniform sampling on `[0.01, 1]`. Scale
-selection uses held-out source-train targets and the common lambda grid:
+selection uses a held-out source-train subset and the common lambda grid:
 
 ```text
 0.01, 0.0178, 0.0316, 0.0562, 0.1, 0.1778, 0.3162, 0.5623, 1.0
 ```
 
-The primary selector minimizes train-selection MAE for the `full` readout,
-breaking a numerical tie toward smaller lambda. The selected index is frozen
-before validation or test features and targets are resolved. Native schedule
+For known-LID, the primary selector minimizes train-selection MAE for the
+`full` readout; E1/E5 use their target-free reference-stability criteria. A
+numerical tie breaks toward smaller lambda. The selected index is frozen before
+validation or test features and targets are resolved. Native schedule
 coordinates (`t` for rectified/VP, `u` for log noise) are reported only as
 deterministically recomputed diagnostics.
 
@@ -63,6 +64,28 @@ entire configuration is present under `pilot_model.diagnostics` in Hydra:
 Hutchinson and exact-trace settings, deterministic subset seeds, empirical
 Gaussian oracle reference size/chunking, and batch size. Diagnostic artifacts
 are part of the sealed pilot output inventory.
+
+## Выполненное покрытие и результат
+
+Все шесть factorial variants обучены на 39 cells с seed 0: всего 234
+физических FM trainings внутри глобальной кампании из 390. Primary readout для
+заранее объявленного сравнения — `full`; `response` и `fm_to_score` являются
+secondary frozen readouts того же checkpoint. Legacy `rectified_flow` имеет
+отдельные 39 trainings и не входит в факториал.
+
+На primary `full` posterior variants оказались сильнее direct на known-LID и
+E5, а direct variants — на E1 sample-size stability. Лучший primary balance
+known-LID/E5 даёт posterior log-noise; лучший E1 — direct VP-trigonometric.
+Универсального победителя нет. Агрегированные cell-level error summaries для
+`full` и `fm_to_score` практически совпадают (maximum relative difference
+`4.18e-05`), но compact CSV не доказывает pointwise equality; readouts не
+считаются независимыми методами.
+
+Exploratory выбор среди secondary readouts на validation выделил
+`posterior_rectified_flow/response`; он конкурентен diffusion/SB на test, но
+должен маркироваться как post-hoc validation-selected secondary result, а не
+как замена predeclared primary. Числа, oracle caveat и cross-family сравнение
+приведены в [`EXPERIMENT_RESULTS.md`](EXPERIMENT_RESULTS.md).
 
 ## Comet names
 

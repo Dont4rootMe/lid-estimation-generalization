@@ -89,17 +89,33 @@ Bundle metadata одновременно привязан к raw query и к tra
    полного input inventory входит в run identity вместе с raw/model selected
    dataset SHA и preprocessing SHA.
 
-Затем validation curve выбирает scale без target labels, test prediction
-сохраняется pointwise, а aggregate report пересчитывается из raw `.npy`.
+Затем task-specific curve на отделённом от optimizer-fit подмножестве
+source-train выбирает scale: target-based MAE для known-LID либо target-free
+reference stability для E1/E5. Индекс замораживается до чтения
+validation/test; validation и test вычисляются только в одной выбранной точке,
+без сохранения их scale curves. Test prediction сохраняется pointwise, а
+aggregate report пересчитывается из raw `.npy`.
 Checkpoint, training config, dataset rows или trace seed нельзя поменять с
 повторным использованием старой cell: изменится run ID либо provenance check
 упадёт.
 
-## Что ещё нужно для настоящей paper table
+## Статус completed evidence и переносимость
 
-Нужны versioned training configs и checkpoints конкретных реализаций. Это
-научный выбор, отсутствующий в текущем тексте статьи, а не инфраструктурная
-деталь. После их фиксации каждый model YAML получает путь и SHA per-cell artifact
-registry, и тот же Hydra multirun становится confirmatory learned matrix. До
-этого oracle matrix можно использовать только для проверки формул, scale/data
-plumbing и benchmark aggregation.
+Production learned campaign была выполнена с versioned configs, checkpoint SHA,
+per-cell provenance и sealed pointwise evidence; её состав и результаты
+зафиксированы в [`EXPERIMENT_RESULTS.md`](EXPERIMENT_RESULTS.md). Локальная
+consolidated копия намеренно компактна: она содержит analysis-ready CSV,
+aggregates, manifests и hashes, но не checkpoint и pointwise `.npy`.
+
+Поэтому существуют два разных утверждения:
+
+- completed remote evidence подтверждает фактически выполненную study;
+- чистый checkout с шаблонными `artifact_registry: null` не может сам
+  воспроизвести learned table без нового обучения или отдельно сохранённых
+  versioned training artifacts.
+
+Для нового confirmatory прогона registry, training configs и checkpoint снова
+обязательны. Compact bundle достаточен для воспроизводимого table-level анализа
+и проверки hashes, но не для переоценки pointwise predictions. Исходный remote
+evidence хранит sealed pointwise/cell outputs и checkpoint-hash attestation, но
+не checkpoint bytes: они удалены по `prune_after_cell_evaluation`.
