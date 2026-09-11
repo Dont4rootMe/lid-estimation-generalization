@@ -42,7 +42,7 @@ def main():
     output=dict(status='passed' if maximum<.002 else 'requires_exact_input_references',
         interpretation='effect of the actual float32 input transform on a continuous-law posterior, not model rounding error',
         maximum_response_gap=maximum,rows=rows)
-    Path(__file__).with_name('query_precision_checks.json').write_text(json.dumps(output,indent=2)+'\n')
+    (ROOT.parent/'query_precision_checks.json').write_text(json.dumps(output,indent=2)+'\n')
     print(json.dumps(dict(status=output['status'],maximum_response_gap=maximum)),flush=True)
 
 

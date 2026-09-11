@@ -14,7 +14,7 @@ from experiments.fair_protocol import source_identity,digest,protocol
 
 ROOT=Path(__file__).resolve().parents[2]
 BASE=ROOT/'artifacts/non_gaussian_20260911'
-HERE=Path(__file__).resolve().parent
+HERE=BASE/'report'
 MODELS=['t_flowmatching','pfgmpp','posterior_rectified_flow']
 NAMES={'t_flowmatching':'t-Flow (nu=5)','pfgmpp':'PFGM++ (D=128)',
     'posterior_rectified_flow':'Gaussian posterior RF'}
@@ -65,24 +65,25 @@ def report_tables(out,tables):
             f"{row['selected_lambda_model_vs_oracle_response_mae']:.3f}"])
         denoising.append(prefix+[f"{row['response_selected_lambda']:.5g}",
             f"{row['selected_lambda_denoising_risk']:.3f}",
-            f"{row['selected_lambda_initial_denoising_risk']:.3f}"])
+            f"{row['selected_lambda_initial_denoising_risk']:.3f}",
+            f"[{row['denoising_paired_difference_ci95_low']:.3f}, {row['denoising_paired_difference_ci95_high']:.3f}]"])
     (out/'score_table.tex').write_text(latex_table(
         ['Данные','Модель','$d$',r'$\lambda$','Test MAE [95\\% CI]','Kneedle MAE'],scores,'llrrlr'))
     (out/'oracle_table.tex').write_text(latex_table(
         ['Данные','Модель',r'$\R_{\min}$ сеть',r'$\R_{\min}$ эталон',r'$|R_{\rm model}-R_{\rm exact}|$'],oracles,'llrrr'))
     (out/'denoising_table.tex').write_text(latex_table(
-        ['Данные','Модель',r'$\lambda$','Обученный posterior','Начальный preconditioner'],denoising,'llrrr'))
+        ['Данные','Модель',r'$\lambda$','Обученный posterior','Начальный preconditioner',r'95\% CI разности'],denoising,'llrrrl'))
     new=[r for r in tables if r['model']!='posterior_rectified_flow']
     passed=sum(r['practical_half_unit_mae_check'] for r in new)
     boundary=sum(r['selected_scale_at_boundary'] for r in new)
     (out/'outcome.tex').write_text(
-        f'Практический порог supervised test MAE$<0.5$ прошли {passed} из8 новых моделей/ячеек. '
-        f'Граничный supervised масштаб выбран в {boundary} из8 случаев. '
+        f'Практический порог supervised test MAE$<0.5$ прошли {passed} из 8 новых моделей/ячеек. '
+        f'Граничный supervised масштаб выбран в {boundary} из 8 случаев. '
         'Эти числа описывают конечную шкалу и данный бюджет. '
         'Точность при малом шуме оценивается следующей проверкой; '
         'она не следует из прохождения этого порога.\n')
 def main():
-    out=HERE/'results';out.mkdir(exist_ok=True)
+    out=HERE/'results';out.mkdir(parents=True,exist_ok=True)
     records={};tables=[];selection_rows=[];source=source_identity();rules=digest(protocol())
     for path in sorted((BASE/'full_budget').glob('*/complete.json')):
         done=verify_measurements(path);quality_path=path.parent/'quality/summary.json'
@@ -105,11 +106,19 @@ def main():
         key=(done['cell_key'],done['variant']);assert key not in records;records[key]=record
         at_min=quality['continuous_law'][0];at_selected=quality['continuous_law'][idx]
         risk=quality['denoising'][idx]
+        cell_meta=done['cell'];ambient=done['resolved']['geometry']['ambient_dim'];rank=done['resolved']['rank']
+        g=json.loads((BASE/'population'/f"{cell_meta['dataset']}__{cell_meta['representation']}"/'geometry.json').read_text())
+        df=done['config']['kernel_df']
+        factor=1. if df is None else ((df-2)/(df+ambient-rank-2))**.5
+        raw_rms=selection['selected_lambda']*g['normalization_rms']
         tables.append(dict(dataset=titles(done['cell_key']),cell_key=done['cell_key'],model=done['variant'],
             true_lid=float(curve['test_target'][0]),test_n=1000,
             primary_readout=done['primary_readout'],primary_selected_lambda=done['selected_lambda'],
             primary_test_mae=done['metrics'][done['primary_readout']]['mae'],
             response_selected_lambda=selection['selected_lambda'],response_test_mae=float(errors.mean()),
+            selected_raw_ambient_rms=raw_rms,selected_raw_active_conditional_rms=raw_rms*factor,
+            selected_active_noise_to_signal_rms=selection['selected_lambda']*factor*(rank/ambient)**.5,
+            conditional_active_df=None if df is None else df+ambient-rank,
             response_mae_ci95_low=quality['response_metrics']['mae_query_bootstrap_ci95'][0],
             response_mae_ci95_high=quality['response_metrics']['mae_query_bootstrap_ci95'][1],
             response_test_mean=quality['response_metrics']['mean'],
@@ -125,6 +134,8 @@ def main():
             selected_lambda_posterior_error_over_lambda_rms=at_selected['posterior_error_over_lambda_rms'],
             selected_lambda_denoising_risk=risk['trained_mean_risk'],
             selected_lambda_initial_denoising_risk=risk['initial_mean_risk'],
+            denoising_paired_difference_ci95_low=risk['paired_risk_difference_ci95'][0],
+            denoising_paired_difference_ci95_high=risk['paired_risk_difference_ci95'][1],
             practical_half_unit_mae_check=quality['practical_half_unit_mae_check'],
             parameters=done['resolved']['actual_parameters'],best_step=done['best_step'],
             native_validation_loss=done['native_validation_loss'],train_seconds=done['train_seconds'],
@@ -162,7 +173,7 @@ def main():
             ax.set(xlabel='lambda (per-coordinate RMS noise)',ylabel='Mean posterior response R',title=titles(cell))
         handles,labels=axes.flat[0].get_legend_handles_labels()
         fig.legend(handles,labels,loc='outside lower center',ncol=3,frameon=False)
-        fig.suptitle('32 fixed holdout queries: trained response versus continuous posterior\nDots: scale selected on all1000 source-train holdout queries; dashed curves are evaluation-only oracles',fontsize=11)
+        fig.suptitle('32 fixed holdout queries: trained response versus continuous posterior\nDots: scale selected on all 1000 source-train holdout queries; dashed curves are evaluation-only oracles',fontsize=11)
         stem='mean_response_logx' if logarithmic else 'mean_response_linearx'
         fig.savefig(out/(stem+'.pdf'));fig.savefig(out/(stem+'.png'));plt.close(fig)
     # A single fixed query: all models use the same first holdout ID in a cell.

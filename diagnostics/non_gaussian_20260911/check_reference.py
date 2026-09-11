@@ -55,7 +55,8 @@ def main():
             trace+=(plus.mean[j]-minus.mean[j])/(2*step)
         assert abs(trace-center.response)<2e-5,(dataset,trace,center.response)
         rows.append(dict(check='continuous_finite_difference',dataset=dataset,max_gap=abs(trace-center.response)))
-    path=Path(__file__).with_name('reference_checks.json')
+    path=Path(__file__).resolve().parents[2]/'artifacts/non_gaussian_20260911/reference_checks.json'
+    path.parent.mkdir(parents=True,exist_ok=True)
     path.write_text(json.dumps(dict(status='passed',rows=rows),indent=2)+'\n')
     print(json.dumps(dict(status='passed',checks=len(rows),maximum_gap=max(r['max_gap'] for r in rows))),flush=True)
 

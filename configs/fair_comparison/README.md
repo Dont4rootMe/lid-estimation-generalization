@@ -244,3 +244,13 @@ Gaussian `full`, `fm_to_score` и likelihood-подстановка явно о�
 Holdout MAE и Kneedle выбирают масштаб по этому нативному response; результат
 хранится в `metrics.response`. Малый MAE при выбранном масштабе сам по себе
 не доказывает точность в пределе lambda к нулю.
+
+Для прямого API вызова используйте
+`training.predict_lid(result, raw_query, lambda_rms, readout='response',
+divergence_backend='active_exact', trace_probes=0)` на covariance-наборах;
+он сам применяет сохранённую нормировку. У новых классов `model.forward(y, lambda)`
+возвращает posterior mean в канонических нормированных координатах. Нативная
+скорость доступна через `model.native_velocity(state, t)`, радиальное поле —
+через `model.poisson_radial_field(y, r)`; эти низкоуровневые методы также работают
+в нормированных координатах. Их поле нельзя получать, просто переименовав
+posterior-выход `forward` в velocity или score.

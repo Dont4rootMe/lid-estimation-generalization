@@ -7,6 +7,36 @@ coefficients and canonical PCA renderings. It does not launch the full507-cell
 comparison. See [the frozen specification](protocol.md) before interpreting a
 selected score. All computations use the canonical arrays and common128k budget.
 
+The original study completed all twelve128k runs and passed measurement replay,
+matched data/split/normalization/capacity checks and trained derivative checks.
+The maximum trained trace/finite-difference discrepancy was1.46e-7. On1000 test
+queries per row, with one response scale selected using1000 source-train holdout
+queries, the measured response MAE was:
+
+| Dataset / representation | True LID | t-Flow | PFGM++ | Gaussian RF response control |
+|---|---:|---:|---:|---:|
+| Exp / coefficients | 2 | .349282 | .325757 | .162739 |
+| Spiral / coefficients | 1 | .213268 | .220503 | .255999 |
+| Exp / PCA render | 2 | .243428 | .295597 | .173966 |
+| Spiral / PCA render | 1 | .280319 | .268318 | .286097 |
+
+All eight new-model rows pass the declared MAE<.5 practical check. This does not
+certify small-noise accuracy: the learned response stays near the fitted
+linear-span rank on the smallest grid scales. The t-Flow Spiral rendering
+selects the upper boundary64. Its active conditional kernel width in raw units
+is.01413, comparable to.01607 at the coefficient model's lambda2.828; this unit
+conversion does not remove the boundary flag. Its denoising-risk improvement
+also has a paired query interval crossing zero. Common-grid Kneedle remains
+weaker, with new-model Spiral MAE.778--.989. No test-based changes to training,
+tail parameters or selection were made. The two methods use different native
+losses/samplers and belong to the same radial Student kernel class; the study
+is not a kernel-only causal comparison or a retraining uncertainty estimate.
+
+Pre-training checks write their fresh numerical receipts under
+`artifacts/non_gaussian_20260911/`, so they preserve the clean checkout required
+by the launcher. The committed `reference_checks.json` is retained evidence
+from the original validation run, not a file overwritten during reproduction.
+
 Run these commands from a clean repository checkout with its training and test
 dependencies installed. `PYTHONPATH=.` makes the standalone diagnostic scripts
 use this checkout's code. The fixed output directory must be fresh. The original
@@ -37,6 +67,10 @@ python diagnostics/non_gaussian_20260911/check_query_precision.py
 python diagnostics/non_gaussian_20260911/run_campaign.py
 python diagnostics/non_gaussian_20260911/evaluate_quality.py --watch
 python diagnostics/non_gaussian_20260911/make_results.py
+cp diagnostics/non_gaussian_20260911/report_ru.tex artifacts/non_gaussian_20260911/report/
+cd artifacts/non_gaussian_20260911/report
+pdflatex -interaction=nonstopmode -halt-on-error report_ru.tex
+pdflatex -interaction=nonstopmode -halt-on-error report_ru.tex
 ```
 
 The archive is authenticated against SHA256
@@ -60,7 +94,9 @@ response remains unchanged. It writes complete metrics, fixed-checkpoint query
 uncertainty, holdout selector bootstraps and scientific PDF/PNG curves, including
 a linear-scale figure for one fixed point.
 
-`report_ru.tex` is the explanatory report source; measured table fragments and
+Report outputs are written to `artifacts/non_gaussian_20260911/report/`, keeping
+the producing checkout clean. The PDF build additionally needs pdfLaTeX with
+Russian Babel and T2A fonts. `report_ru.tex` is the explanatory report source; measured table fragments and
 the final interpretation are populated only after the complete study is
 verified. `results/verification.json` and each producing run's manifests are the
 authoritative numerical records. A short preflight proves execution only and
