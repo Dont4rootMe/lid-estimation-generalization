@@ -36,7 +36,7 @@ def selector_bootstrap(curves,target,scales):
 
 def titles(cell):
     _,dataset,rep=cell.split('/')
-    return ('Exp' if dataset=='e6_exp_pca' else 'Spiral')+' / '+('coefficients, N=30' if rep=='coefficients' else 'PCA render, N=784')
+    return ('Exp' if dataset=='e6_exp_pca' else 'Spiral')+' / '+('coefficients, N=30' if rep=='coefficients' else 'PCA render, N=784')+' (fit-span model)'
 
 
 

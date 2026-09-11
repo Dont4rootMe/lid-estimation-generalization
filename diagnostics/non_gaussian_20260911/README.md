@@ -32,6 +32,14 @@ tail parameters or selection were made. The two methods use different native
 losses/samplers and belong to the same radial Student kernel class; the study
 is not a kernel-only causal comparison or a retraining uncertainty estimate.
 
+These runs use the existing fit-derived affine-span projection for both
+representations, identically across methods. This explicitly supplies global
+support structure and constrains the posterior; it is more than normalization.
+The author has subsequently objected to this aided representation protocol.
+Retain the numbers as a labelled study of that frozen recipe, not evidence of
+unassisted ambient-image learning. Quality under a replacement ambient-space
+recipe must be measured anew; the tested U-Net integration alone does not prove it.
+
 Pre-training checks write their fresh numerical receipts under
 `artifacts/non_gaussian_20260911/`, so they preserve the clean checkout required
 by the launcher. The committed `reference_checks.json` is retained evidence
