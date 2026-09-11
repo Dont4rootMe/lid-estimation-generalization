@@ -151,6 +151,9 @@ class ConditionedBottleneckMLP(nn.Module):
             previous = output_width
         self.activation = nn.SiLU()
 
+    def _final_skip(self, skip: Tensor) -> Tensor:
+        return skip
+
     def forward(self, inputs: Tensor, time: Tensor) -> Tensor:
         if inputs.ndim != 2 or inputs.shape[1] != self.ambient_dim:
             raise ValueError("inputs must be (batch, ambient_dim)")
@@ -178,6 +181,8 @@ class ConditionedBottleneckMLP(nn.Module):
             state = self.activation(layer(state))
             skips.append(state)
         for index, (layer, skip) in enumerate(zip(self.decoder, reversed(skips[:-1]))):
+            if index + 1 == len(self.decoder):
+                skip = self._final_skip(skip)
             state = layer(torch.cat((skip, state), dim=1))
             if index + 1 < len(self.decoder):
                 state = self.activation(state)
@@ -224,8 +229,16 @@ def vp_loss(
     noise: Tensor,
     schedule: VPSchedule = DEFAULT_VP_SCHEDULE,
 ) -> Tensor:
+    from models.noise_pairing import paired_corruption
+    clean,time,noise=paired_corruption(model,clean,time,noise)
     alpha, sigma = schedule.coefficients(time)
     noisy = alpha[:, None] * clean + sigma[:, None] * noise
+    from models.empirical_target import empirical_target_enabled,denoising_target
+    if empirical_target_enabled(model):
+        posterior=denoising_target(model,noisy/alpha[:,None],sigma/alpha,clean)
+        target=(alpha[:,None]*posterior-noisy)/sigma.clamp_min(torch.finfo(sigma.dtype).eps)[:,None]
+        target=torch.where((sigma==0)[:,None],torch.zeros_like(target),target)
+        return (model(noisy,time)-target).square().sum(dim=1).mean()
     return (model(noisy, time) + noise).square().sum(dim=1).mean()
 
 

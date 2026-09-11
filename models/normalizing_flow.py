@@ -1,12 +1,14 @@
 """Scale-conditioned normalizing flow for the paper's fixed-point interface.
 
-The model is an explicit conditional RealNVP diffeomorphism.  At training
-time it fits the coherent density path
+The model is an explicit conditional RealNVP diffeomorphism. Its training
+observations are drawn from the coherent target density path
 
 ``p_epsilon = Law(X_normalized + epsilon * standard_normal)``
 
 with one shared set of parameters conditioned on the *known* smoothing scale.
-Consequently ``log_prob(x, epsilon)`` is an exact change-of-variables density,
+The fitted conditional densities need not exactly satisfy the Gaussian heat
+equation: that is a learned-path validity check, not a normalization guarantee.
+``log_prob(x, epsilon)`` is an exact change-of-variables density,
 not a density proxy or a precomputed field bundle.  The LID readout is obtained
 by differentiating this exact likelihood at a fixed observation:
 
@@ -182,7 +184,7 @@ class _AffineCoupling(nn.Module):
 
 
 class ScaleConditionedRealNVP(nn.Module):
-    """A coherent conditional family of regular, exactly normalized densities."""
+    """A shared conditional family of regular, exactly normalized densities."""
 
     def __init__(self, config: ConditionalFlowConfig) -> None:
         super().__init__()
@@ -595,6 +597,8 @@ def conditional_smoothed_nll(
         dtype=clean.dtype,
         generator=generator,
     )
+    from models.noise_pairing import paired_corruption
+    clean,epsilon,noise=paired_corruption(model,clean,epsilon,noise)
     epsilon_broadcast = epsilon.reshape(-1, *([1] * (clean.ndim - 1)))
     noisy = clean + epsilon_broadcast * noise
     return -model.log_prob(noisy, epsilon).mean() / model.config.ambient_dim

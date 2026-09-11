@@ -160,10 +160,14 @@ def brownian_sb_terminal_denoising_loss(
         dtype=terminal.dtype,
         generator=generator,
     )
+    from models.noise_pairing import paired_corruption
+    terminal,tau,noise=paired_corruption(model,terminal,tau,noise)
     sigma = torch.sqrt(spec.diffusivity * tau)
     sigma_broadcast = sigma.reshape(-1, *([1] * (terminal.ndim - 1)))
     bridge_state = terminal + sigma_broadcast * noise
     denoised_terminal = model(bridge_state, tau)
+    from models.empirical_target import denoising_target
+    terminal=denoising_target(model,bridge_state,sigma,terminal)
     if denoised_terminal.shape != terminal.shape:
         raise ValueError("bridge denoiser output must have the terminal shape")
     return ((denoised_terminal - terminal) / sigma_broadcast).square().flatten(1).mean()

@@ -18,13 +18,14 @@ the denoising-score-matching identity
 from __future__ import annotations
 
 import hashlib
+import copy
 import json
 import math
 import os
 import random
 import tempfile
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from itertools import pairwise
 from pathlib import Path
 from typing import Any, Literal
@@ -174,11 +175,73 @@ class TrainingConfig:
     flow_noise_ratio_min: float | None = None
     flow_noise_ratio_max: float | None = None
     field_hidden_sizes: tuple[int, ...] | None = None
+    field_preconditioning: str | None = None
+    field_projection_rank: int | None = None
+    field_backbone: str = 'bottleneck_v1'
+    field_residual_scaling: str = 'noise_v1'
+    field_residual_width: int = 512
+    noise_pairing: str = 'iid'
+    training_target: str = 'sample_v1'
+    training_target_start_step: int = 0
+    terminal_decay_steps: int = 0
+    terminal_learning_rate_ratio: float = 0.01
+    ema_decay: float | None = None
+    ema_start_step: int = 0
     vp_hidden_sizes: tuple[int, ...] | None = None
     vp_beta_min: float | None = None
     vp_beta_max: float | None = None
 
     def __post_init__(self) -> None:
+        if self.training_target not in {'sample_v1','empirical_posterior_v1'}:
+            raise ValueError('unknown training target estimator')
+        if self.training_target != 'sample_v1' and (self.training_mode!='fixed_steps_v1' or self.num_coupling_layers is not None):
+            raise ValueError('empirical posterior targets require fixed-step vector-field training')
+        if isinstance(self.training_target_start_step,bool) or not isinstance(self.training_target_start_step,int) or self.training_target_start_step<0:
+            raise ValueError('training target start must be a nonnegative integer')
+        if self.training_target != 'sample_v1' and not self.training_target_start_step<self.steps:
+            raise ValueError('training target must start before the budget ends')
+        if isinstance(self.field_residual_width, bool) or not isinstance(self.field_residual_width, int) or self.field_residual_width <= 0:
+            raise ValueError('field_residual_width must be a positive integer')
+        if self.field_residual_width != 512 and self.field_backbone != 'spectral_residual_v1':
+            raise ValueError('residual width applies only to the spectral residual backbone')
+        if self.field_residual_scaling not in {'noise_v1', 'data_v1', 'gaussian_tail_v1'}:
+            raise ValueError('unknown residual scaling')
+        if self.field_residual_scaling != 'noise_v1' and self.field_preconditioning != 'covariance_span_v1':
+            raise ValueError('data residual scaling requires covariance-span fields')
+        if self.field_residual_scaling != 'noise_v1' and self.num_coupling_layers is not None:
+            raise ValueError('NF has no field residual scaling')
+        if self.terminal_decay_steps or self.ema_decay is not None:
+            if self.training_mode != 'fixed_steps_v1' or self.steps is None:
+                raise ValueError('terminal decay and EMA require fixed-step training')
+        if isinstance(self.terminal_decay_steps, bool) or not isinstance(self.terminal_decay_steps, int) or self.terminal_decay_steps < 0:
+            raise ValueError('terminal_decay_steps must be a nonnegative integer')
+        if self.terminal_decay_steps and self.terminal_decay_steps > self.steps:
+            raise ValueError('terminal decay exceeds training budget')
+        if not 0 < self.terminal_learning_rate_ratio <= 1:
+            raise ValueError('terminal_learning_rate_ratio must lie in (0, 1]')
+        if self.ema_decay is not None and not 0 <= self.ema_decay < 1:
+            raise ValueError('ema_decay must lie in [0, 1)')
+        if isinstance(self.ema_start_step, bool) or not isinstance(self.ema_start_step, int) or self.ema_start_step < 0:
+            raise ValueError('ema_start_step must be a nonnegative integer')
+        if self.ema_decay is not None and self.ema_start_step >= self.steps:
+            raise ValueError('EMA must start before training ends')
+        if self.noise_pairing not in {'iid','antithetic_v1'}:
+            raise ValueError('unknown noise pairing')
+        if self.noise_pairing == 'antithetic_v1' and self.batch_size % 2:
+            raise ValueError('antithetic training requires even batch_size')
+        if self.field_backbone not in {'bottleneck_v1','spectral_residual_v1'}:
+            raise ValueError('unknown field backbone')
+        if self.field_backbone != 'bottleneck_v1' and self.field_preconditioning != 'covariance_span_v1':
+            raise ValueError('spectral residual backbone requires covariance_span_v1')
+        if self.field_projection_rank is not None:
+            if self.field_preconditioning != 'covariance_span_v1' or isinstance(self.field_projection_rank, bool) or not isinstance(self.field_projection_rank, int) or self.field_projection_rank <= 0:
+                raise ValueError('projection rank requires covariance_span_v1 and a positive integer')
+        if self.field_preconditioning is not None:
+            if self.field_preconditioning not in {'gaussian_v1', 'gaussian_no_input_skip_v1', 'covariance_span_v1'}:
+                raise ValueError('unknown field_preconditioning')
+            is_covariance_nf = self.field_preconditioning == 'covariance_span_v1' and self.num_coupling_layers is not None
+            if not self.normalize or (self.field_hidden_sizes is None and self.vp_hidden_sizes is None and not is_covariance_nf):
+                raise ValueError('field preconditioning requires a normalized bottleneck field')
         integer_positive = {
             "epochs": self.epochs,
             "batch_size": self.batch_size,
@@ -571,6 +634,16 @@ def field_parameter_count(
     resolved = _coerce_config(config)
     if canonical == "scale_conditioned_normalizing_flow":
         raise ValueError("normalizing flows are not vector fields")
+    if resolved.field_preconditioning is not None:
+        from models.preconditioned_field import build_bottleneck
+        if resolved.field_preconditioning == 'covariance_span_v1' and resolved.field_projection_rank is None:
+            raise ValueError('fit the training covariance rank before declaring field capacity')
+        architecture = (_vp_architecture_from_training_config(resolved, ambient_dim=ambient_dim)
+                        if canonical == 'vp_diffusion' else
+                        _bottleneck_architecture_from_training_config(resolved, family=canonical, ambient_dim=ambient_dim))
+        with torch.device('meta'):
+            model = build_bottleneck(architecture, canonical, resolved)
+        return sum(parameter.numel() for parameter in model.parameters())
     if canonical == "vp_diffusion":
         architecture = _vp_architecture_from_training_config(
             resolved, ambient_dim=ambient_dim
@@ -691,6 +764,24 @@ def _nf_architecture_from_training_config(
 
 
 def _model_contract(family: Family, config: TrainingConfig) -> dict[str, Any]:
+    contract = _native_model_contract(family, config)
+    if config.field_preconditioning is not None:
+        contract = {**contract, 'field_preconditioning': config.field_preconditioning}
+    if config.field_backbone != 'bottleneck_v1':
+        contract = {**contract, 'field_backbone': config.field_backbone}
+    if config.field_residual_scaling != 'noise_v1':
+        contract = {**contract, 'field_residual_scaling': config.field_residual_scaling}
+    if config.field_residual_width != 512:
+        contract = {**contract, 'field_residual_width': config.field_residual_width}
+    if config.noise_pairing != 'iid':
+        contract = {**contract, 'noise_pairing': config.noise_pairing}
+    if config.training_target != 'sample_v1':
+        contract = {**contract,'training_target':config.training_target,
+                    'training_target_start_step':config.training_target_start_step}
+    return contract
+
+
+def _native_model_contract(family: Family, config: TrainingConfig) -> dict[str, Any]:
     """Return the checkpointed scientific identity for one canonical family."""
 
     if family == "vp_diffusion":
@@ -1036,9 +1127,13 @@ def diffusion_ve_dsm_loss(
     noise = torch.randn(
         clean.shape, device=clean.device, dtype=clean.dtype, generator=generator
     )
+    from models.noise_pairing import paired_corruption
+    clean,sigma,noise=paired_corruption(model,clean,sigma,noise)
     sigma_broadcast = sigma.reshape(-1, *([1] * (clean.ndim - 1)))
     perturbed = clean + sigma_broadcast * noise
     denoised = model(perturbed, sigma)
+    from models.empirical_target import denoising_target
+    clean=denoising_target(model,perturbed,sigma,clean)
     # Equivalent to sigma^2 * ||score + noise/sigma||^2 after substituting
     # score=(denoised-perturbed)/sigma^2.
     return ((denoised - clean) / sigma_broadcast).square().flatten(1).mean()
@@ -1063,9 +1158,15 @@ def rectified_flow_matching_loss(
     noise = torch.randn(
         data.shape, device=data.device, dtype=data.dtype, generator=generator
     )
+    from models.noise_pairing import paired_corruption
+    data,time,noise=paired_corruption(model,data,time,noise)
     time_broadcast = time.reshape(-1, *([1] * (data.ndim - 1)))
     interpolated = time_broadcast * data + (1.0 - time_broadcast) * noise
     target_velocity = data - noise
+    from models.empirical_target import empirical_target_enabled,denoising_target
+    if empirical_target_enabled(model):
+        posterior=denoising_target(model,interpolated/time_broadcast,(1-time)/time,data)
+        target_velocity=(posterior-interpolated)/(1-time_broadcast)
     velocity = model(interpolated, time)
     return (velocity - target_velocity).square().flatten(1).mean()
 
@@ -1092,6 +1193,15 @@ def independent_affine_flow_matching_loss(
     noise = torch.randn(
         data.shape, device=data.device, dtype=data.dtype, generator=generator
     )
+    from models.noise_pairing import paired_corruption
+    original_noise=noise
+    data,noise_ratio,noise=paired_corruption(model,data,noise_ratio,noise)
+    if noise is not original_noise:
+        # Antithetic pairing repeats the first half. Reuse its already checked
+        # schedule tensors exactly, rather than synchronizing the GPU again.
+        half=len(noise_ratio)//2
+        state=replace(state,**{name:torch.cat((getattr(state,name)[:half],)*2)
+                              for name in state.__dataclass_fields__})
     interpolated, target = affine_interpolant_and_target(
         data,
         noise,
@@ -1099,6 +1209,10 @@ def independent_affine_flow_matching_loss(
         parameterization=spec.parameterization,
     )
     condition = schedule_condition(state, spec.conditioning)
+    from models.empirical_target import empirical_target_enabled,denoising_target
+    if empirical_target_enabled(model):
+        posterior=denoising_target(model,interpolated/state.alpha[:,None],noise_ratio,data)
+        target=posterior if spec.parameterization=='posterior_mean' else posterior_to_velocity(posterior,interpolated,state)
     prediction = model(interpolated, condition)
     per_example = (prediction - target).square().flatten(1).mean(dim=1)
     weights = flow_matching_loss_weights(state, spec)
@@ -1265,7 +1379,7 @@ def _state_dict_sha256(state: Mapping[str, Tensor]) -> str:
         ).encode("utf-8")
         digest.update(len(header).to_bytes(8, "big"))
         digest.update(header)
-        digest.update(memoryview(value.view(torch.uint8).numpy()).cast("B"))
+        digest.update(value.reshape(-1).view(torch.uint8).numpy().tobytes())
     return digest.hexdigest()
 
 
@@ -1279,16 +1393,24 @@ class _FixedStepScheduler:
         base_learning_rate: float,
         total_steps: int,
         warmup_steps: int,
-        schedule: Literal["constant_v1", "warmup_cosine_v1"],
+        schedule: Literal["constant_v1", "warmup_cosine_v1", "terminal_cosine_v1"],
+        terminal_decay_steps: int = 0,
+        terminal_learning_rate_ratio: float = 0.01,
     ) -> None:
         self.optimizer = optimizer
         self.base_learning_rate = base_learning_rate
         self.total_steps = total_steps
         self.warmup_steps = warmup_steps
         self.schedule = schedule
+        self.terminal_decay_steps = terminal_decay_steps
+        self.terminal_learning_rate_ratio = terminal_learning_rate_ratio
         self.last_completed_step = 0
 
     def _multiplier(self, step: int) -> float:
+        if self.schedule == 'terminal_cosine_v1':
+            start = self.total_steps - self.terminal_decay_steps
+            progress = max(0.0, (step - start) / self.terminal_decay_steps)
+            return self.terminal_learning_rate_ratio + (1 - self.terminal_learning_rate_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
         if self.schedule == "constant_v1":
             return 1.0
         if self.warmup_steps and step <= self.warmup_steps:
@@ -1317,7 +1439,7 @@ class _FixedStepScheduler:
         self.last_completed_step = step
 
     def state_dict(self) -> dict[str, Any]:
-        return {
+        state = {
             "schema_version": 1,
             "schedule": self.schedule,
             "base_learning_rate": self.base_learning_rate,
@@ -1325,6 +1447,10 @@ class _FixedStepScheduler:
             "warmup_steps": self.warmup_steps,
             "last_completed_step": self.last_completed_step,
         }
+        if self.schedule == 'terminal_cosine_v1':
+            state.update(terminal_decay_steps=self.terminal_decay_steps,
+                         terminal_learning_rate_ratio=self.terminal_learning_rate_ratio)
+        return state
 
     def load_state_dict(self, value: Mapping[str, Any]) -> None:
         expected = {
@@ -1334,6 +1460,9 @@ class _FixedStepScheduler:
             "total_steps": self.total_steps,
             "warmup_steps": self.warmup_steps,
         }
+        if self.schedule == 'terminal_cosine_v1':
+            expected.update(terminal_decay_steps=self.terminal_decay_steps,
+                            terminal_learning_rate_ratio=self.terminal_learning_rate_ratio)
         if (
             not isinstance(value, Mapping)
             or {key: value.get(key) for key in expected} != expected
@@ -1782,8 +1911,9 @@ def _fixed_training_progress_payload(
     sampler_generator: torch.Generator,
     objective_generator: torch.Generator,
     device: torch.device,
+    ema_model: TrainableModel | None = None,
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "schema_version": FIXED_STEP_PROGRESS_SCHEMA_VERSION,
         "family": family,
         "model_contract": _model_contract(family, config),
@@ -1824,6 +1954,9 @@ def _fixed_training_progress_payload(
             "device_type": device.type,
         },
     }
+    if config.ema_decay is not None:
+        payload['ema_state'] = None if ema_model is None else _cpu_state_dict(ema_model)
+    return payload
 
 
 def _load_fixed_training_progress(
@@ -1866,6 +1999,8 @@ def _load_fixed_training_progress(
         "counters",
         "rng",
     }
+    if config.ema_decay is not None:
+        required.add('ema_state')
     if not isinstance(payload, dict) or set(payload) != required:
         raise ValueError("fixed-step training progress schema mismatch")
     if payload["schema_version"] != FIXED_STEP_PROGRESS_SCHEMA_VERSION:
@@ -2121,6 +2256,12 @@ def train_model(
     train_cpu = (train_cpu - mean) / scale
     validation_cpu = (validation_cpu - mean) / scale
     device = _resolve_device(resolved_config.device)
+    covariance_span = None
+    if resolved_config.field_preconditioning == 'covariance_span_v1':
+        from models.preconditioned_field import training_covariance_span
+        covariance_span = training_covariance_span(train_cpu, device,
+            minimum_rank=2 if canonical_family == 'scale_conditioned_normalizing_flow' else 1)
+        resolved_config = replace(resolved_config, field_projection_rank=covariance_span[0].shape[1])
     seed_everything(resolved_config.seed)
 
     previous_deterministic = torch.are_deterministic_algorithms_enabled()
@@ -2140,28 +2281,22 @@ def train_model(
             nf_architecture = _nf_architecture_from_training_config(
                 resolved_config, ambient_dim=train_cpu.shape[1]
             )
-            model: TrainableModel = ScaleConditionedRealNVP(nf_architecture).to(device)
+            from models.preconditioned_nf import build_nf
+            model: TrainableModel = build_nf(nf_architecture, resolved_config).to(device)
         elif canonical_family == "vp_diffusion":
             vp_architecture = _vp_architecture_from_training_config(
                 resolved_config, ambient_dim=train_cpu.shape[1]
             )
-            model = VPBottleneckMLP(
-                vp_architecture.ambient_dim,
-                vp_architecture.hidden_sizes,
-                vp_architecture.time_dim,
-            ).to(device)
+            from models.preconditioned_field import build_bottleneck
+            model = build_bottleneck(vp_architecture, canonical_family, resolved_config).to(device)
         elif resolved_config.field_hidden_sizes is not None:
             bottleneck_architecture = _bottleneck_architecture_from_training_config(
                 resolved_config,
                 family=canonical_family,
                 ambient_dim=train_cpu.shape[1],
             )
-            model = ConditionedBottleneckMLP(
-                bottleneck_architecture.ambient_dim,
-                bottleneck_architecture.hidden_sizes,
-                bottleneck_architecture.time_dim,
-                condition_transform=bottleneck_architecture.condition_transform,
-            ).to(device)
+            from models.preconditioned_field import build_bottleneck
+            model = build_bottleneck(bottleneck_architecture, canonical_family, resolved_config).to(device)
         else:
             if canonical_family == "independent_affine_flow":
                 field_architecture = _affine_field_architecture_from_training_config(
@@ -2188,13 +2323,25 @@ def train_model(
                     ),
                 )
             model = ScaleConditionedNeuralField(field_architecture).to(device)
+        if covariance_span is not None:
+            with torch.no_grad():
+                model.basis.copy_(covariance_span[0])
+                model.variances.copy_(covariance_span[1])
+                model.omitted_variance_fraction.copy_(covariance_span[2])
+                if canonical_family == 'scale_conditioned_normalizing_flow':
+                    complete_basis = torch.linalg.qr(model.basis.double(), mode='complete').Q
+                    model.normal_basis.copy_(complete_basis[:, model.basis.shape[1]:])
         model._lid_family = canonical_family
+        model._lid_noise_pairing = resolved_config.noise_pairing
         if canonical_family == "vp_diffusion":
             model._lid_vp_schedule = _vp_schedule_from_training_config(resolved_config)
         if canonical_family == "independent_affine_flow":
             model._lid_affine_spec = _affine_spec_from_training_config(resolved_config)
         train_tensor = train_cpu.to(device)
         validation_tensor = validation_cpu.to(device)
+        if resolved_config.training_target == 'empirical_posterior_v1':
+            from models.empirical_target import EmpiricalPosteriorTarget
+            model._lid_empirical_teacher=EmpiricalPosteriorTarget(train_tensor)
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=resolved_config.learning_rate,
@@ -2209,16 +2356,21 @@ def train_model(
             assert resolved_config.steps is not None
             assert resolved_config.warmup_steps is not None
             assert resolved_config.validation_interval_steps is not None
+            if resolved_config.terminal_decay_steps and canonical_family == 'vp_diffusion':
+                raise ValueError('native VP already uses cosine decay; terminal override is unsupported')
             scheduler = _FixedStepScheduler(
                 optimizer,
                 base_learning_rate=resolved_config.learning_rate,
                 total_steps=resolved_config.steps,
                 warmup_steps=resolved_config.warmup_steps,
                 schedule=(
+                    'terminal_cosine_v1' if resolved_config.terminal_decay_steps else
                     "warmup_cosine_v1"
                     if canonical_family == "vp_diffusion"
                     else "constant_v1"
                 ),
+                terminal_decay_steps=resolved_config.terminal_decay_steps,
+                terminal_learning_rate_ratio=resolved_config.terminal_learning_rate_ratio,
             )
             step_history: list[StepMetrics] = []
             best_validation_loss = math.inf
@@ -2234,6 +2386,7 @@ def train_model(
             best_step = 0
             best_state: dict[str, Tensor] | None = None
             start_step = 1
+            ema_model = None
             if progress_path is not None and progress_path.exists():
                 (
                     start_step,
@@ -2259,10 +2412,21 @@ def train_model(
                     device=device,
                     expected_initial_validation_loss=initial_validation_loss,
                 )
+                if resolved_config.ema_decay is not None:
+                    ema_state = torch.load(progress_path, map_location='cpu', weights_only=True)['ema_state']
+                    if ema_state is not None:
+                        ema_model = copy.deepcopy(model).requires_grad_(False)
+                        ema_model.load_state_dict(ema_state, strict=True)
+                    elif start_step > resolved_config.ema_start_step + 1:
+                        raise ValueError('resumed EMA state is missing after its start')
             interval_loss_sum = 0.0
             interval_examples = 0
             parameter_count = sum(parameter.numel() for parameter in model.parameters())
             for step in range(start_step, resolved_config.steps + 1):
+                model._lid_use_empirical_target=(resolved_config.training_target=='empirical_posterior_v1'
+                                                and step>resolved_config.training_target_start_step)
+                if resolved_config.ema_decay is not None and ema_model is None and step > resolved_config.ema_start_step:
+                    ema_model = copy.deepcopy(model).requires_grad_(False)
                 model.train()
                 indices = torch.randint(
                     train_tensor.shape[0],
@@ -2288,6 +2452,13 @@ def train_model(
                         model.parameters(), resolved_config.gradient_clip_norm
                     )
                 optimizer.step()
+                if ema_model is not None:
+                    with torch.no_grad():
+                        torch._foreach_lerp_(list(ema_model.parameters()), list(model.parameters()), 1 - resolved_config.ema_decay)
+                        # Running statistics must track their source; these fields
+                        # currently have static covariance/Fourier buffers only.
+                        for target, source in zip(ema_model.buffers(), model.buffers()):
+                            target.copy_(source)
                 scheduler.complete_step(step)
                 interval_loss_sum += float(loss.item()) * batch.shape[0]
                 interval_examples += batch.shape[0]
@@ -2310,6 +2481,19 @@ def train_model(
                     raise FloatingPointError(
                         f"non-finite validation loss at step {step}"
                     )
+                raw_validation_loss = validation_loss
+                ema_validation_loss = None
+                candidate_model = model
+                if ema_model is not None:
+                    ema_validation_loss = _validation_loss(
+                        canonical_family, ema_model, validation_tensor, resolved_config,
+                        seed=resolved_config.seed + 1_000_003,
+                    )
+                    if not math.isfinite(ema_validation_loss):
+                        raise FloatingPointError('non-finite EMA validation loss')
+                    if ema_validation_loss < validation_loss:
+                        validation_loss = ema_validation_loss
+                        candidate_model = ema_model
                 metric = StepMetrics(
                     step=step,
                     examples_seen=step * resolved_config.batch_size,
@@ -2321,7 +2505,7 @@ def train_model(
                 if validation_loss < best_validation_loss:
                     best_validation_loss = validation_loss
                     best_step = step
-                    best_state = _cpu_state_dict(model)
+                    best_state = _cpu_state_dict(candidate_model)
                 if progress_path is not None:
                     assert best_state is not None
                     _atomic_torch_save(
@@ -2346,6 +2530,7 @@ def train_model(
                             sampler_generator=shuffle_generator,
                             objective_generator=objective_generator,
                             device=device,
+                            ema_model=ema_model,
                         ),
                     )
                 if log_callback is not None:
@@ -2356,6 +2541,10 @@ def train_model(
                             "best_validation_loss": best_validation_loss,
                             "parameter_count": parameter_count,
                             "validated": True,
+                            **({'raw_validation_loss': raw_validation_loss,
+                                'ema_validation_loss': ema_validation_loss,
+                                'validation_candidate': 'ema' if candidate_model is ema_model else 'raw'}
+                               if resolved_config.ema_decay is not None else {}),
                         }
                     )
                 interval_loss_sum = 0.0
@@ -2692,9 +2881,8 @@ def load_checkpoint(
             raise ValueError(
                 "checkpoint NF architecture does not match training_config"
             )
-        model: TrainableModel = ScaleConditionedRealNVP(flow_architecture).to(
-            resolved_device
-        )
+        from models.preconditioned_nf import build_nf
+        model: TrainableModel = build_nf(flow_architecture, config).to(resolved_device)
         ambient_dim = flow_architecture.ambient_dim
     elif family == "vp_diffusion":
         vp_architecture = VPBottleneckConfig.from_mapping(payload["architecture"])
@@ -2705,11 +2893,8 @@ def load_checkpoint(
             raise ValueError(
                 "checkpoint VP architecture does not match training_config"
             )
-        model = VPBottleneckMLP(
-            vp_architecture.ambient_dim,
-            vp_architecture.hidden_sizes,
-            vp_architecture.time_dim,
-        ).to(resolved_device)
+        from models.preconditioned_field import build_bottleneck
+        model = build_bottleneck(vp_architecture, family, config).to(resolved_device)
         ambient_dim = vp_architecture.ambient_dim
     elif config.field_hidden_sizes is not None:
         bottleneck_architecture = VPBottleneckConfig.from_mapping(
@@ -2724,12 +2909,8 @@ def load_checkpoint(
             raise ValueError(
                 "checkpoint bottleneck architecture does not match training_config"
             )
-        model = ConditionedBottleneckMLP(
-            bottleneck_architecture.ambient_dim,
-            bottleneck_architecture.hidden_sizes,
-            bottleneck_architecture.time_dim,
-            condition_transform=bottleneck_architecture.condition_transform,
-        ).to(resolved_device)
+        from models.preconditioned_field import build_bottleneck
+        model = build_bottleneck(bottleneck_architecture, family, config).to(resolved_device)
         ambient_dim = bottleneck_architecture.ambient_dim
     else:
         field_architecture = NeuralFieldConfig.from_mapping(payload["architecture"])
@@ -2746,6 +2927,7 @@ def load_checkpoint(
         ambient_dim = field_architecture.ambient_dim
     model.load_state_dict(payload["model_state"], strict=True)
     model._lid_family = family
+    model._lid_noise_pairing = config.noise_pairing
     if family == "vp_diffusion":
         model._lid_vp_schedule = _vp_schedule_from_training_config(config)
     if family == "independent_affine_flow":
@@ -3704,7 +3886,7 @@ def predict_lid(
     *,
     family: str | None = None,
     readout: Literal["full", "response", "fm_to_score", "fixed_likelihood"] = "full",
-    divergence_backend: Literal["exact", "hutchinson"] = "hutchinson",
+    divergence_backend: Literal["exact", "hutchinson", "active_exact"] = "hutchinson",
     trace_probes: int = 16,
     trace_seed: int = 0,
     batch_size: int = 256,
@@ -3714,6 +3896,31 @@ def predict_lid(
     model, canonical_family, mean, normalization_scale = _model_and_context(
         model_or_result, family
     )
+    if divergence_backend == 'active_exact':
+        from models.preconditioned_field import covariance_span_value_and_trace,CovariancePreconditionedField
+        if not isinstance(model,CovariancePreconditionedField):
+            raise TypeError('active_exact requires the checkpointed covariance-span field')
+        allowed={'full','response','fm_to_score'} if canonical_family=='independent_affine_flow' else {'full','response'}
+        if canonical_family in {'vp_diffusion','gaussian_diffusion'}:allowed={'full'}
+        if readout not in allowed:raise ValueError('unsupported native-family readout')
+        if not math.isfinite(scale) or scale<=0 or batch_size<=0:raise ValueError('positive scale and batch_size required')
+        noise_ratio=float(scale)
+        if canonical_family=='rectified_flow':
+            if scale>=1:raise ValueError('rectified-flow native time must be in (0,1)')
+            noise_ratio=(1-scale)/scale
+        elif canonical_family=='brownian_schrodinger_bridge':
+            noise_ratio=math.sqrt(scale*model.training_config.bridge_diffusivity)
+        query_cpu=_flat_finite_data(query,name='query')
+        if query_cpu.shape[1]!=model.config.ambient_dim:raise ValueError('query ambient dimension differs')
+        normalized=(query_cpu-mean.reshape(1,-1))/normalization_scale
+        parameter=next(model.parameters());model.eval();predictions=[]
+        for start in range(0,len(normalized),batch_size):
+            batch=normalized[start:start+batch_size].to(device=parameter.device,dtype=parameter.dtype)
+            value,response=covariance_span_value_and_trace(model,batch,noise_ratio)
+            value,response=value.double(),response.double()
+            full=response+((value-batch.double())/noise_ratio).square().sum(1)
+            predictions.append((response if readout=='response' else full).cpu())
+        return np.asarray(torch.cat(predictions).numpy(),dtype=np.float64)
     if canonical_family == "scale_conditioned_normalizing_flow":
         if not isinstance(model, ScaleConditionedRealNVP):
             raise TypeError("fixed-likelihood readout requires ScaleConditionedRealNVP")
