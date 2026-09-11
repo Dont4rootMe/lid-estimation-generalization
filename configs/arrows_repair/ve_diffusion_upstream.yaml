@@ -1,0 +1,82 @@
+variant_id: ve_diffusion
+model:
+  schema_version: 2
+  readout: full
+  primary_readout: full
+  selection_prefer: smaller
+  derivative_backend: hutchinson
+  trace_probes: 16
+  native_coordinate: ve_sigma
+  lambda_support:
+  - 0.00390625
+  - 64.0
+  capacity_policy:
+    id: shared_bottleneck_parameter_match_v1
+    field_hidden_sizes:
+    - 1024
+    - 512
+    - 256
+    - 256
+    - 128
+    - 128
+    time_embedding_dim: 128
+    nf_width_multiple: 32
+    nf_max_relative_gap: 0.1
+  training:
+    seed: 0
+    device: cuda
+    epochs: 100
+    training_mode: fixed_steps_v1
+    steps: 128000
+    warmup_steps: 0
+    validation_interval_steps: 500
+    batch_size: 256
+    learning_rate: 0.0002
+    weight_decay: 1.0e-06
+    hidden_dim: 1024
+    depth: null
+    time_embedding_dim: 128
+    validation_interval: 1
+    early_stopping_patience: null
+    gradient_clip_norm: 1.0
+    num_workers: 4
+    deterministic: true
+    fourier_features: 32
+    max_condition_frequency: 100.0
+    dropout: 0.0
+    normalize: true
+    normalization_epsilon: 1.0e-08
+    field_hidden_sizes:
+    - 1024
+    - 512
+    - 256
+    - 256
+    - 128
+    - 128
+    sigma_min: 0.00390625
+    sigma_max: 64.0
+  scales:
+  - 0.015625
+  - 0.02209708691207961
+  - 0.03125
+  - 0.04419417382415922
+  - 0.0625
+  - 0.08838834764831845
+  - 0.125
+  - 0.1767766952966369
+  - 0.25
+  - 0.3535533905932738
+  - 0.5
+  - 0.7071067811865476
+  - 1.0
+  - 1.4142135623730951
+  - 2.0
+  - 2.8284271247461903
+  - 4.0
+  - 5.656854249492381
+  - 8.0
+  - 11.313708498984761
+  - 16.0
+  id: ve_diffusion
+  name: ve_x0_denoiser_shared_bottleneck
+  family: diffusion

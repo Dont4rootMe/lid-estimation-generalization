@@ -59,6 +59,8 @@ from models.neural_fields import (
     hutchinson_divergence,
     rademacher_probes_like,
 )
+from models.gaussian_fields import NativeGaussianBottleneck
+from models.image_gaussian_fields import ImageFieldConfig, NativeGaussianImageField
 from models.normalizing_flow import (
     NF_DENSITY_CONTRACT,
     ConditionalFlowConfig,
@@ -85,6 +87,8 @@ from models.schrodinger_bridge import (
 )
 from models.vp_baseline import (
     ConditionedBottleneckMLP,
+    PreconditionedLogNoiseMLP,
+    PreconditionedLogNoiseNoInputSkipMLP,
     VPBottleneckConfig,
     VPBottleneckMLP,
     VPSchedule,
@@ -107,9 +111,14 @@ LEGACY_CHECKPOINT_SCHEMA_VERSION = 1
 FIXED_STEP_CHECKPOINT_SCHEMA_VERSION = 3
 TRAINING_PROGRESS_SCHEMA_VERSION = 1
 FIXED_STEP_PROGRESS_SCHEMA_VERSION = 2
+IMAGE_PRECONDITIONING_MODES = frozenset({
+    "unit_rms_gaussian_image_v1", "unit_rms_pixel_mixture_image_v1",
+    "unit_rms_gaussian_tail_image_v1",
+})
 TRAINING_PROGRESS_INTERVAL_EPOCHS = 20
 TrainableModel = (
     ScaleConditionedNeuralField | ScaleConditionedRealNVP | ConditionedBottleneckMLP
+    | NativeGaussianImageField
 )
 
 
@@ -187,11 +196,27 @@ class TrainingConfig:
     terminal_learning_rate_ratio: float = 0.01
     ema_decay: float | None = None
     ema_start_step: int = 0
+    optimizer_schedule_policy: str = 'native_v1'
+    posterior_preconditioning: str | None = None
+    native_preconditioning: str | None = None
+    image_shape: tuple[int, int, int] | None = None
+    image_width: int = 32
+    image_training_bf16: bool = False
+    native_noise_pairing: str = "independent_v1"
+    image_layout: str = 'nhwc'
     vp_hidden_sizes: tuple[int, ...] | None = None
     vp_beta_min: float | None = None
     vp_beta_max: float | None = None
 
     def __post_init__(self) -> None:
+        if self.optimizer_schedule_policy not in {'native_v1', 'shared_terminal_v1'}:
+            raise ValueError('unknown optimizer schedule policy')
+        if self.optimizer_schedule_policy != 'native_v1' and (
+            self.training_mode != 'fixed_steps_v1' or not self.terminal_decay_steps or self.warmup_steps != 0
+        ):
+            raise ValueError('shared optimizer policy requires explicit terminal decay and zero warmup')
+        if self.field_preconditioning is not None and (self.native_preconditioning is not None or self.posterior_preconditioning is not None):
+            raise ValueError('choose one field preconditioning interface')
         if self.training_target not in {'sample_v1','empirical_posterior_v1'}:
             raise ValueError('unknown training target estimator')
         if self.training_target != 'sample_v1' and (self.training_mode!='fixed_steps_v1' or self.num_coupling_layers is not None):
@@ -206,7 +231,7 @@ class TrainingConfig:
             raise ValueError('residual width applies only to the spectral residual backbone')
         if self.field_residual_scaling not in {'noise_v1', 'data_v1', 'gaussian_tail_v1'}:
             raise ValueError('unknown residual scaling')
-        if self.field_residual_scaling != 'noise_v1' and self.field_preconditioning != 'covariance_span_v1':
+        if self.field_residual_scaling != 'noise_v1' and self.field_preconditioning not in {'covariance_span_v1','image_gaussian_v1'}:
             raise ValueError('data residual scaling requires covariance-span fields')
         if self.field_residual_scaling != 'noise_v1' and self.num_coupling_layers is not None:
             raise ValueError('NF has no field residual scaling')
@@ -229,19 +254,59 @@ class TrainingConfig:
             raise ValueError('unknown noise pairing')
         if self.noise_pairing == 'antithetic_v1' and self.batch_size % 2:
             raise ValueError('antithetic training requires even batch_size')
-        if self.field_backbone not in {'bottleneck_v1','spectral_residual_v1'}:
+        if self.field_backbone not in {'bottleneck_v1','spectral_residual_v1','image_unet_v1'}:
             raise ValueError('unknown field backbone')
-        if self.field_backbone != 'bottleneck_v1' and self.field_preconditioning != 'covariance_span_v1':
+        if self.field_backbone == 'spectral_residual_v1' and self.field_preconditioning != 'covariance_span_v1':
             raise ValueError('spectral residual backbone requires covariance_span_v1')
+        if self.field_backbone == 'image_unet_v1' and self.field_preconditioning != 'image_gaussian_v1':
+            raise ValueError('image backbone requires image_gaussian_v1')
         if self.field_projection_rank is not None:
             if self.field_preconditioning != 'covariance_span_v1' or isinstance(self.field_projection_rank, bool) or not isinstance(self.field_projection_rank, int) or self.field_projection_rank <= 0:
                 raise ValueError('projection rank requires covariance_span_v1 and a positive integer')
         if self.field_preconditioning is not None:
-            if self.field_preconditioning not in {'gaussian_v1', 'gaussian_no_input_skip_v1', 'covariance_span_v1'}:
+            if self.field_preconditioning not in {'gaussian_v1', 'gaussian_no_input_skip_v1', 'covariance_span_v1','image_gaussian_v1'}:
                 raise ValueError('unknown field_preconditioning')
-            is_covariance_nf = self.field_preconditioning == 'covariance_span_v1' and self.num_coupling_layers is not None
+            is_covariance_nf = self.field_preconditioning in {'covariance_span_v1','image_gaussian_v1'} and self.num_coupling_layers is not None
             if not self.normalize or (self.field_hidden_sizes is None and self.vp_hidden_sizes is None and not is_covariance_nf):
                 raise ValueError('field preconditioning requires a normalized bottleneck field')
+        if self.native_noise_pairing not in {"independent_v1", "antithetic_v1"}:
+            raise ValueError("unknown native_noise_pairing")
+        if self.native_noise_pairing == "antithetic_v1":
+            if self.native_preconditioning is None or self.batch_size % 2:
+                raise ValueError("antithetic native noise requires preconditioning and an even batch")
+        if self.native_preconditioning is not None:
+            if self.native_preconditioning not in ({"unit_rms_gaussian_no_input_skip_v1"} | IMAGE_PRECONDITIONING_MODES):
+                raise ValueError("unknown native_preconditioning")
+            if self.posterior_preconditioning is not None or not self.normalize:
+                raise ValueError("native preconditioning requires normalization and no posterior override")
+            if self.native_preconditioning == "unit_rms_gaussian_no_input_skip_v1" and self.field_hidden_sizes is None:
+                raise ValueError("native bottleneck preconditioning requires field_hidden_sizes")
+        if self.image_layout not in {'nhwc','nchw'}:
+            raise ValueError('unknown image layout')
+        if self.field_preconditioning == 'image_gaussian_v1':
+            if self.image_shape is None or self.field_backbone != 'image_unet_v1' or self.field_projection_rank is not None:
+                raise ValueError('shared image fields require shape, image backbone, and no covariance projection')
+            ImageFieldConfig(math.prod(self.image_shape),tuple(self.image_shape),self.image_width,self.image_training_bf16)
+        elif self.native_preconditioning in IMAGE_PRECONDITIONING_MODES:
+            if self.field_hidden_sizes is not None or self.image_shape is None:
+                raise ValueError("native image field requires image_shape and no field_hidden_sizes")
+            ImageFieldConfig(math.prod(self.image_shape),tuple(self.image_shape),self.image_width,self.image_training_bf16)
+        elif self.image_shape is not None or self.image_width != 32 or self.image_training_bf16:
+            raise ValueError("inactive image settings require the native image field")
+        if self.posterior_preconditioning is not None:
+            if self.posterior_preconditioning not in {
+                "unit_rms_gaussian_v1", "unit_rms_gaussian_no_input_skip_v1"
+            }:
+                raise ValueError("unknown posterior_preconditioning")
+            if not (
+                self.flow_schedule == "log_noise"
+                and self.flow_parameterization == "posterior_mean"
+                and self.flow_conditioning == "log_noise_ratio"
+                and self.flow_loss_weighting == "posterior_bias_equivalent"
+                and self.field_hidden_sizes is not None
+                and self.normalize
+            ):
+                raise ValueError("posterior preconditioning requires normalized log-noise posterior bottleneck")
         integer_positive = {
             "epochs": self.epochs,
             "batch_size": self.batch_size,
@@ -435,6 +500,8 @@ class TrainingConfig:
             fields["vp_hidden_sizes"] = tuple(fields["vp_hidden_sizes"])
         if isinstance(fields.get("field_hidden_sizes"), list):
             fields["field_hidden_sizes"] = tuple(fields["field_hidden_sizes"])
+        if isinstance(fields.get("image_shape"), list):
+            fields["image_shape"] = tuple(fields["image_shape"])
         return cls(**fields)
 
 
@@ -623,6 +690,14 @@ def _bottleneck_architecture_from_training_config(
     )
 
 
+def _image_architecture(config: TrainingConfig,ambient_dim: int) -> ImageFieldConfig:
+    prior = ('pixel_spike_gaussian_v1' if config.native_preconditioning == 'unit_rms_pixel_mixture_image_v1'
+             else 'unit_gaussian')
+    return ImageFieldConfig(ambient_dim,tuple(config.image_shape),config.image_width,
+                            config.image_training_bf16,prior,
+                            2 if config.native_preconditioning=='unit_rms_gaussian_tail_image_v1' else 1)
+
+
 def field_parameter_count(
     family: str,
     config: TrainingConfig | Mapping[str, Any],
@@ -644,6 +719,12 @@ def field_parameter_count(
         with torch.device('meta'):
             model = build_bottleneck(architecture, canonical, resolved)
         return sum(parameter.numel() for parameter in model.parameters())
+    if resolved.native_preconditioning in IMAGE_PRECONDITIONING_MODES:
+        _model_contract(canonical,resolved)
+        architecture = _image_architecture(resolved,ambient_dim)
+        with torch.device("meta"):
+            image_model = NativeGaussianImageField(architecture,native_family=canonical)
+        return sum(parameter.numel() for parameter in image_model.parameters())
     if canonical == "vp_diffusion":
         architecture = _vp_architecture_from_training_config(
             resolved, ambient_dim=ambient_dim
@@ -775,6 +856,8 @@ def _model_contract(family: Family, config: TrainingConfig) -> dict[str, Any]:
         contract = {**contract, 'field_residual_width': config.field_residual_width}
     if config.noise_pairing != 'iid':
         contract = {**contract, 'noise_pairing': config.noise_pairing}
+    if config.optimizer_schedule_policy != 'native_v1':
+        contract = {**contract, 'optimizer_schedule_policy': config.optimizer_schedule_policy}
     if config.training_target != 'sample_v1':
         contract = {**contract,'training_target':config.training_target,
                     'training_target_start_step':config.training_target_start_step}
@@ -784,6 +867,11 @@ def _model_contract(family: Family, config: TrainingConfig) -> dict[str, Any]:
 def _native_model_contract(family: Family, config: TrainingConfig) -> dict[str, Any]:
     """Return the checkpointed scientific identity for one canonical family."""
 
+    if config.native_preconditioning is not None:
+        if family not in {"gaussian_diffusion", "rectified_flow"}:
+            raise ValueError("native preconditioning supports VE and rectified flow")
+        return {"schema_version": 1, "family": family,
+                "native_preconditioning": config.native_preconditioning}
     if family == "vp_diffusion":
         schedule = _vp_schedule_from_training_config(config)
         return {
@@ -810,7 +898,10 @@ def _native_model_contract(family: Family, config: TrainingConfig) -> dict[str, 
             tau_max=float(config.bridge_tau_max),
         )
     if family == "independent_affine_flow":
-        return affine_flow_contract(_affine_spec_from_training_config(config))
+        contract = affine_flow_contract(_affine_spec_from_training_config(config))
+        if config.posterior_preconditioning is not None:
+            contract = {**contract, "posterior_preconditioning": config.posterior_preconditioning}
+        return contract
     return {"schema_version": 1, "family": family}
 
 
@@ -1129,6 +1220,10 @@ def diffusion_ve_dsm_loss(
     )
     from models.noise_pairing import paired_corruption
     clean,sigma,noise=paired_corruption(model,clean,sigma,noise)
+    if isinstance(model, (NativeGaussianBottleneck, NativeGaussianImageField)):
+        if model.native_family != "gaussian_diffusion":
+            raise ValueError("VE loss requires a VE field")
+        return model.residual_loss(clean, sigma, noise)
     sigma_broadcast = sigma.reshape(-1, *([1] * (clean.ndim - 1)))
     perturbed = clean + sigma_broadcast * noise
     denoised = model(perturbed, sigma)
@@ -1160,6 +1255,10 @@ def rectified_flow_matching_loss(
     )
     from models.noise_pairing import paired_corruption
     data,time,noise=paired_corruption(model,data,time,noise)
+    if isinstance(model, (NativeGaussianBottleneck, NativeGaussianImageField)):
+        if model.native_family != "rectified_flow":
+            raise ValueError("rectified loss requires a rectified field")
+        return model.residual_loss(data, time, noise)
     time_broadcast = time.reshape(-1, *([1] * (data.ndim - 1)))
     interpolated = time_broadcast * data + (1.0 - time_broadcast) * noise
     target_velocity = data - noise
@@ -1202,6 +1301,15 @@ def independent_affine_flow_matching_loss(
         half=len(noise_ratio)//2
         state=replace(state,**{name:torch.cat((getattr(state,name)[:half],)*2)
                               for name in state.__dataclass_fields__})
+    if isinstance(model, PreconditionedLogNoiseMLP):
+        if not (
+            spec.schedule == "log_noise"
+            and spec.parameterization == "posterior_mean"
+            and spec.conditioning == "log_noise_ratio"
+            and spec.loss_weighting == "posterior_bias_equivalent"
+        ):
+            raise ValueError("preconditioned MLP received an incompatible affine spec")
+        return model.residual_loss(data, noise_ratio, noise)
     interpolated, target = affine_interpolant_and_target(
         data,
         noise,
@@ -1226,6 +1334,24 @@ def _objective(
     config: TrainingConfig,
     generator: torch.Generator,
 ) -> Tensor:
+    if config.native_noise_pairing == "antithetic_v1" and model.training:
+        # Same marginal native objective and the same number of network
+        # examples: half as many independent clean points, each with Z and -Z.
+        # Validation keeps its original independent samples and RNG sequence.
+        if family not in {"gaussian_diffusion", "rectified_flow"}:
+            raise ValueError("antithetic native noise supports VE and rectified flow")
+        if len(batch) % 2:
+            raise ValueError("antithetic training requires an even batch")
+        clean = batch[:len(batch) // 2]
+        if family == "gaussian_diffusion":
+            condition = _sample_log_uniform(len(clean), minimum=config.sigma_min,
+                maximum=config.sigma_max, data=clean, generator=generator)
+        else:
+            condition = config.time_min + (config.time_max-config.time_min)*torch.rand(
+                len(clean), device=clean.device, dtype=clean.dtype, generator=generator)
+        noise = torch.randn(clean.shape, device=clean.device, dtype=clean.dtype, generator=generator)
+        return model.residual_loss(torch.cat((clean,clean)),torch.cat((condition,condition)),
+                                   torch.cat((noise,-noise)))
     if family == "vp_diffusion":
         schedule = _vp_schedule_from_training_config(config)
         time = torch.rand(
@@ -2015,7 +2141,10 @@ def _load_fixed_training_progress(
         raise ValueError("fixed-step training progress config mismatch")
     if payload["model_contract"] != _model_contract(family, config):
         raise ValueError("fixed-step training progress model contract mismatch")
-    if payload["architecture"] != model.config.to_dict():
+    stored_architecture = payload["architecture"]
+    if isinstance(model, NativeGaussianImageField):
+        stored_architecture = ImageFieldConfig.from_mapping(stored_architecture).to_dict()
+    if stored_architecture != model.config.to_dict():
         raise ValueError("fixed-step training progress architecture mismatch")
     if payload["data_identity"] != dict(data_identity):
         raise ValueError("fixed-step training progress data identity mismatch")
@@ -2192,7 +2321,7 @@ def train_model(
         _vp_schedule_from_training_config(resolved_config)
         if resolved_config.training_mode != "fixed_steps_v1":
             raise ValueError("vp_diffusion requires training_mode=fixed_steps_v1")
-        if resolved_config.gradient_clip_norm is not None:
+        if resolved_config.gradient_clip_norm is not None and resolved_config.optimizer_schedule_policy == 'native_v1':
             raise ValueError("vp_diffusion requires gradient_clip_norm=null")
         if resolved_config.field_hidden_sizes is not None:
             raise ValueError(
@@ -2261,6 +2390,8 @@ def train_model(
         from models.preconditioned_field import training_covariance_span
         covariance_span = training_covariance_span(train_cpu, device,
             minimum_rank=2 if canonical_family == 'scale_conditioned_normalizing_flow' else 1)
+        if resolved_config.optimizer_schedule_policy == 'shared_terminal_v1' and resolved_config.field_projection_rank is not None and resolved_config.field_projection_rank != covariance_span[0].shape[1]:
+            raise ValueError('fitted covariance rank changed after capacity resolution')
         resolved_config = replace(resolved_config, field_projection_rank=covariance_span[0].shape[1])
     seed_everything(resolved_config.seed)
 
@@ -2289,6 +2420,11 @@ def train_model(
             )
             from models.preconditioned_field import build_bottleneck
             model = build_bottleneck(vp_architecture, canonical_family, resolved_config).to(device)
+        elif resolved_config.native_preconditioning in IMAGE_PRECONDITIONING_MODES:
+            image_architecture = _image_architecture(resolved_config,train_cpu.shape[1])
+            model = NativeGaussianImageField(image_architecture,native_family=canonical_family).to(device)
+            if image_architecture.prior == 'pixel_spike_gaussian_v1':
+                model.pixel_prior.fit(train_cpu,-mean/scale)
         elif resolved_config.field_hidden_sizes is not None:
             bottleneck_architecture = _bottleneck_architecture_from_training_config(
                 resolved_config,
@@ -2356,7 +2492,7 @@ def train_model(
             assert resolved_config.steps is not None
             assert resolved_config.warmup_steps is not None
             assert resolved_config.validation_interval_steps is not None
-            if resolved_config.terminal_decay_steps and canonical_family == 'vp_diffusion':
+            if resolved_config.terminal_decay_steps and canonical_family == 'vp_diffusion' and resolved_config.optimizer_schedule_policy == 'native_v1':
                 raise ValueError('native VP already uses cosine decay; terminal override is unsupported')
             scheduler = _FixedStepScheduler(
                 optimizer,
@@ -2896,6 +3032,13 @@ def load_checkpoint(
         from models.preconditioned_field import build_bottleneck
         model = build_bottleneck(vp_architecture, family, config).to(resolved_device)
         ambient_dim = vp_architecture.ambient_dim
+    elif config.native_preconditioning in IMAGE_PRECONDITIONING_MODES:
+        image_architecture = ImageFieldConfig.from_mapping(payload["architecture"])
+        declared_architecture = _image_architecture(config,image_architecture.ambient_dim)
+        if image_architecture != declared_architecture:
+            raise ValueError("checkpoint image architecture does not match training_config")
+        model = NativeGaussianImageField(image_architecture,native_family=family).to(resolved_device)
+        ambient_dim = image_architecture.ambient_dim
     elif config.field_hidden_sizes is not None:
         bottleneck_architecture = VPBottleneckConfig.from_mapping(
             payload["architecture"]

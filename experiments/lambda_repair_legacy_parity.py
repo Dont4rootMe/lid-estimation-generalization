@@ -3,6 +3,7 @@
 Invoke by absolute path with each checkout as cwd and PYTHONPATH=dependencies:.
 It intentionally resolves models from that working directory.
 """
+import yaml
 import argparse
 import json
 import os
@@ -20,7 +21,7 @@ def main():
     a.output.mkdir(exist_ok=False,parents=True)
     torch.set_num_threads(2);torch.backends.cuda.matmul.allow_tf32=False
     x=np.random.default_rng(19).normal(size=(96,30)).astype(np.float32)
-    contracts=json.loads(a.contracts.read_text())['model_contracts']
+    contracts=yaml.safe_load(a.contracts.read_text())['model_contracts']
     for contract in contracts:
         cfg=training.TrainingConfig.from_mapping(contract['model']['training'])
         cfg=replace(cfg,steps=20,warmup_steps=min(cfg.warmup_steps,5),validation_interval_steps=5,

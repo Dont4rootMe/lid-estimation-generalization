@@ -3,6 +3,7 @@
 This is a separate, reproducible entry point. Legacy campaign defaults and
 historical results remain source faithful. It never chooses a model using test.
 """
+import yaml
 import argparse
 import json
 import os
@@ -13,13 +14,13 @@ import sys
 
 def commands(args):
     root=Path(__file__).resolve().parents[1]
-    contracts=json.loads((root/'configs/lambda_repair/native_contracts.json').read_text())
+    contracts=yaml.safe_load((root/'configs/lambda_repair/native_contracts.yaml').read_text())
     variants={c['variant_id'] for c in contracts['model_contracts']}
     if args.variant not in variants:
         raise ValueError('unknown native variant: '+args.variant)
     if args.steps<8000 or args.steps%500:
         raise ValueError('use a budget >=8000 divisible by the500-step validation interval')
-    recipe=json.loads((root/'configs/lambda_repair/shared_recipe.json').read_text())
+    recipe=yaml.safe_load((root/'configs/lambda_repair/shared_recipe.yaml').read_text())
     nf=args.variant=='scale_conditioned_nf';vp=args.variant=='vp_diffusion'
     settings=recipe['nf' if nf else 'vector']
     train=[sys.executable,'-m','experiments.lambda_repair_train','--variant',args.variant,

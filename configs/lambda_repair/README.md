@@ -1,8 +1,8 @@
 # Applied native-model repair
 
 This patch targets upstream `6d041365b9bc27de5054293be6c1318766ddf911`.
-`shared_recipe.json` is the common rerun recipe. The original eleven model
-contracts are retained verbatim in `native_contracts.json`; model families keep
+`shared_recipe.yaml` is the common rerun recipe. The original eleven model
+contracts are retained verbatim in `native_contracts.yaml`; model families keep
 their own targets, time/noise sampling, optimizer, batch size and normalization.
 The normalizing flow remains an invertible conditional RealNVP with a complete
 likelihood determinant. Legacy entry points retain their original defaults.

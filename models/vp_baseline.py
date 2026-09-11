@@ -189,6 +189,62 @@ class ConditionedBottleneckMLP(nn.Module):
         return state
 
 
+class PreconditionedLogNoiseMLP(ConditionedBottleneckMLP):
+    """Same MLP parameters, with an analytic unit-RMS Gaussian posterior skip.
+
+    For log(lambda) conditioning, q(y) = y/(1+lambda**2) +
+    lambda/sqrt(1+lambda**2) * F(y/sqrt(1+lambda**2), log(lambda)).
+    Only the residual output layer is zero-initialized. State-dict keys remain
+    compatible with the backbone; the training contract identifies this mode.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.config.condition_transform != "linear":
+            raise ValueError("posterior preconditioning requires log-lambda input")
+        nn.init.zeros_(self.decoder[-1].weight)
+        nn.init.zeros_(self.decoder[-1].bias)
+
+    def residual(self, inputs: Tensor, log_lambda: Tensor) -> Tensor:
+        return super().forward(inputs, log_lambda)
+
+    def forward(self, inputs: Tensor, log_lambda: Tensor) -> Tensor:
+        condition = torch.as_tensor(
+            log_lambda, device=inputs.device, dtype=inputs.dtype
+        )
+        if condition.ndim == 0:
+            condition = condition.expand(inputs.shape[0])
+        scale = condition.exp()[:, None]
+        inverse = (1 + scale.square()).rsqrt()
+        residual = self.residual(inputs * inverse, condition)
+        return inverse.square() * inputs + scale * inverse * residual
+
+    def residual_loss(self, clean: Tensor, scale: Tensor, noise: Tensor) -> Tensor:
+        """Algebraically identical to mean((q(clean+scale*noise)-clean)/scale)^2.
+
+        Evaluate without subtracting nearly equal clean/posterior vectors at
+        small scale. No change to scale sampling or the objective's weights.
+        """
+        column = scale[:, None]
+        inverse = (1 + column.square()).rsqrt()
+        predicted = self.residual((clean + column * noise) * inverse, scale.log())
+        target = (column * clean - noise) * inverse
+        return ((predicted - target).square() * inverse.square()).mean()
+
+
+class PreconditionedLogNoiseNoInputSkipMLP(PreconditionedLogNoiseMLP):
+    """A targeted ablation: remove only the raw-coordinate final-layer skip.
+
+    Coordinates still enter the encoder. Time features and all hidden skips
+    remain. The unused D-by-D block has identically zero gradient and stays
+    zero; effective learnable capacity is reduced by D**2 parameters.
+    """
+
+    def _final_skip(self, skip: Tensor) -> Tensor:
+        return torch.cat((torch.zeros_like(skip[:, :self.ambient_dim]),
+                          skip[:, self.ambient_dim:]), dim=1)
+
+
 class VPBottleneckMLP(ConditionedBottleneckMLP):
     """VP specialization of the shared bottleneck with native-time input."""
 

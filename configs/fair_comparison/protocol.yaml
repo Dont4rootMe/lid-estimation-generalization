@@ -1,0 +1,51 @@
+schema_version: 1
+id: dataset_routed_native_comparison_v1
+scope: all 39 campaign representations and 11 native interfaces
+architecture_rule: dataset representation only; never selected from LID scores
+vector_data:
+  preconditioning: covariance_span_v1
+  backbone: spectral_residual_v1
+  width: 512
+  residual_scaling: noise_v1
+image_data:
+  preconditioning: image_gaussian_v1
+  backbone: image_unet_v1
+  width: 32
+  residual_scaling: gaussian_tail_v1
+nf:
+  architecture: invertible RealNVP; spatial U-Net conditioners on images
+  capacity_target: actual common vector backbone on the same representation
+  maximum_relative_parameter_gap: 0.1
+  width_selection: closest parameter count; no data labels or validation score
+  max_condition_frequency: 1.0
+training:
+  seed: 0
+  steps: 128000
+  batch_size: 256
+  learning_rate: 0.0002
+  weight_decay: 1.0e-06
+  gradient_clip_norm: 1.0
+  validation_interval_steps: 500
+  warmup_steps: 0
+  noise_pairing: antithetic_v1
+  terminal_decay_steps: 8000
+  terminal_learning_rate_ratio: 0.01
+  ema_decay: 0.999
+  optimizer_schedule_policy: shared_terminal_v1
+  precision: float32; TF32 disabled
+  native_differences: targets, loss weights and noise/time sampling remain the declared
+    method definitions
+selection:
+  weights: lowest native holdout loss, same raw/EMA candidates and validation intervals
+  known_lid_scale: source-train holdout bounded-v2 supervised MAE
+  unknown_lid_scale: source-train reference mean Kneedle; freeze and transfer to dependent
+    cells
+  image_trace_probes: 64
+  vector_trace: exact learned-span Jacobian for every vector interface
+  nf_primary: OLS5
+  nf_validity: exact log-scale derivative, separately reported
+  refinement: none for any model
+  test: all original test queries, only after immutable checkpoint/scale receipts
+budget_interpretation: equal updates and network examples; parameters matched within
+  10 percent for NF, measured elapsed time recorded; FLOPs are not claimed equal
+old_results: diagnostics only; aggregation requires fresh matching protocol receipts

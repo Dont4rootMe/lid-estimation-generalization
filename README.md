@@ -5,9 +5,19 @@ Local Dimension: Diffusions, Flow Matching, Bridges, and Calibrated Normalizing
 Flows** и набора **Why We Need New Benchmarks for Local Intrinsic Dimension
 Estimation** (ICLR 2026).
 
+## Общий протокол нового сравнения
+
+Для повторного сравнения всех методов используйте
+[общий запуск](configs/fair_comparison/README.md):
+`python -m experiments.fair_campaign`. Архитектура выбирается по представлению
+данных, все векторные методы получают одинаковый backbone, а NF — обратимую
+архитектуру с сопоставимым числом параметров. Общие правила обучения и выбора
+зафиксированы в `configs/fair_comparison/protocol.yaml`. Старые repair-прогоны
+и исторические таблицы не смешиваются с результатами этого протокола.
+
 ## Запуск через Hydra
 
-Все конфигурации экспериментов — YAML и компонуются только Hydra. TOML остаётся
+Конфигурации исторических кампаний ниже — YAML и компонуются Hydra. TOML остаётся
 только там, где это формат Python tooling (`pyproject.toml` и `uv.lock`), а не
 экспериментальная конфигурация.
 

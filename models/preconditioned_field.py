@@ -81,10 +81,22 @@ class PreconditionedField(VPBottleneckMLP):
 
 
 def build_bottleneck(architecture, family, config):
+    if config.field_preconditioning == 'image_gaussian_v1':
+        from models.shared_image_field import SharedImagePosteriorField
+        return SharedImagePosteriorField(architecture,family,config)
     if config.field_preconditioning == 'covariance_span_v1':
         return CovariancePreconditionedField(architecture, family, config)
     if config.field_preconditioning is not None:
         return PreconditionedField(architecture, family, config)
+    if config.native_preconditioning == 'unit_rms_gaussian_no_input_skip_v1':
+        from models.gaussian_fields import NativeGaussianBottleneck
+        return NativeGaussianBottleneck(architecture.ambient_dim,architecture.hidden_sizes,
+            architecture.time_dim,condition_transform=architecture.condition_transform,native_family=family)
+    if config.posterior_preconditioning is not None:
+        from models.vp_baseline import PreconditionedLogNoiseMLP,PreconditionedLogNoiseNoInputSkipMLP
+        cls=PreconditionedLogNoiseMLP if config.posterior_preconditioning=='unit_rms_gaussian_v1' else PreconditionedLogNoiseNoInputSkipMLP
+        return cls(architecture.ambient_dim,architecture.hidden_sizes,architecture.time_dim,
+            condition_transform=architecture.condition_transform)
     if family == 'vp_diffusion':
         return VPBottleneckMLP(architecture.ambient_dim, architecture.hidden_sizes, architecture.time_dim)
     return ConditionedBottleneckMLP(architecture.ambient_dim, architecture.hidden_sizes,

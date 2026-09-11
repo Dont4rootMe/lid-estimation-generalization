@@ -1,4 +1,5 @@
 """Run a source-native fixed-budget pair and preserve its training state."""
+import yaml
 import argparse
 from dataclasses import replace
 import hashlib
@@ -12,7 +13,7 @@ import numpy as np
 import torch
 from models import training
 
-CONTRACTS=Path(__file__).resolve().parents[1]/'configs/lambda_repair/native_contracts.json'
+CONTRACTS=Path(__file__).resolve().parents[1]/'configs/lambda_repair/native_contracts.yaml'
 
 
 def extend_constant_progress(payload,config,family):
@@ -141,7 +142,7 @@ def main():
     torch.set_num_threads(2)
     torch.backends.cuda.matmul.allow_tf32=False
     torch.backends.cudnn.allow_tf32=False
-    campaign=json.loads(CONTRACTS.read_text())
+    campaign=yaml.safe_load(CONTRACTS.read_text())
     contract=next(x for x in campaign['model_contracts'] if x['variant_id']==args.variant)
     config=training.TrainingConfig.from_mapping(contract['model']['training'])
     config=replace(config,steps=args.steps,validation_interval_steps=min(500,args.steps),num_workers=0)

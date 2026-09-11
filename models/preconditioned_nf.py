@@ -52,6 +52,9 @@ class CovariancePreconditionedNF(ScaleConditionedRealNVP):
 
 
 def build_nf(architecture, config):
+    if config.field_preconditioning == 'image_gaussian_v1':
+        from models.image_normalizing_flow import ImageConditionedRealNVP
+        return ImageConditionedRealNVP(architecture,config)
     if config.field_preconditioning == 'covariance_span_v1':
         return CovariancePreconditionedNF(architecture, config)
     if config.field_preconditioning is not None:

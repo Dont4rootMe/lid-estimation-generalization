@@ -1,3 +1,4 @@
+import yaml
 import copy
 from dataclasses import replace
 import json
@@ -12,7 +13,7 @@ from models.preconditioned_field import build_bottleneck
 from models.vp_baseline import ConditionedBottleneckMLP
 from experiments.global_campaign_v2 import _prediction_curve
 
-CONTRACTS = json.loads((Path(__file__).resolve().parents[2]/'configs/lambda_repair/native_contracts.json').read_text())['model_contracts']
+CONTRACTS = yaml.safe_load((Path(__file__).resolve().parents[2]/'configs/lambda_repair/native_contracts.yaml').read_text())['model_contracts']
 CONTRACTS = [c for c in CONTRACTS if c['variant_id']!='scale_conditioned_nf']
 
 

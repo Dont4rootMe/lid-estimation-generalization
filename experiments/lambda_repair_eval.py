@@ -3,6 +3,7 @@
 Default is source-train holdout only. Test predictions require --test and are
 computed only after a selection receipt has been written.
 """
+import yaml
 import argparse
 import csv
 import json
@@ -21,7 +22,7 @@ from models.neural_fields import rademacher_probes_like
 from experiments.global_campaign_v2 import select_supervised_bounded, initial_supervised_lambdas, _prediction_curve
 from datasets.registry import load_registry
 
-CONTRACTS=Path(__file__).resolve().parents[1]/'configs/lambda_repair/native_contracts.json'
+CONTRACTS=Path(__file__).resolve().parents[1]/'configs/lambda_repair/native_contracts.yaml'
 SCALES=2.**(np.arange(-16,13)/2)
 
 
@@ -152,7 +153,7 @@ def main():
     # Verify the canonical formula against source interfaces using exact traces
     # on two queries at one non-singular scale (the 784-coordinate audit is explicit).
     if not (dest/'source_parity.json').exists():
-        contracts=json.loads(CONTRACTS.read_text())['model_contracts']
+        contracts=yaml.safe_load(CONTRACTS.read_text())['model_contracts']
         spec=next(c['model'] for c in contracts if c['variant_id']==manifest['variant']).copy()
         spec['derivative_backend']='active_exact' if args.probes==0 else 'hutchinson';spec['trace_probes']=args.probes
         actual_sample=_prediction_curve(predict_lid,result,raw[:args.batch_size],np.array([scale]),model=spec,seed=0,

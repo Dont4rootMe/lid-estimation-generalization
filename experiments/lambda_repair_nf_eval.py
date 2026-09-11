@@ -1,4 +1,5 @@
 """Source OLS5 likelihood readout; holdout selection precedes test evaluation."""
+import yaml
 import argparse,json
 from pathlib import Path
 import numpy as np
@@ -17,7 +18,7 @@ def main():
     a=p.parse_args();torch.set_num_threads(2);torch.backends.cuda.matmul.allow_tf32=False
     assert (a.run/'complete.json').exists()
     manifest=json.loads((a.run/'manifest.json').read_text());result=load_checkpoint(a.run/'model.pt',device='cuda')
-    contracts=json.loads(CONTRACTS.read_text())['model_contracts']
+    contracts=yaml.safe_load(CONTRACTS.read_text())['model_contracts']
     spec=next(c['model'] for c in contracts if c['variant_id']=='scale_conditioned_nf')
     registry=load_registry(Path(__file__).resolve().parents[1]/'configs/datasets/registry/paper_benchmarks.yaml',validate_official_coverage=False)
     d=float(registry[manifest['dataset']].expected_lid);folder=a.data/manifest['dataset'];rep=manifest['representation']

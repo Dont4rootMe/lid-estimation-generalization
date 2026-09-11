@@ -1,3 +1,4 @@
+import yaml
 from dataclasses import replace
 from pathlib import Path
 import copy,json
@@ -33,7 +34,7 @@ def test_teacher_zero_noise_and_validation_bypass():
     assert denoising_target(model,x,1.,fallback) is fallback
 
 
-CONTRACTS=json.loads((Path(__file__).resolve().parents[2]/'configs/lambda_repair/native_contracts.json').read_text())['model_contracts']
+CONTRACTS=yaml.safe_load((Path(__file__).resolve().parents[2]/'configs/lambda_repair/native_contracts.yaml').read_text())['model_contracts']
 CONTRACTS=[c for c in CONTRACTS if c['variant_id']!='scale_conditioned_nf']
 
 
