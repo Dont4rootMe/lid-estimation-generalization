@@ -1,0 +1,162 @@
+[
+  {
+    "cell": {
+      "dataset": "e1_spiral_pca",
+      "representation": "dataset"
+    },
+    "input_record": {
+      "source_files": {
+        "test/coefficients.npy": {
+          "path": "e1_spiral_pca/test/coefficients.npy",
+          "sha256": "14cb7b8f79eceb1ecd08640afa76430a0d7c75638c5cca50e2145ee07fec7492",
+          "size_bytes": 240128
+        },
+        "test/dataset.npy": {
+          "path": "e1_spiral_pca/test/dataset.npy",
+          "sha256": "77af2881652ead2cbecc9ed4fee6441117e17851970df483c455fd9d81c5beef",
+          "size_bytes": 6272128
+        },
+        "test/lid.npy": {
+          "path": "e1_spiral_pca/test/lid.npy",
+          "sha256": "aa6194ba8c33d2e8270e6e20ca32031f3f05c1c2af596fa9ca56ebc1ee584a29",
+          "size_bytes": 8128
+        },
+        "train/coefficients.npy": {
+          "path": "e1_spiral_pca/train/coefficients.npy",
+          "sha256": "890ace0217bf530c5c5a5abce4a164ce25d52a8816538f4e5576ff6e4efa4bd0",
+          "size_bytes": 24000128
+        },
+        "train/dataset.npy": {
+          "path": "e1_spiral_pca/train/dataset.npy",
+          "sha256": "e506754766a5600dee688d116c5ff41fdd8953d63d8fe79d1ac6476dea1ebd83",
+          "size_bytes": 627200128
+        },
+        "train/lid.npy": {
+          "path": "e1_spiral_pca/train/lid.npy",
+          "sha256": "d0ddc08f38806125f57ecd0be141be297cc9d5c6221892ac62c790e2257af32f",
+          "size_bytes": 800128
+        }
+      }
+    }
+  },
+  {
+    "cell": {
+      "dataset": "e1_spiral_pca",
+      "representation": "coefficients"
+    },
+    "input_record": {
+      "source_files": {
+        "test/coefficients.npy": {
+          "path": "e1_spiral_pca/test/coefficients.npy",
+          "sha256": "14cb7b8f79eceb1ecd08640afa76430a0d7c75638c5cca50e2145ee07fec7492",
+          "size_bytes": 240128
+        },
+        "test/dataset.npy": {
+          "path": "e1_spiral_pca/test/dataset.npy",
+          "sha256": "77af2881652ead2cbecc9ed4fee6441117e17851970df483c455fd9d81c5beef",
+          "size_bytes": 6272128
+        },
+        "test/lid.npy": {
+          "path": "e1_spiral_pca/test/lid.npy",
+          "sha256": "aa6194ba8c33d2e8270e6e20ca32031f3f05c1c2af596fa9ca56ebc1ee584a29",
+          "size_bytes": 8128
+        },
+        "train/coefficients.npy": {
+          "path": "e1_spiral_pca/train/coefficients.npy",
+          "sha256": "890ace0217bf530c5c5a5abce4a164ce25d52a8816538f4e5576ff6e4efa4bd0",
+          "size_bytes": 24000128
+        },
+        "train/dataset.npy": {
+          "path": "e1_spiral_pca/train/dataset.npy",
+          "sha256": "e506754766a5600dee688d116c5ff41fdd8953d63d8fe79d1ac6476dea1ebd83",
+          "size_bytes": 627200128
+        },
+        "train/lid.npy": {
+          "path": "e1_spiral_pca/train/lid.npy",
+          "sha256": "d0ddc08f38806125f57ecd0be141be297cc9d5c6221892ac62c790e2257af32f",
+          "size_bytes": 800128
+        }
+      }
+    }
+  },
+  {
+    "cell": {
+      "dataset": "e6_exp_pca",
+      "representation": "dataset"
+    },
+    "input_record": {
+      "source_files": {
+        "test/coefficients.npy": {
+          "path": "e6_exp_pca/test/coefficients.npy",
+          "sha256": "4c1ec208d7ac3f4a16de700c9f9595b0f99ce96a02cd54773c8ba24e9f950c0a",
+          "size_bytes": 240128
+        },
+        "test/dataset.npy": {
+          "path": "e6_exp_pca/test/dataset.npy",
+          "sha256": "9330b23591bbcb9764b444511a1c0ac85b37181b5c983ceadd0bf21620f8ec8d",
+          "size_bytes": 6272128
+        },
+        "test/lid.npy": {
+          "path": "e6_exp_pca/test/lid.npy",
+          "sha256": "8717a74a28047e34c2fb9a1cddf4a26118d4de4aed1a777fa5e43b7d8500875b",
+          "size_bytes": 8128
+        },
+        "train/coefficients.npy": {
+          "path": "e6_exp_pca/train/coefficients.npy",
+          "sha256": "fa1e98e003d322300d97af83430f508e9256a043779a9a459b0a8bb896eb63f4",
+          "size_bytes": 24000128
+        },
+        "train/dataset.npy": {
+          "path": "e6_exp_pca/train/dataset.npy",
+          "sha256": "d62bc022dd61700788faaa27be3bc63ff84e67b36c02df4775948c536c2efb8d",
+          "size_bytes": 627200128
+        },
+        "train/lid.npy": {
+          "path": "e6_exp_pca/train/lid.npy",
+          "sha256": "d0ddc08f38806125f57ecd0be141be297cc9d5c6221892ac62c790e2257af32f",
+          "size_bytes": 800128
+        }
+      }
+    }
+  },
+  {
+    "cell": {
+      "dataset": "e6_exp_pca",
+      "representation": "coefficients"
+    },
+    "input_record": {
+      "source_files": {
+        "test/coefficients.npy": {
+          "path": "e6_exp_pca/test/coefficients.npy",
+          "sha256": "4c1ec208d7ac3f4a16de700c9f9595b0f99ce96a02cd54773c8ba24e9f950c0a",
+          "size_bytes": 240128
+        },
+        "test/dataset.npy": {
+          "path": "e6_exp_pca/test/dataset.npy",
+          "sha256": "9330b23591bbcb9764b444511a1c0ac85b37181b5c983ceadd0bf21620f8ec8d",
+          "size_bytes": 6272128
+        },
+        "test/lid.npy": {
+          "path": "e6_exp_pca/test/lid.npy",
+          "sha256": "8717a74a28047e34c2fb9a1cddf4a26118d4de4aed1a777fa5e43b7d8500875b",
+          "size_bytes": 8128
+        },
+        "train/coefficients.npy": {
+          "path": "e6_exp_pca/train/coefficients.npy",
+          "sha256": "fa1e98e003d322300d97af83430f508e9256a043779a9a459b0a8bb896eb63f4",
+          "size_bytes": 24000128
+        },
+        "train/dataset.npy": {
+          "path": "e6_exp_pca/train/dataset.npy",
+          "sha256": "d62bc022dd61700788faaa27be3bc63ff84e67b36c02df4775948c536c2efb8d",
+          "size_bytes": 627200128
+        },
+        "train/lid.npy": {
+          "path": "e6_exp_pca/train/lid.npy",
+          "sha256": "d0ddc08f38806125f57ecd0be141be297cc9d5c6221892ac62c790e2257af32f",
+          "size_bytes": 800128
+        }
+      }
+    }
+  }
+]

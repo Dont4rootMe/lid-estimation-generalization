@@ -1,0 +1,153 @@
+{
+  "status": "passed",
+  "rows": [
+    {
+      "check": "direct_kernel_identity",
+      "ambient": 30,
+      "df": 5,
+      "scale": 0.1,
+      "max_gap": 2.220446049250313e-16
+    },
+    {
+      "check": "direct_kernel_identity",
+      "ambient": 30,
+      "df": 5,
+      "scale": 1.0,
+      "max_gap": 4.440892098500626e-16
+    },
+    {
+      "check": "direct_kernel_identity",
+      "ambient": 30,
+      "df": 5,
+      "scale": 10.0,
+      "max_gap": 8.326672684688674e-17
+    },
+    {
+      "check": "direct_kernel_identity",
+      "ambient": 30,
+      "df": 128,
+      "scale": 0.1,
+      "max_gap": 6.661338147750939e-16
+    },
+    {
+      "check": "direct_kernel_identity",
+      "ambient": 30,
+      "df": 128,
+      "scale": 1.0,
+      "max_gap": 4.440892098500626e-16
+    },
+    {
+      "check": "direct_kernel_identity",
+      "ambient": 30,
+      "df": 128,
+      "scale": 10.0,
+      "max_gap": 2.0816681711721685e-17
+    },
+    {
+      "check": "direct_kernel_identity",
+      "ambient": 784,
+      "df": 5,
+      "scale": 0.1,
+      "max_gap": 2.220446049250313e-16
+    },
+    {
+      "check": "direct_kernel_identity",
+      "ambient": 784,
+      "df": 5,
+      "scale": 1.0,
+      "max_gap": 2.220446049250313e-16
+    },
+    {
+      "check": "direct_kernel_identity",
+      "ambient": 784,
+      "df": 5,
+      "scale": 10.0,
+      "max_gap": 2.220446049250313e-16
+    },
+    {
+      "check": "direct_kernel_identity",
+      "ambient": 784,
+      "df": 128,
+      "scale": 0.1,
+      "max_gap": 3.3306690738754696e-16
+    },
+    {
+      "check": "direct_kernel_identity",
+      "ambient": 784,
+      "df": 128,
+      "scale": 1.0,
+      "max_gap": 9.992007221626409e-16
+    },
+    {
+      "check": "direct_kernel_identity",
+      "ambient": 784,
+      "df": 128,
+      "scale": 10.0,
+      "max_gap": 4.163336342344337e-17
+    },
+    {
+      "check": "exp_analytic_angular_parity",
+      "u": 0.1,
+      "scale": 0.0002,
+      "max_gap": 1.9021606512126255e-10
+    },
+    {
+      "check": "exp_analytic_angular_parity",
+      "u": 0.1,
+      "scale": 0.01,
+      "max_gap": 2.2470914018413168e-13
+    },
+    {
+      "check": "exp_analytic_angular_parity",
+      "u": 0.1,
+      "scale": 0.2,
+      "max_gap": 1.1102230246251565e-14
+    },
+    {
+      "check": "exp_analytic_angular_parity",
+      "u": 3.0,
+      "scale": 0.0002,
+      "max_gap": 3.701483564100272e-13
+    },
+    {
+      "check": "exp_analytic_angular_parity",
+      "u": 3.0,
+      "scale": 0.01,
+      "max_gap": 7.771561172376096e-15
+    },
+    {
+      "check": "exp_analytic_angular_parity",
+      "u": 3.0,
+      "scale": 0.2,
+      "max_gap": 3.9968028886505635e-15
+    },
+    {
+      "check": "exp_analytic_angular_parity",
+      "u": 7.8,
+      "scale": 0.0002,
+      "max_gap": 2.8466118351389014e-13
+    },
+    {
+      "check": "exp_analytic_angular_parity",
+      "u": 7.8,
+      "scale": 0.01,
+      "max_gap": 1.4876988529977098e-14
+    },
+    {
+      "check": "exp_analytic_angular_parity",
+      "u": 7.8,
+      "scale": 0.2,
+      "max_gap": 3.6637359812630166e-15
+    },
+    {
+      "check": "continuous_finite_difference",
+      "dataset": "e6_exp_pca",
+      "max_gap": 6.002227603829624e-10
+    },
+    {
+      "check": "continuous_finite_difference",
+      "dataset": "e1_spiral_pca",
+      "max_gap": 8.693068487275468e-11
+    }
+  ]
+}
