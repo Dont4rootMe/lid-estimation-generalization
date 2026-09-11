@@ -102,6 +102,9 @@ def main():
         generation=json.loads((path.parent/'generation_quality/summary.json').read_text())
         assert quality['status']=='complete' and quality['checkpoint_sha256']==done['checkpoint_sha256']
         assert generation['status']=='complete' and generation['checkpoint_sha256']==done['checkpoint_sha256']
+        assert generation['samples_sha256']==file_sha(path.parent/'generation_quality/samples.npz')
+        for key in ('train_files_sha256','test_files_sha256','fit_indices_sha256','holdout_indices_sha256'):
+            assert generation[key]==done[key]
         assert done['source_sha256']==source and done['protocol_sha256']==rules
         assert done['kind']=='benchmark' and done['steps_completed']==128000
         assert done['test_n']==1000 and done['fit_n']==99000 and done['holdout_n']==1000

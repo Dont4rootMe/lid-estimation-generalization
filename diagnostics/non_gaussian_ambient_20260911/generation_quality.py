@@ -15,7 +15,7 @@ import numpy as np
 import torch
 
 from datasets.registry import load_split
-from experiments.fair_campaign import verify_measurements,inventory,dataset_spec,write_json
+from experiments.fair_campaign import verify_measurements,inventory,dataset_spec,write_json,file_sha
 from experiments import global_campaign as partition_tools
 from models import training
 from models.non_gaussian_fields import student_unit_rms
@@ -77,6 +77,7 @@ def evaluate(run):
     if (dest/'summary.json').exists():
         saved=json.loads((dest/'summary.json').read_text())
         assert saved['checkpoint_sha256']==done['checkpoint_sha256'] and saved['diagnostic_sha256']==source_hash
+        assert saved['samples_sha256']==file_sha(dest/'samples.npz')
         return
     if dest.exists():dest.rename(run/f'generation_partial_{time.time_ns()}')
     dest.mkdir();(dest/'source.py').write_bytes(SOURCE)
@@ -96,6 +97,9 @@ def evaluate(run):
     test_raw=np.asarray(test.features).reshape(len(test.features),-1)
     fit_raw=np.asarray(train.features).reshape(len(train.features),-1)[fit_ids]
     pop=BASE/'population'/f'{cell.dataset}__{cell.representation}'
+    geometry=json.loads((pop/'geometry.json').read_text())
+    assert geometry['normalization_sha256']==result.preprocessing_sha256
+    assert geometry['fit_indices_sha256']==done['fit_indices_sha256']
     with np.load(pop/'queries.npz') as z:renderer=z['renderer'];offset=z['offset']
     generator=torch.Generator(device='cuda').manual_seed(10522)
     initial=64*student_unit_rms((512,done['resolved']['geometry']['ambient_dim']),result.config.kernel_df,
@@ -122,11 +126,15 @@ def evaluate(run):
         refinement_max_per_coordinate_rms=float(paired.max()),
         refinement_gate_passed=bool(float(paired.square().mean().sqrt())<.005),
         seed=10522,metrics=score,seconds=time.time()-started,
+        train_files_sha256=done['train_files_sha256'],test_files_sha256=done['test_files_sha256'],
+        fit_indices_sha256=done['fit_indices_sha256'],holdout_indices_sha256=done['holdout_indices_sha256'],
+        evaluation_geometry_sha256={name:file_sha(pop/name) for name in ('geometry.json','queries.npz')},
         interpretation='sample diagnostics in the full ambient space; no test-based tuning, no empirical posterior or projection in the native trajectory')
     np.savez_compressed(dest/'samples.npz',raw=raw,normalized=samples.cpu().numpy(),
         end_state=endpoints.cpu().numpy(),initial=initial.cpu().numpy(),refined_first64=refined.cpu().numpy(),
         coordinates=coordinates,test_coordinates=test_coordinates,test_raw=test_raw,
         fit_neighbor_bank_ids=fit_ids,renderer=renderer,offset=offset)
+    record['samples_sha256']=file_sha(dest/'samples.npz')
     write_json(dest/'summary.json',record)
     print(json.dumps(dict(event='generation_complete',**record)),flush=True)
 
