@@ -11,6 +11,7 @@ import numpy as np
 
 from experiments.fair_campaign import verify_measurements,write_json,file_sha
 from experiments.fair_protocol import source_identity,digest,protocol
+from generation_geometry import make as generation_geometry
 
 ROOT=Path(__file__).resolve().parents[2]
 BASE=ROOT/'artifacts/non_gaussian_ambient_20260911'
@@ -317,6 +318,7 @@ def main():
             if j==0:ax.set_ylabel(('Exp' if '/e6_' in cell else 'Spiral')+'\n'+NAMES[method],fontsize=8)
     fig.suptitle('Full28x28 images: fixed real-data intensity range per dataset; no per-image contrast normalization',fontsize=10)
     fig.savefig(out/'generation_images.pdf');fig.savefig(out/'generation_images.png');plt.close(fig)
+    generation_geometry(BASE,out,latex_table)
     validation=dict(status=('passed' if all(r['float32_trace_precision_passed'] and r['generation_refinement_passed'] for r in tables) else 'numerical_precision_failed'),cells=8,distinct_tasks=2,representations=2,
         source_sha256=source,protocol_sha256=rules,all_common_group_checks=True,
         primary_receipts_replayed=True,all_practical_half_unit_checks=all(r['practical_half_unit_mae_check'] for r in tables),
