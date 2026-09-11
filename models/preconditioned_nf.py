@@ -51,12 +51,37 @@ class CovariancePreconditionedNF(ScaleConditionedRealNVP):
         return x, determinant
 
 
+class AmbientIsotropicNF(ScaleConditionedRealNVP):
+    """Full-dimensional invertible flow; only scalar schedule normalization."""
+    def _standard(self, epsilon, reference):
+        scale = torch.as_tensor(epsilon, dtype=reference.dtype, device=reference.device)
+        if scale.ndim == 0: scale = scale.expand(len(reference))
+        if scale.ndim == 2 and scale.shape[1] == 1: scale = scale[:, 0]
+        if scale.shape != (len(reference),) or not torch.isfinite(scale).all() or torch.any(scale <= 0):
+            raise ValueError('positive finite scalar or per-example epsilon required')
+        return torch.sqrt(1 + scale[:, None].square())
+
+    def encode(self, observations, epsilon):
+        x = self._flatten(observations)
+        standard = self._standard(epsilon, x)
+        latent, determinant = super().encode(x / standard, epsilon)
+        return latent, determinant - self.config.ambient_dim * standard[:, 0].log()
+
+    def decode(self, latent, epsilon):
+        z = self._flatten(latent)
+        standard = self._standard(epsilon, z)
+        x, determinant = super().decode(z, epsilon)
+        return x * standard, determinant + self.config.ambient_dim * standard[:, 0].log()
+
+
 def build_nf(architecture, config):
     if config.field_preconditioning == 'image_gaussian_v1':
         from models.image_normalizing_flow import ImageConditionedRealNVP
         return ImageConditionedRealNVP(architecture,config)
     if config.field_preconditioning == 'covariance_span_v1':
         return CovariancePreconditionedNF(architecture, config)
+    if config.field_preconditioning == 'ambient_isotropic_v1':
+        return AmbientIsotropicNF(architecture)
     if config.field_preconditioning is not None:
         raise ValueError('NF supports only covariance_span_v1')
     return ScaleConditionedRealNVP(architecture)

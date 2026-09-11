@@ -1,9 +1,9 @@
-schema_version: 5
-id: dataset_routed_native_comparison_non_gaussian_v5
+schema_version: 6
+id: full_ambient_native_comparison_non_gaussian_v6
 scope: all 39 campaign representations and 13 native interfaces
-architecture_rule: dataset representation only; never selected from LID scores
+architecture_rule: full supplied coordinates or full images; no fitted support projection
 vector_data:
-  preconditioning: covariance_span_v1
+  preconditioning: ambient_isotropic_v1
   backbone: spectral_residual_v1
   width: 512
   residual_scaling: noise_v1
@@ -41,7 +41,7 @@ selection:
   unknown_lid_scale: source-train reference mean Kneedle; freeze and transfer to dependent
     cells
   image_trace_probes: 64
-  vector_trace: exact learned-span Jacobian for every vector interface
+  vector_trace: exact full-ambient Jacobian for every vector interface
   nf_primary: OLS5
   nf_validity: exact log-scale derivative, separately reported
   refinement: none for any model
@@ -70,9 +70,9 @@ non_gaussian:
   kernel: multivariate Student-t with one chi-square denominator per sample
   sampling: native uniform t for t-Flow; truncated EDM lognormal sigma for PFGM++
   loss: native Student noise MSE; native EDM weighted denoising MSE, respectively
-  vector_conditioning: exact active Student conditional RMS scale given observed normal norm
+  vector_conditioning: all supplied coordinates and native RMS noise; no normal-complement substitution
   backbone: same parameter count and core as Gaussian fields on each dataset
   image_routing: common U-Net with all ambient coordinates retained
 budget_interpretation: equal updates and network examples; parameters matched within
   10 percent for NF, measured elapsed time recorded; FLOPs are not claimed equal
-old_results: diagnostics only; aggregation requires fresh matching protocol receipts
+old_results: projected runs excluded from paper including ablations; aggregation requires fresh matching protocol receipts

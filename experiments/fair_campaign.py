@@ -57,9 +57,9 @@ def matrix():
         geo=geometry(cell.dataset,cell.representation,spec.expected_shapes[cell.representation])
         for variant in native_contracts():
             rows.append(dict(cell_key=cell.key,cell=asdict(cell),variant=variant,
-                geometry=geo,architecture=('spatial RealNVP with U-Net conditioners' if geo['kind']=='image' else 'covariance RealNVP')
+                geometry=geo,architecture=('spatial RealNVP with U-Net conditioners' if geo['kind']=='image' else 'full-ambient RealNVP')
                     if variant=='scale_conditioned_nf' else ('shared U-Net' if geo['kind']=='image' else 'shared spectral residual'),
-                capacity_resolution='exact image parameter count' if geo['kind']=='image' else 'resolve from optimizer-fit covariance before training',
+                capacity_resolution='exact image parameter count' if geo['kind']=='image' else 'full supplied vector dimension; no fitted projection',
                 protocol_sha256=digest(protocol())))
     assert len(rows)==len(native_contracts())*len(v2.APPROVED_GLOBAL_CELL_KEYS)
     return dict(status='routing_audited',protocol=protocol(),rows=rows,
@@ -70,7 +70,7 @@ def matrix():
 def prediction_spec(variant,geo):
     spec=dict(native_contracts()[variant])
     if variant=='scale_conditioned_nf':return spec
-    spec['derivative_backend']='active_exact' if geo['kind']=='vector' else 'hutchinson'
+    spec['derivative_backend']='exact' if geo['kind']=='vector' else 'hutchinson'
     spec['trace_probes']=0 if geo['kind']=='vector' else protocol()['selection']['image_trace_probes']
     return spec
 
@@ -216,12 +216,7 @@ def run(args):
         if target is not None:target=target[:len(holdout)]
     torch.set_num_threads(2)
     torch.backends.cuda.matmul.allow_tf32=False;torch.backends.cudnn.allow_tf32=False
-    rank=None
-    if geo['kind']=='vector':
-        from models.preconditioned_field import training_covariance_span
-        tensor=training._flat_finite_data(fit,name='fit')
-        mean,rms,_,_=training._normalization(tensor,enabled=True,epsilon=1e-8)
-        rank=training_covariance_span((tensor-mean)/rms,args.device)[0].shape[1]
+    rank=geo['ambient_dim'] if geo['kind']=='vector' else None
     config,resolved=resolve(args.variant,geo,rank=rank,device=args.device,
         steps=args.steps,preflight=args.preflight)
     sources=source_identity()

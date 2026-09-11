@@ -1,5 +1,11 @@
 # Reproduce the non-Gaussian Exp / Spiral check
 
+HISTORICAL PROJECTED STUDY: reproduce this directory at commit fe8c94b. The
+author's14:43 override excludes these results from the paper, including
+ablations. The current unprojected work is in
+`diagnostics/non_gaussian_ambient_20260911/`; do not run this old campaign with
+the changed common v6 routing or use its scores to certify the new geometry.
+
 The common runner supports `t_flowmatching` and `pfgmpp` on every configured
 representation. This directory reproduces the bounded twelve-training study:
 two new models and a Gaussian posterior rectified-flow control on Exp/Spiral,

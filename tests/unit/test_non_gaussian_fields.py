@@ -1,5 +1,6 @@
 """Native-kernel, conditioning, trace and common-training validity gates."""
 import math
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -18,8 +19,11 @@ torch.set_num_threads(2)
 
 
 def vector_config(variant, ambient=7, rank=2):
-    return resolve(variant, geometry('fixture_pca','coefficients',[ambient]),rank=rank,
+    # Preserve checks of the legacy kernel-conditioning implementation without
+    # routing any new benchmark run through that excluded projected geometry.
+    config=resolve(variant, geometry('fixture_pca','coefficients',[ambient]),
         device='cpu',steps=8,preflight=True)[0]
+    return replace(config,field_preconditioning='covariance_span_v1',field_projection_rank=rank)
 
 
 def initialized(variant, *, image=False):
@@ -157,7 +161,7 @@ def test_training_and_reload_use_common_budget_selection_and_exact_parameter_cou
     else:
         raw=torch.randn(64,2)@torch.linalg.qr(torch.randn(7,2))[0].T
         geo=geometry('fixture_pca','coefficients',[7])
-        config,expected=resolve(variant,geo,rank=2,device='cpu',steps=8,preflight=True)
+        config,expected=resolve(variant,geo,device='cpu',steps=8,preflight=True)
     result=training.train_model(native_contracts()[variant]['family'],raw[:48],raw[48:],config,tmp_path/'model.pt')
     loaded=training.load_checkpoint(tmp_path/'model.pt',device='cpu')
     assert result.config.to_dict()==loaded.config.to_dict()
@@ -165,6 +169,7 @@ def test_training_and_reload_use_common_budget_selection_and_exact_parameter_cou
         torch.testing.assert_close(value,loaded.model.state_dict()[key],rtol=0,atol=0)
     assert result.metrics['steps_completed']==8
     assert parameter_count(result.model)==expected['reference_parameters']
-    a=training.predict_lid(result,raw[:5],.5,readout='response',divergence_backend='exact' if image else 'active_exact',trace_probes=0)
+    assert not hasattr(result.model,'basis')
+    a=training.predict_lid(result,raw[:5],.5,readout='response',divergence_backend='exact',trace_probes=0)
     b=training.predict_lid(loaded,raw[:5],.5,readout='response',divergence_backend='exact',trace_probes=0)
     np.testing.assert_allclose(a,b,atol=2e-5,rtol=2e-5)

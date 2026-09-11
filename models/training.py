@@ -236,7 +236,7 @@ class TrainingConfig:
             raise ValueError('residual width applies only to the spectral residual backbone')
         if self.field_residual_scaling not in {'noise_v1', 'data_v1', 'gaussian_tail_v1'}:
             raise ValueError('unknown residual scaling')
-        if self.field_residual_scaling != 'noise_v1' and self.field_preconditioning not in {'covariance_span_v1','image_gaussian_v1'}:
+        if self.field_residual_scaling != 'noise_v1' and self.field_preconditioning not in {'covariance_span_v1','ambient_isotropic_v1','image_gaussian_v1'}:
             raise ValueError('data residual scaling requires covariance-span fields')
         if self.field_residual_scaling != 'noise_v1' and self.num_coupling_layers is not None:
             raise ValueError('NF has no field residual scaling')
@@ -261,17 +261,17 @@ class TrainingConfig:
             raise ValueError('antithetic training requires even batch_size')
         if self.field_backbone not in {'bottleneck_v1','spectral_residual_v1','image_unet_v1'}:
             raise ValueError('unknown field backbone')
-        if self.field_backbone == 'spectral_residual_v1' and self.field_preconditioning != 'covariance_span_v1':
-            raise ValueError('spectral residual backbone requires covariance_span_v1')
+        if self.field_backbone == 'spectral_residual_v1' and self.field_preconditioning not in {'covariance_span_v1','ambient_isotropic_v1'}:
+            raise ValueError('spectral residual backbone requires an explicit vector field route')
         if self.field_backbone == 'image_unet_v1' and self.field_preconditioning != 'image_gaussian_v1':
             raise ValueError('image backbone requires image_gaussian_v1')
         if self.field_projection_rank is not None:
             if self.field_preconditioning != 'covariance_span_v1' or isinstance(self.field_projection_rank, bool) or not isinstance(self.field_projection_rank, int) or self.field_projection_rank <= 0:
                 raise ValueError('projection rank requires covariance_span_v1 and a positive integer')
         if self.field_preconditioning is not None:
-            if self.field_preconditioning not in {'gaussian_v1', 'gaussian_no_input_skip_v1', 'covariance_span_v1','image_gaussian_v1'}:
+            if self.field_preconditioning not in {'gaussian_v1', 'gaussian_no_input_skip_v1', 'covariance_span_v1','ambient_isotropic_v1','image_gaussian_v1'}:
                 raise ValueError('unknown field_preconditioning')
-            is_covariance_nf = self.field_preconditioning in {'covariance_span_v1','image_gaussian_v1'} and self.num_coupling_layers is not None
+            is_covariance_nf = self.field_preconditioning in {'covariance_span_v1','ambient_isotropic_v1','image_gaussian_v1'} and self.num_coupling_layers is not None
             if not self.normalize or (self.field_hidden_sizes is None and self.vp_hidden_sizes is None and not is_covariance_nf):
                 raise ValueError('field preconditioning requires a normalized bottleneck field')
         if self.native_noise_pairing not in {"independent_v1", "antithetic_v1"}:

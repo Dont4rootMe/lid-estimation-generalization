@@ -87,6 +87,9 @@ def build_bottleneck(architecture, family, config):
     if config.field_preconditioning == 'image_gaussian_v1':
         from models.shared_image_field import SharedImagePosteriorField
         return SharedImagePosteriorField(architecture,family,config)
+    if config.field_preconditioning == 'ambient_isotropic_v1':
+        from models.ambient_field import AmbientPosteriorField
+        return AmbientPosteriorField(architecture, family, config)
     if config.field_preconditioning == 'covariance_span_v1':
         return CovariancePreconditionedField(architecture, family, config)
     if config.field_preconditioning is not None:

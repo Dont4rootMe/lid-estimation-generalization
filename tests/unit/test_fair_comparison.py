@@ -32,12 +32,13 @@ def test_complete_matrix_has_no_family_specific_architecture_fallback():
     assert all('U-Net' in r['architecture'] for r in arrows)
 
 
-@pytest.mark.parametrize('rank',[2,3,6,20,30])
-def test_rank_resolved_nf_matches_actual_shared_vector_capacity(rank):
-    geo=geometry('e6_exp_pca','coefficients',[30]);rows=[]
+@pytest.mark.parametrize('dimension',[2,3,6,20,30])
+def test_full_ambient_nf_matches_actual_shared_vector_capacity(dimension):
+    geo=geometry('fixture','coefficients',[dimension]);rows=[]
     for variant in native_contracts():
-        cfg,receipt=resolve(variant,geo,rank=rank,device='cpu',steps=8,preflight=True)
-        with torch.device('meta'):model=build_model(variant,cfg,30)
+        cfg,receipt=resolve(variant,geo,device='cpu',steps=8,preflight=True)
+        with torch.device('meta'):model=build_model(variant,cfg,dimension)
+        assert cfg.field_projection_rank is None and not hasattr(model,'basis')
         assert parameter_count(model)==receipt['actual_parameters']
         rows.append(dict(variant=variant,resolved=receipt))
     assert audit_group(rows)
@@ -140,8 +141,12 @@ def test_reference_cannot_be_taken_from_another_method_or_protocol():
 def test_benchmark_budget_cannot_be_shortened_without_preflight_label():
     with pytest.raises(ValueError,match='frozen common budget'):
         resolve('ve_diffusion',image_geo(),steps=8)
-    with pytest.raises(ValueError,match='fit the common training covariance'):
-        resolve('scale_conditioned_nf',geometry('e6_exp_pca','dataset',[1,28,28]))
+    image=geometry('e6_exp_pca','dataset',[1,28,28])
+    assert image['kind']=='image'
+    config,_=resolve('scale_conditioned_nf',image)
+    assert config.field_projection_rank is None and config.field_backbone=='image_unet_v1'
+    with pytest.raises(ValueError,match='forbids reduced-rank'):
+        resolve('scale_conditioned_nf',geometry('e6_exp_pca','coefficients',[30]),rank=3)
 
 
 def test_nf_readout_uses_likelihood_derivative_for_both_geometries():

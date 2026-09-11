@@ -49,7 +49,7 @@ def native_contracts():
 
 def geometry(dataset,representation,feature_shape):
     shape=tuple(feature_shape)
-    if representation=='coefficients' or dataset.endswith('_pca') or '_pca_' in dataset:
+    if representation=='coefficients':
         return dict(kind='vector',ambient_dim=math.prod(shape),feature_shape=list(shape),image_shape=None,image_layout='nhwc')
     if representation!='dataset' or len(shape)!=3:
         raise ValueError('representation has no explicit common architecture rule')
@@ -70,7 +70,7 @@ def parameter_count(module):
 
 @lru_cache(maxsize=None)
 def capacities(kind,dimension):
-    """dimension is fitted active rank for vectors, channel count for images."""
+    """dimension is the complete vector dimension or the image channel count."""
     with torch.device('meta'):
         target=parameter_count(SpectralResidualCore(dimension,width=512) if kind=='vector' else ImageUNet(dimension,32))
         candidates=[]
@@ -98,15 +98,17 @@ def resolve(variant,geo,*,rank=None,device='cuda',steps=None,preflight=False):
     if isinstance(budget,bool) or not isinstance(budget,int) or budget<2:
         raise ValueError('invalid training budget')
     nf=variant=='scale_conditioned_nf';image=geo['kind']=='image'
-    if not image and (rank is None or not 2<=rank<=geo['ambient_dim']):
-        raise ValueError('fit the common training covariance before resolving vector/NF capacity')
+    if not image:
+        if rank is not None and rank != geo['ambient_dim']:
+            raise ValueError('the common vector protocol forbids reduced-rank projections')
+        rank=geo['ambient_dim']
     cap=capacities(geo['kind'],geo['image_shape'][-1] if image else rank)
     terminal=min(rules['training']['terminal_decay_steps'],max(1,budget//4))
     keys={k:v for k,v in rules['training'].items() if k in training.TrainingConfig.__dataclass_fields__}
     keys.update(device=device,steps=budget,terminal_decay_steps=terminal,ema_start_step=budget-terminal,
         validation_interval_steps=min(500,budget),num_workers=0,training_target='sample_v1',
-        field_projection_rank=None if image else rank,
-        field_preconditioning='image_gaussian_v1' if image else 'covariance_span_v1',
+        field_projection_rank=None,
+        field_preconditioning='image_gaussian_v1' if image else 'ambient_isotropic_v1',
         field_backbone='image_unet_v1' if image else ('bottleneck_v1' if nf else 'spectral_residual_v1'),
         field_residual_scaling='noise_v1' if nf or not image else 'gaussian_tail_v1',
         field_residual_width=512,image_training_bf16=False,

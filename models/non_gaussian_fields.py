@@ -12,6 +12,7 @@ import torch
 from models.noise_pairing import paired_corruption
 from models.preconditioned_field import CovariancePreconditionedField
 from models.shared_image_field import SharedImagePosteriorField
+from models.ambient_field import AmbientPosteriorField
 
 
 FAMILIES = frozenset({'student_t_flow', 'pfgmpp'})
@@ -26,9 +27,9 @@ def validate_config(family, config):
     if (config.sigma_min is None or config.sigma_max is None or
             not 0 < config.sigma_min < config.sigma_max < math.inf):
         raise ValueError('explicit positive common RMS scale support required')
-    if config.field_preconditioning not in {'covariance_span_v1', 'image_gaussian_v1'}:
+    if config.field_preconditioning not in {'covariance_span_v1', 'ambient_isotropic_v1', 'image_gaussian_v1'}:
         raise ValueError('non-Gaussian models require the shared routed field backbone')
-    expected = 'spectral_residual_v1' if config.field_preconditioning=='covariance_span_v1' else 'image_unet_v1'
+    expected = 'image_unet_v1' if config.field_preconditioning=='image_gaussian_v1' else 'spectral_residual_v1'
     if config.field_backbone != expected:
         raise ValueError('non-Gaussian model backbone must follow the shared representation route')
     if config.training_target != 'sample_v1':
@@ -52,7 +53,7 @@ def contract(family, config):
         pfgm_log_sigma_std=config.kernel_log_scale_std if family=='pfgmpp' else None,
         pfgm_sigma_data=1. if family=='pfgmpp' else None,
         normal_conditioning=('exact_student_conditional_scale_v1'
-            if config.field_preconditioning=='covariance_span_v1' else 'full_ambient_image_input'),
+            if config.field_preconditioning=='covariance_span_v1' else 'full_ambient_learned_input_output'),
         gaussian_full_or_score_conversion=False)
 
 
@@ -136,6 +137,11 @@ class StudentCovarianceField(NativeStudentInterface, CovariancePreconditionedFie
         return (gain*coordinate+factor*residual) @ self.basis.T
 
 
+class StudentAmbientField(NativeStudentInterface, AmbientPosteriorField):
+    def channel(self, condition):
+        return condition, torch.ones_like(condition)
+
+
 class StudentImageField(NativeStudentInterface, SharedImagePosteriorField):
     def channel(self, condition):
         # Full ambient images retain all normal information in their input.
@@ -144,7 +150,9 @@ class StudentImageField(NativeStudentInterface, SharedImagePosteriorField):
 
 def build_field(architecture, family, config):
     validate_config(family, config)
-    cls = StudentCovarianceField if config.field_preconditioning=='covariance_span_v1' else StudentImageField
+    cls = {'covariance_span_v1': StudentCovarianceField,
+        'ambient_isotropic_v1': StudentAmbientField,
+        'image_gaussian_v1': StudentImageField}[config.field_preconditioning]
     return cls(architecture, family, config)
 
 
