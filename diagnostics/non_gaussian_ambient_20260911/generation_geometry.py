@@ -62,6 +62,7 @@ def make(base,out,latex_table,cells=None):
             with np.load(sample) as z:
                 generated=z['coordinates'];real=z['test_coordinates'];raw=z['test_raw']
                 renderer=z['renderer'];offset=z['offset']
+                refined_normalized=z['refined_first64']
             # A separate reference to the precision floor caused only by one
             # float32 normalized-input round trip; never a modified test set.
             model=training.load_checkpoint(run/'model.pt',device='cpu')
@@ -69,12 +70,17 @@ def make(base,out,latex_table,cells=None):
             mean=model.normalization_mean.numpy();rms=np.float32(model.normalization_scale)
             rounded=((raw.astype(np.float32)-mean)/rms)*rms+mean
             rounded_coordinates=(rounded.astype(np.float64)-offset)@np.linalg.pinv(renderer)
+            refined_raw=refined_normalized*rms+mean
+            refined_coordinates=(refined_raw.astype(np.float64)-offset)@np.linalg.pinv(renderer)
             del model
             gen,position,error,valid=geometry(generated,task)
             control,_,_,_=geometry(real,task)
             precision_control,_,_,_=geometry(rounded_coordinates,task)
+            first64,_,_,_=geometry(generated[:64],task)
+            refined64,_,_,_=geometry(refined_coordinates,task)
             row=dict(variant=method,task=task,representation=representation,
                 generated=gen,real_test=control,float32_round_trip=precision_control,
+                paired_512step_first64=first64,paired_1024step_first64=refined64,
                 samples_sha256=receipt['samples_sha256'],
                 generated_full_ambient_normal_ratio=receipt['metrics']['generated_normal_distance_over_data_rms_norm'],
                 timing='posthoc after first PFGM++ Exp image aggregate generation result; no tuning',
