@@ -1,5 +1,5 @@
-schema_version: 1
-id: dataset_routed_native_comparison_v1
+schema_version: 2
+id: dataset_routed_native_comparison_measurements_v2
 scope: all 39 campaign representations and 11 native interfaces
 architecture_rule: dataset representation only; never selected from LID scores
 vector_data:
@@ -46,6 +46,15 @@ selection:
   nf_validity: exact log-scale derivative, separately reported
   refinement: none for any model
   test: all original test queries, only after immutable checkpoint/scale receipts
+measurement:
+  kneed_version: 0.8.6
+  known_lid_automatic: legacy pointwise Kneedle on 22 FLIPD VP times, ambient fallback
+  common_grid_diagnostic: pointwise Kneedle on 29 half-octaves from 1/256 through 64
+  common_grid_comparator: minimum holdout MAE on the same 29 candidates, frozen before test
+  kneedle_parameters: reference VP time, convex decreasing, S=1, online=false, interp1d
+  automatic_coverage: report every fallback and boundary choice; retain all queries in MAE
+  unknown_failure: propagate reference failure reason and report missing measurement coverage
+  verification: replay selection and all metrics from hashed query-level artifacts
 budget_interpretation: equal updates and network examples; parameters matched within
   10 percent for NF, measured elapsed time recorded; FLOPs are not claimed equal
 old_results: diagnostics only; aggregation requires fresh matching protocol receipts

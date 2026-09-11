@@ -9,6 +9,7 @@ import torch
 from experiments.fair_protocol import (geometry,native_contracts,resolve,build_model,
     parameter_count,audit_group,protocol,digest)
 from experiments.fair_campaign import matrix,select_scale,validate_reference,prediction_spec,aggregate
+from experiments import global_campaign_v2 as v2
 from experiments.lambda_repair_eval import CanonicalPosterior
 from models import training
 from models.image_gaussian_fields import NativeGaussianImageField,ImageFieldConfig
@@ -129,7 +130,8 @@ def test_spatial_nf_nontrivial_inverse_and_full_jacobian_determinant():
 def test_reference_cannot_be_taken_from_another_method_or_protocol():
     cell=SimpleNamespace(suite_id='e1',reference_dataset='e1_sampled_fmnist_step1',representation='dataset')
     manifest=dict(variant='ve_diffusion',protocol_sha256='a',source_sha256={'x':'b'},kind='benchmark')
-    ref=dict(manifest,cell_key='e1/e1_sampled_fmnist_step1/dataset',status='complete')
+    ref=dict(manifest,cell_key='e1/e1_sampled_fmnist_step1/dataset',status='complete',
+        selected_lambda=float(v2.unknown_reference_lambdas()[20]),selection=dict(status='selected'))
     validate_reference(ref,manifest,cell)
     for key,value in [('variant','vp_diffusion'),('protocol_sha256','old'),('kind','preflight')]:
         with pytest.raises(ValueError):validate_reference(dict(ref,**{key:value}),manifest,cell)
@@ -151,10 +153,11 @@ def test_nf_readout_uses_likelihood_derivative_for_both_geometries():
 def test_unknown_dependent_cell_cannot_retune_reference_scale():
     cell=SimpleNamespace(target_policy='sample_size',dataset='step2',reference_dataset='step1')
     grid=np.geomspace(1/256,64,50)
-    reference=dict(selected_lambda=.5,selection=dict(status='selected'))
+    selected=float(v2.unknown_reference_lambdas()[20])
+    reference=dict(selected_lambda=selected,selection=dict(status='selected'))
     for curve in [np.ones((8,50)),np.random.default_rng(9).normal(size=(8,50))]:
         scale,receipt=select_scale(curve,grid,None,cell,reference)
-        assert scale==.5 and receipt['criterion']=='reuse_reference_mean_kneedle'
+        assert scale==selected and receipt['criterion']=='reuse_reference_mean_kneedle'
 
 
 def test_shared_vp_really_trains_with_common_clipping_decay_and_ema(tmp_path):
