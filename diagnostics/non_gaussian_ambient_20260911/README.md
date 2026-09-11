@@ -15,6 +15,31 @@ native EDM denoising objective. LID is posterior response, not a Gaussian score
 substitution. All13 common interfaces support the unrestricted geometry, but
 only the requested eight new-model cells are trained in this study.
 
+## Measured outcome of the frozen128k study
+
+All eight runs and numerical/replay gates completed. Primary test response MAE
+uses1000 queries and a scale fixed on1000 source-train holdout queries:
+
+| Dataset / full representation | True LID | t-Flow MAE (lambda) | PFGM++ MAE (lambda) |
+| --- | ---: | ---: | ---: |
+| Exp /30 coefficients | 2 | .502301 (.353553) | .417934 (.0625) |
+| Spiral /30 coefficients | 1 | .216052 (2) | .236663 (1.414214) |
+| Exp /784 pixels | 2 | .478396 (.5) | .721105 (.353553) |
+| Spiral /784 pixels | 1 | .294483 (8) | .324088 (2) |
+
+This is **not a learned endpoint-quality pass**. Six point estimates pass the
+descriptive MAE<.5 threshold; all eight are worse than the separately selected
+zero-head response control. Image minimum-scale exact traces range65.2–352.4,
+far from their continuous posteriors. Kneedle MAE exceeds.5 in all eight.
+Fine generation geometry also fails to reproduce the thin Exp radius and the
+Spiral radius/phase relation. Full-coordinate finite differences, independent
+image probes and sampler refinement distinguish these from a trace arithmetic
+bug. The supplementary Student density readout is retained even where it fails.
+
+The measured interpretation is versioned in `assessment_128k_results.tex`.
+It describes these exact saved runs; write a new assessment for new trainings.
+The producing source remains b90a2b7. Later commits add diagnostics/reports only.
+
 ## Reproduce from a fresh output directory
 
 Use a clean checkout with the repository's training/test dependencies. The
@@ -71,6 +96,12 @@ continuous-law posterior comparisons, and paired denoising on128 fresh-noise
 test points with eight observations each. Neither tail parameters nor training
 recipe are tuned using these diagnostics.
 
+`generation_geometry.py` adds an explicitly posthoc check of the saved samples'
+Exp relative radius and Spiral wrapped phase, alongside full ambient normal
+error, a float32 round-trip control, and paired512/1024-step results. No sample
+or trajectory is projected or changed by this diagnostic. Display coordinates
+are obtained only for evaluation from the known renderer.
+
 The [supplemental generation check](generation_control.md) uses512 native ODE
 samples per final model, checks Heun step refinement and measures full-ambient
 distribution/normal errors. It can run as a separate watcher on GPU1. A good
@@ -120,6 +151,12 @@ cd artifacts/non_gaussian_ambient_20260911/report
 pdflatex -interaction=nonstopmode -halt-on-error report_ru.tex
 pdflatex -interaction=nonstopmode -halt-on-error report_ru.tex
 ```
+
+For replay of the existing recorded checkpoints, `assessment_128k_results.tex`
+may be copied to the report's `results/assessment.tex` before `make_results.py`.
+`verification.json` certifies numerical/provenance replay only; it does not
+declare learned quality sufficient. The author-facing PDF and CSV are also
+delivered under the paper repository's `notes/non_gaussian_ambient_20260911/`.
 
 The output needs pdfLaTeX, Russian Babel and T2A fonts. Numerical provenance is
 in `results/verification.json` and each run's model/selection/quality receipts.

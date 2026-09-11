@@ -264,6 +264,30 @@ def main():
         fig.suptitle('32 fixed holdout queries: trained response versus continuous posterior\nDots: scale selected on all 1000 source-train holdout queries; dashed curves are evaluation-only oracles',fontsize=11)
         stem='mean_response_logx' if logarithmic else 'mean_response_linearx'
         fig.savefig(out/(stem+'.pdf'));fig.savefig(out/(stem+'.png'));plt.close(fig)
+    # The full-range figures above retain the large endpoint errors. A clearly
+    # labelled window makes the selected image-scale behavior readable too.
+    fig,axes=plt.subplots(2,2,figsize=(9,7),constrained_layout=True)
+    for i,logarithmic in enumerate((True,False)):
+        for j,cell in enumerate(CELLS[2:]):
+            ax=axes[i,j]
+            for k,method in enumerate(MODELS):
+                record=records[cell,method];z=record['continuous'];mean=z['learned_response'].mean(1)
+                ax.plot(z['scales'],mean,color=COLORS[method],label=NAMES[method]+' learned')
+                ax.plot(z['scales'],z['oracle_response'].mean(1),color=COLORS[method],ls='--',label=NAMES[method]+' exact')
+                index=record['quality']['response_selection']['selected_index']
+                ax.scatter([z['scales'][index]],[mean[index]],color=COLORS[method],s=22)
+                outside=int(((mean < -4)|(mean > 5)).sum())
+                ax.text(.02,.96-.07*k,f'{NAMES[method]}: {outside}/29 means outside window',
+                    transform=ax.transAxes,va='top',fontsize=7,color=COLORS[method])
+            ax.axhline(record['curve']['test_target'][0],color='gray',ls=':')
+            if logarithmic:ax.set_xscale('log',base=2)
+            else:ax.set_xlim(0,64)
+            ax.set(ylim=(-4,5),xlabel='lambda (RMS)',ylabel='Mean R; displayed window [-4,5]',
+                title=('Exp' if '/e6_' in cell else 'Spiral')+' / full784 pixels; '+('log x' if logarithmic else 'linear x'))
+    handles,labels=axes[0,0].get_legend_handles_labels()
+    fig.legend(handles,labels,loc='outside lower center',ncol=2,frameon=False,fontsize=8)
+    fig.suptitle('Image responses near the selected values: a labelled vertical zoom\n32 identical holdout queries; full-range curves are preserved separately',fontsize=10)
+    fig.savefig(out/'image_response_zoom.pdf');fig.savefig(out/'image_response_zoom.png');plt.close(fig)
     # A single fixed query: all models use the same first holdout ID in a cell.
     fig,axes=plt.subplots(4,2,figsize=(11,13),constrained_layout=True)
     for i,cell in enumerate(CELLS):
@@ -323,7 +347,10 @@ def main():
     fig.suptitle('Full28x28 images: fixed real-data intensity range per dataset; no per-image contrast normalization',fontsize=10)
     fig.savefig(out/'generation_images.pdf');fig.savefig(out/'generation_images.png');plt.close(fig)
     generation_geometry(BASE,out,latex_table)
-    validation=dict(status=('passed' if all(r['float32_trace_precision_passed'] and r['generation_refinement_passed'] for r in tables) else 'numerical_precision_failed'),cells=8,distinct_tasks=2,representations=2,
+    (out/'make_results_source.py').write_bytes(Path(__file__).read_bytes())
+    validation=dict(status=('numerical_and_replay_passed' if all(r['float32_trace_precision_passed'] and r['generation_refinement_passed'] for r in tables) else 'numerical_precision_failed'),cells=8,distinct_tasks=2,representations=2,
+        scope='Numerical and provenance checks only; learned quality is assessed separately, not certified by this status.',
+        report_generator_sha256=file_sha(Path(__file__)),
         source_sha256=source,protocol_sha256=rules,all_common_group_checks=True,
         primary_receipts_replayed=True,all_practical_half_unit_checks=all(r['practical_half_unit_mae_check'] for r in tables),
         new_models_half_unit_checks=all(r['practical_half_unit_mae_check'] for r in tables if r['model']!='posterior_rectified_flow'),
