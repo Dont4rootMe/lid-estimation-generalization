@@ -147,18 +147,24 @@ def test_loss_matches_native_noise_or_edm_objective_samplewise(variant):
 
 
 @pytest.mark.parametrize('variant',['t_flowmatching','pfgmpp'])
-def test_training_and_reload_use_common_budget_selection_and_exact_parameter_count(tmp_path,variant):
+@pytest.mark.parametrize('image',[False,True])
+def test_training_and_reload_use_common_budget_selection_and_exact_parameter_count(tmp_path,variant,image):
     torch.manual_seed(8)
-    raw=torch.randn(64,2)@torch.linalg.qr(torch.randn(7,2))[0].T
-    config=vector_config(variant)
+    if image:
+        raw=torch.randn(64,16)
+        geo=geometry('fixture','dataset',[4,4,1])
+        config,expected=resolve(variant,geo,device='cpu',steps=8,preflight=True)
+    else:
+        raw=torch.randn(64,2)@torch.linalg.qr(torch.randn(7,2))[0].T
+        geo=geometry('fixture_pca','coefficients',[7])
+        config,expected=resolve(variant,geo,rank=2,device='cpu',steps=8,preflight=True)
     result=training.train_model(native_contracts()[variant]['family'],raw[:48],raw[48:],config,tmp_path/'model.pt')
     loaded=training.load_checkpoint(tmp_path/'model.pt',device='cpu')
     assert result.config.to_dict()==loaded.config.to_dict()
     for key,value in result.model.state_dict().items():
         torch.testing.assert_close(value,loaded.model.state_dict()[key],rtol=0,atol=0)
     assert result.metrics['steps_completed']==8
-    expected=resolve(variant,geometry('fixture_pca','coefficients',[7]),rank=2,device='cpu',steps=8,preflight=True)[1]
     assert parameter_count(result.model)==expected['reference_parameters']
-    a=training.predict_lid(result,raw[:5],.5,readout='response',divergence_backend='active_exact',trace_probes=0)
+    a=training.predict_lid(result,raw[:5],.5,readout='response',divergence_backend='exact' if image else 'active_exact',trace_probes=0)
     b=training.predict_lid(loaded,raw[:5],.5,readout='response',divergence_backend='exact',trace_probes=0)
     np.testing.assert_allclose(a,b,atol=2e-5,rtol=2e-5)
