@@ -79,6 +79,12 @@ score through supervised scale selection. The separate
 `flat_scaling_control.py` is a paired synthetic parameterization diagnostic,
 not one of the eight benchmark trainings and not permission to change their
 frozen source. Its output is isolated under `flat_scaling_control/`.
+`flat_linear_control.py` tests one additional unrestricted learned-linear
+shortcut on the same synthetic draw sequence. Neither short intervention was
+adopted: changing the scalar coefficient worsened the minimum-scale normal
+error, and the linear shortcut still left a response25.77 on a clean plane
+of dimension2 after4000 steps. These are limited negative diagnostics, not
+claims that a larger budget could never improve either alternative.
 
 ## Report
 

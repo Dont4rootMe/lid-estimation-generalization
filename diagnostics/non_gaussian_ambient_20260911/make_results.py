@@ -110,6 +110,7 @@ def main():
         frozen=json.loads((path.parent/'quality/response_selection.json').read_text())
         selection=quality['response_selection'];idx=selection['selected_index']
         errors=abs(curve['test'][:,idx]-curve['test_target'])
+        assert np.all(curve['test_target']==curve['test_target'][0]),'this report requires constant-LID Exp/Spiral cells'
         assert np.isclose(errors.mean(),quality['response_metrics']['mae'],rtol=0,atol=1e-12)
         bootstrap=selector_bootstrap(curve['holdout'],curve['holdout_target'],curve['scales'])
         selection_rows.append(dict(variant=done['variant'],cell=done['cell_key'],
@@ -271,7 +272,7 @@ def main():
             if j==0:ax.set_ylabel(('Exp' if '/e6_' in cell else 'Spiral')+'\n'+NAMES[method],fontsize=8)
     fig.suptitle('Full28x28 images: fixed real-data intensity range per dataset; no per-image contrast normalization',fontsize=10)
     fig.savefig(out/'generation_images.pdf');fig.savefig(out/'generation_images.png');plt.close(fig)
-    validation=dict(status=('passed' if all(r['float32_trace_precision_passed'] for r in tables) else 'numerical_precision_failed'),cells=8,distinct_tasks=2,representations=2,
+    validation=dict(status=('passed' if all(r['float32_trace_precision_passed'] and r['generation_refinement_passed'] for r in tables) else 'numerical_precision_failed'),cells=8,distinct_tasks=2,representations=2,
         source_sha256=source,protocol_sha256=rules,all_common_group_checks=True,
         primary_receipts_replayed=True,all_practical_half_unit_checks=all(r['practical_half_unit_mae_check'] for r in tables),
         new_models_half_unit_checks=all(r['practical_half_unit_mae_check'] for r in tables if r['model']!='posterior_rectified_flow'),

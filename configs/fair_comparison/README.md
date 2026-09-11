@@ -63,7 +63,8 @@ Test открывается только после записи checkpoint/scal
 | `kneedle_common_grid` | Основной автоматический Kneedle; reference-VP-time координата | 29 полушагов log2 λ от1/256 до64 |
 | `supervised_common_grid` | Основной минимум MAE на source-train holdout; заморожен перед test | Те же29 кандидатов |
 
-Основная строка `metrics.full` или `metrics.ols5` использует полный29-grid
+Основная строка `metrics.full`, `metrics.response` у новых негауссовских методов
+или `metrics.ols5` использует полный29-grid
 supervised-выбор. Основной автоматический результат явно экспортируется в
 `automatic_metrics`; это те же числа, что в `diagnostic_metrics.kneedle_common_grid`,
 а не дополнительный независимый метод. Frozen measurement plan задаёт
