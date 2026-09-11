@@ -48,11 +48,11 @@ def geometry(coordinates,task):
         inside_domain=summary(valid),bins=bins),position,error,valid
 
 
-def make(base,out,latex_table):
+def make(base,out,latex_table,cells=None):
     torch.set_num_threads(2)
     rows=[];table=[];source=Path(__file__);out.mkdir(parents=True,exist_ok=True)
-    fig,axes=plt.subplots(4,2,figsize=(11,11),constrained_layout=True)
-    cells=[('exp','coefficients'),('spiral','coefficients'),('exp','dataset'),('spiral','dataset')]
+    cells=cells or [('exp','coefficients'),('spiral','coefficients'),('exp','dataset'),('spiral','dataset')]
+    fig,axes=plt.subplots(len(cells),2,figsize=(8,2.5*len(cells)),constrained_layout=True,squeeze=False)
     for i,(task,representation) in enumerate(cells):
         for j,method in enumerate(('t_flowmatching','pfgmpp')):
             run=base/'full_budget'/f'{method}__{task}__{representation}'
@@ -86,7 +86,8 @@ def make(base,out,latex_table):
             table.append([title,name,gen['outside_domain_n'],fmt(gen['inside_domain']['median']),
                 fmt(gen['inside_domain']['q90']),fmt(precision_control['inside_domain']['q90'])])
             ax=axes[i,j]
-            ax.scatter(position[valid],error[valid],s=6,alpha=.4,label='Generated (inside domain)')
+            color='#2563eb' if method=='t_flowmatching' else '#d97706'
+            ax.scatter(position[valid],error[valid],s=6,alpha=.4,color=color,label='Generated (inside domain)')
             if task=='exp':
                 ax.set_yscale('symlog',linthresh=.02)
                 ax.set(xlabel='Exp coordinate u',ylabel='Absolute relative radius error')
@@ -94,7 +95,7 @@ def make(base,out,latex_table):
                 ax.set(xlabel='Spiral t inferred from radius',ylabel='Absolute phase error / pi',ylim=(0,1))
                 ax.axhline(.5,color='gray',ls=':',label='Uniform-phase mean')
             ax.set_title(f'{title}; {name}\n{gen["outside_domain_n"]}/512 outside generator domain',fontsize=9)
-    fig.suptitle('Fine geometry of existing full-ambient samples (posthoc diagnostic)\nExp surface error and Spiral phase error use different defined units; no sample or model is altered',fontsize=11)
+    fig.suptitle('Fine geometry of existing full-ambient samples (posthoc)\nExp: relative radius error; Spiral: wrapped phase error\nSamples and models unchanged; outside-domain counts are shown',fontsize=10)
     fig.savefig(out/'generation_fine_geometry.pdf');fig.savefig(out/'generation_fine_geometry.png');plt.close(fig)
     (out/'generation_geometry_source.py').write_bytes(source.read_bytes())
     write_json(out/'generation_fine_geometry.json',dict(status='complete',source_sha256=file_sha(source),rows=rows))

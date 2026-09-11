@@ -62,7 +62,9 @@ def report_tables(out,tables):
             f"{row['response_kneedle_mae']:.3f}"])
         oracles.append(prefix+[f"{row['min_lambda_learned_response_mean']:.3f}",
             f"{row['min_lambda_oracle_response_mean']:.3f}",
-            f"{row['selected_lambda_model_vs_oracle_response_mae']:.3f}"])
+            f"{row['selected_lambda_model_vs_oracle_response_mae']:.3f}",
+            f"{row['selected_mean_response_fit_bias']:.3f}",
+            f"{row['selected_mean_response_scale_bias']:.3f}"])
         denoising.append(prefix+[f"{row['response_selected_lambda']:.5g}",
             f"{row['selected_lambda_denoising_risk']:.3f}",
             f"{row['selected_lambda_initial_denoising_risk']:.3f}",
@@ -78,7 +80,7 @@ def report_tables(out,tables):
     (out/'score_table.tex').write_text(latex_table(
         ['Данные','Модель','$d$',r'$\lambda$','Test MAE [95\\% CI]','Kneedle MAE'],scores,'llrrlr'))
     (out/'oracle_table.tex').write_text(latex_table(
-        ['Данные','Модель',r'$\R_{\min}$ сеть',r'$\R_{\min}$ эталон',r'$|R_{\rm model}-R_{\rm exact}|$'],oracles,'llrrr'))
+        ['Данные','Модель',r'$\R_{\min}$ сеть',r'$\R_{\min}$ эталон',r'$|R_{\rm model}-R_{\rm exact}|$',r'$\overline\Delta_{\rm fit}$',r'$\overline\Delta_{\rm scale}$'],oracles,'llrrrrr'))
     (out/'denoising_table.tex').write_text(latex_table(
         ['Данные','Модель',r'$\lambda$','Обученный posterior','Начальный preconditioner',r'95\% CI разности'],denoising,'llrrrl'))
     (out/'probe_table.tex').write_text(latex_table(
@@ -207,6 +209,8 @@ def main():
             min_lambda_oracle_response_mean=at_min['oracle_response_mean'],
             min_lambda_model_vs_oracle_response_mae=at_min['learned_vs_oracle_response_mae'],
             selected_lambda_model_vs_oracle_response_mae=at_selected['learned_vs_oracle_response_mae'],
+            selected_mean_response_fit_bias=float((continuous['learned_response'][idx]-continuous['oracle_response'][idx]).mean()),
+            selected_mean_response_scale_bias=float((continuous['oracle_response'][idx]-float(curve['test_target'][0])).mean()),
             selected_lambda_posterior_error_over_lambda_rms=at_selected['posterior_error_over_lambda_rms'],
             selected_lambda_denoising_risk=risk['trained_mean_risk'],
             selected_lambda_initial_denoising_risk=risk['initial_mean_risk'],
