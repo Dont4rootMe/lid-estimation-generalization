@@ -1,5 +1,5 @@
-schema_version: 2
-id: dataset_routed_native_comparison_measurements_v2
+schema_version: 3
+id: dataset_routed_native_comparison_common_grid_v3
 scope: all 39 campaign representations and 11 native interfaces
 architecture_rule: dataset representation only; never selected from LID scores
 vector_data:
@@ -37,7 +37,7 @@ training:
     method definitions
 selection:
   weights: lowest native holdout loss, same raw/EMA candidates and validation intervals
-  known_lid_scale: source-train holdout bounded-v2 supervised MAE
+  known_lid_scale: minimum source-train holdout MAE on all 29 half-octaves from 1/256 through 64
   unknown_lid_scale: source-train reference mean Kneedle; freeze and transfer to dependent
     cells
   image_trace_probes: 64
@@ -48,9 +48,10 @@ selection:
   test: all original test queries, only after immutable checkpoint/scale receipts
 measurement:
   kneed_version: 0.8.6
-  known_lid_automatic: legacy pointwise Kneedle on 22 FLIPD VP times, ambient fallback
-  common_grid_diagnostic: pointwise Kneedle on 29 half-octaves from 1/256 through 64
-  common_grid_comparator: minimum holdout MAE on the same 29 candidates, frozen before test
+  known_lid_automatic: primary pointwise Kneedle on the same 29 candidates as supervised selection
+  primary_automatic_metric: kneedle_common_grid
+  historical_reproduction: legacy pointwise Kneedle on 22 FLIPD VP times, ambient fallback
+  candidate_matching: exactly the same fixed 29 scales for all models and both primary selectors
   kneedle_parameters: reference VP time, convex decreasing, S=1, online=false, interp1d
   automatic_coverage: report every fallback and boundary choice; retain all queries in MAE
   unknown_failure: propagate reference failure reason and report missing measurement coverage

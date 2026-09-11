@@ -77,14 +77,8 @@ def prediction_spec(variant,geo):
 def select_scale(curve,scales,target,cell,reference=None):
     curve,scales=measurement.validate_curve(curve,scales,target)
     if cell.target_policy=='known_lid':
-        measurement.require_grid(scales,measurement.common_scales())
-        initial=v2.initial_supervised_lambdas()
-        def values(requested):
-            ids=[int(np.argmin(abs(scales-s))) for s in requested]
-            if not np.allclose(scales[ids],requested,rtol=1e-12,atol=1e-12):raise ValueError('selector requested an unavailable scale')
-            return curve[:,ids]
-        grid,_,index,receipt=v2.select_supervised_bounded(initial,values(initial),target,evaluate=values)
-        return float(grid[index]),receipt
+        receipt=measurement.supervised_common_selection(curve,scales,target)
+        return receipt['selected_lambda'],receipt
     if cell.reference_dataset not in (None,cell.dataset):
         if reference is None:raise ValueError('dependent cell requires its completed same-method reference')
         status=measurement.validate_selection(reference['selected_lambda'],reference['selection'],reference=True)
@@ -169,8 +163,12 @@ def verify_measurements(path,row=None):
             if not np.array_equal(primary_values,z['common_prediction'][:,index]):
                 raise ValueError('primary prediction differs from its saved scale curve')
         if row['diagnostic_metrics']!=expected:raise ValueError('automatic metrics differ from saved curves')
+        if row['automatic_metrics']!=expected[plan['primary_automatic_metric']]:
+            raise ValueError('primary automatic metrics must report common-grid Kneedle')
     elif row['diagnostic_metrics'] or row['test_scale_curves_sha256'] is not None:
         raise ValueError('unexpected known-LID diagnostics on an unknown-LID cell')
+    elif row['automatic_metrics']:
+        raise ValueError('unexpected pointwise automatic metrics on an unknown-LID cell')
     return row
 
 
@@ -282,6 +280,7 @@ def run(args):
     if file_sha(out/'selection.json')!=selection_hash:raise ValueError('selection changed during test inference')
     final=dict(receipt,status='complete',measurement_status=status,selection_receipt_sha256=selection_hash,
         test_n=len(queries),metrics=metrics,diagnostic_metrics=diagnostics,
+        automatic_metrics=diagnostics[plan['primary_automatic_metric']] if known else {},
         test_files_sha256={p.name:file_sha(p) for p in test.source_paths.values()},
         test_predictions_sha256=file_sha(out/'test_predictions.npz'),
         test_scale_curves_sha256=file_sha(out/'test_scale_curves.npz') if known else None,
@@ -290,7 +289,7 @@ def run(args):
     verify_measurements(out/'complete.pending.json')
     (out/'complete.pending.json').replace(out/'complete.json')
     print(json.dumps(dict(status='complete',measurement_status=status,kind=final['kind'],
-        variant=args.variant,cell=cell.key,metrics=metrics,diagnostic_metrics=diagnostics)),flush=True)
+        variant=args.variant,cell=cell.key,metrics=metrics,automatic_metrics=final['automatic_metrics'])),flush=True)
 
 
 def aggregate(root,scope='all'):

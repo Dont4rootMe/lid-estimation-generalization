@@ -112,6 +112,7 @@ def make_receipt(root,known=True,reference=None):
     np.savez_compressed(root/'test_predictions.npz',**pred)
     final=dict(receipt,status='complete',measurement_status=selection['status'],test_loaded=True,
         selection_receipt_sha256=file_sha(root/'selection.json'),test_n=4,metrics=metrics,
+        automatic_metrics=diagnostics[m.PRIMARY_AUTOMATIC_METRIC] if known else {},
         diagnostic_metrics=diagnostics,test_predictions_sha256=file_sha(root/'test_predictions.npz'),
         test_scale_curves_sha256=file_sha(root/'test_scale_curves.npz') if known else None)
     path=root/'complete.json';write_json(path,final)
@@ -149,3 +150,33 @@ def test_failed_reference_and_dependent_are_verified_as_missing_measurements(tmp
 def test_nonfinite_json_is_not_exported_as_a_success(tmp_path):
     with pytest.raises(ValueError):write_json(tmp_path/'invalid.json',dict(mae=float('nan')))
     assert not (tmp_path/'invalid.json').exists()
+
+
+def test_primary_supervised_and_kneedle_share_every_candidate_including_the_other_tail():
+    grid=m.common_scales();target=np.ones(4)
+    error=np.full(29,2.);error[14]=1.;error[-2]=.1
+    curve=target[:,None]+error[None,:]
+    scale,receipt=select_scale(curve,grid,target,SimpleNamespace(target_policy='known_lid'))
+    assert scale==grid[-2]  # The old one-sided rule stopped at lambda0.5.
+    plan=m.known_plan(curve,grid,target)
+    assert receipt['candidate_lambdas']==plan['common_scales']==grid.tolist()
+    assert receipt==plan['supervised_common_grid']
+    assert plan['primary_automatic_metric']=='kneedle_common_grid'
+    assert plan['legacy_role']=='historical_reproduction_only'
+    assert receipt['status']=='selected'
+
+
+def test_full_grid_boundary_ties_keep_smallest_scale_and_are_reported():
+    grid=m.common_scales();curve=np.full((4,29),3.)
+    curve[:,[0,-1]]=1.
+    scale,receipt=select_scale(curve,grid,np.ones(4),SimpleNamespace(target_policy='known_lid'))
+    assert scale==1/256 and receipt['scale_unresolved'] is True
+    assert receipt['status']=='scale_unresolved'
+
+
+def test_export_cannot_substitute_legacy_kneedle_for_primary_automatic_result(tmp_path):
+    path,row=make_receipt(tmp_path/'known')
+    row['automatic_metrics']=dict(row['diagnostic_metrics']['kneedle_legacy'])
+    row['automatic_metrics']['mean']+=1.
+    write_json(path,row)
+    with pytest.raises(ValueError,match='primary automatic metrics'):verify_measurements(path)

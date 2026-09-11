@@ -1,8 +1,8 @@
 """Replayable measurement rules; no model fitting or test-label scale selection.
 
-The legacy FLIPD grid remains a distinct baseline. The common-grid diagnostic
-changes only the candidate grid; it does not promise that a knee estimates LID.
-Its supervised comparator is frozen on the source-train holdout on that grid.
+Primary supervised selection and pointwise Kneedle share all 29 candidates.
+The supervised scale is frozen on the source-train holdout. The narrow legacy
+FLIPD grid is retained only for historical reproduction.
 """
 import importlib.metadata
 import warnings
@@ -11,6 +11,8 @@ import numpy as np
 from kneed import KneeLocator
 
 from experiments import global_campaign_v2 as v2
+
+PRIMARY_AUTOMATIC_METRIC='kneedle_common_grid'
 
 
 def validate_runtime():
@@ -78,19 +80,29 @@ def metric(values,target,dtype='float32'):
     return result
 
 
-def known_plan(curve,scales,target):
+def supervised_common_selection(curve,scales,target):
     values,grid=validate_curve(curve,scales,target)
     require_grid(grid,common_scales())
     if target is None:raise ValueError('known-LID holdout targets are required')
     errors=np.abs(values-np.asarray(target)[:,None]).mean(axis=0)
     index=int(np.flatnonzero(errors<=errors.min()+1e-12)[0])
-    return dict(protocol='known_lid_measurements_v2',kneed_version=v2.PINNED_KNEED_VERSION,
+    unresolved=index in (0,len(grid)-1)
+    return dict(protocol='held_out_source_train_supervised_mae_common_grid_v3',
+        selected_index=index,selected_lambda=float(grid[index]),
+        criterion='minimum_source_train_holdout_mae_on_all_29_candidates',
+        candidate_lambdas=grid.tolist(),candidate_mae=errors.tolist(),
+        tie_rule='smallest_lambda_within_1e-12',holdout_mae=float(errors[index]),
+        status='scale_unresolved' if unresolved else 'selected',scale_unresolved=unresolved)
+
+
+def known_plan(curve,scales,target):
+    selection=supervised_common_selection(curve,scales,target)
+    return dict(protocol='known_lid_measurements_v3',kneed_version=v2.PINNED_KNEED_VERSION,
         coordinate='reference_vp_time',S=1.0,curve='convex',direction='decreasing',
         online=False,interp_method='interp1d',fallback='ambient_dimension',
-        common_scales=grid.tolist(),legacy_scales=legacy_scales().tolist(),
-        supervised_common_grid=dict(selected_index=index,selected_lambda=float(grid[index]),
-            criterion='minimum_source_train_holdout_mae_on_all_29_candidates',
-            tie_rule='smallest_lambda_within_1e-12',holdout_mae=float(errors[index])),
+        common_scales=selection['candidate_lambdas'],legacy_scales=legacy_scales().tolist(),
+        primary_automatic_metric=PRIMARY_AUTOMATIC_METRIC,
+        legacy_role='historical_reproduction_only',supervised_common_grid=selection,
         test_labels_used_for_selection=False)
 
 
@@ -115,6 +127,8 @@ def pointwise(curve,scales,ambient_dim):
 
 
 def known_results(common_curve,legacy_curve,target,plan,ambient_dim):
+    if plan['primary_automatic_metric']!=PRIMARY_AUTOMATIC_METRIC:
+        raise ValueError('primary automatic selection must use the common grid')
     common,grid=validate_curve(common_curve,plan['common_scales'],target)
     legacy,old_grid=validate_curve(legacy_curve,plan['legacy_scales'],target)
     require_grid(grid,common_scales());require_grid(old_grid,legacy_scales())
