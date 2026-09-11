@@ -19,6 +19,7 @@ from datasets.registry import load_registry,apply_registry_overlay,load_split
 from experiments import global_campaign as v1,global_campaign_v2 as v2
 from experiments import fair_measurements as measurement
 from experiments import fair_outputs as outputs
+from experiments import fair_data
 from experiments.fair_protocol import (ROOT,protocol,native_contracts,geometry,resolve,
     parameter_count,source_identity,digest,audit_group,capacities)
 from models import training
@@ -113,6 +114,7 @@ def verify_measurements(path,row=None):
     """Replay receipts from saved arrays, including references and failed coverage."""
     measurement.validate_runtime()
     row=json.loads(path.read_text()) if row is None else row
+    fair_data.validate_receipt(row)
     root=path.parent
     if row['status']!='complete':raise ValueError('measurement is not complete')
     for name,key in [('model.pt','checkpoint_sha256'),('selection.json','selection_receipt_sha256'),
@@ -167,6 +169,7 @@ def verify_measurements(path,row=None):
                 'float64' if readout=='fixed_likelihood' else 'float32')
         if row['metrics']!=expected:raise ValueError('reported metrics differ from saved predictions')
         primary_values=z[primary] if selected is not None else None
+        response_values=z['response'] if 'response' in readouts else None
         if not known:
             if reference is None:
                 relative=outputs.reference_metrics(row,z,row,z)
@@ -181,12 +184,15 @@ def verify_measurements(path,row=None):
         if file_sha(curve_path)!=row['test_scale_curves_sha256']:raise ValueError('test scale curves changed')
         with np.load(curve_path,allow_pickle=False) as z:
             expected,arrays=measurement.known_results(z['common_prediction'],z['legacy_prediction'],
-                target,plan,receipt['resolved']['geometry']['ambient_dim'])
+                target,plan,receipt['resolved']['geometry']['ambient_dim'],
+                response_curves=(z['common_response'],z['legacy_response']) if 'response' in readouts else None)
             if set(arrays)!=set(z.files) or any(not np.array_equal(z[k],v) for k,v in arrays.items()):
                 raise ValueError('pointwise decisions do not replay from saved curves')
             index=int(np.argmin(abs(z['common_scales']-selected)))
             if not np.array_equal(primary_values,z['common_prediction'][:,index]):
                 raise ValueError('primary prediction differs from its saved scale curve')
+            if response_values is not None and not np.array_equal(response_values,z['common_response'][:,index]):
+                raise ValueError('response did not reuse the Full-selected scale')
         if row['diagnostic_metrics']!=expected:raise ValueError('automatic metrics differ from saved curves')
         if row['automatic_metrics']!=expected[plan['primary_automatic_metric']]:
             raise ValueError('primary automatic metrics must report common-grid Kneedle')
@@ -210,6 +216,7 @@ def run(args):
     if data_root is None:raise ValueError('provide the data root for this source kind')
     # Test split is not loaded until selection.json has been written below.
     loaded=load_split(data_root,spec,'train',representation=cell.representation,mmap_mode='r')
+    train_hashes=fair_data.validate_loaded(cell,loaded,'train')
     raw=loaded.features.reshape(len(loaded.features),-1)
     geo=geometry(cell.dataset,cell.representation,loaded.feature_shape)
     part=v1.partition_source_train(raw,loaded.lid,selection=cfg['campaign']['selection'],seed=0)
@@ -226,7 +233,8 @@ def run(args):
     sources=source_identity()
     manifest=dict(variant=args.variant,cell_key=cell.key,cell=asdict(cell),resolved=resolved,
         config=config.to_dict(),kind=resolved['kind'],protocol_sha256=digest(protocol()),
-        source_sha256=sources,train_files_sha256={p.name:file_sha(p) for p in loaded.source_paths.values()},
+        source_sha256=sources,train_files_sha256=train_hashes,
+        input_manifest_sha256=fair_data.contract_sha(),query_order_contract='pinned_input_rows_v1',
         registry_sha256=file_sha(ROOT/cell.registry),registry_overlay_sha256=file_sha(ROOT/cell.registry_overlay) if cell.registry_overlay else None,
         fit_indices_sha256=v1._array_sha(part.fit_indices),holdout_indices_sha256=v1._array_sha(part.selection_indices),
         effective_fit_indices_sha256=v1._array_sha(part.fit_indices[:len(fit)]),
@@ -282,6 +290,7 @@ def run(args):
     write_json(out/'selection.json',receipt)
     selection_hash=file_sha(out/'selection.json')
     test=load_split(data_root,spec,'test',representation=cell.representation,mmap_mode='r')
+    test_hashes=fair_data.validate_loaded(cell,test,'test')
     queries=test.features.reshape(len(test.features),-1)
     if args.preflight:queries=queries[:min(16,len(queries))]
     targets=np.asarray(test.lid).reshape(-1)[:len(queries)] if known and test.lid is not None else None
@@ -291,13 +300,19 @@ def run(args):
     if known:
         common_curve=predict(queries,scales)
         legacy_curve=predict(queries,measurement.legacy_scales())
-        diagnostics,arrays=measurement.known_results(common_curve,legacy_curve,targets,plan,geo['ambient_dim'])
+        response_curves=(predict(queries,scales,'response'),predict(queries,measurement.legacy_scales(),'response')) \
+            if 'response' in outputs.readouts(args.variant) else None
+        diagnostics,arrays=measurement.known_results(common_curve,legacy_curve,targets,plan,geo['ambient_dim'],
+            response_curves=response_curves)
         np.savez_compressed(out/'test_scale_curves.npz',**arrays)
     if selected is not None:
         readouts=outputs.readouts(args.variant)
         for readout in readouts:
             if args.variant=='scale_conditioned_nf' and readout=='fixed_likelihood':result.model.double()
-            values=common_curve[:,int(np.argmin(abs(scales-selected)))] if known and readout==primary else predict(queries,[selected],readout)[:,0]
+            if known and readout in (primary,'response'):
+                values=(common_curve if readout==primary else response_curves[0])[:,int(np.argmin(abs(scales-selected)))]
+            else:
+                values=predict(queries,[selected],readout)[:,0]
             predictions[readout]=values
             metrics[readout]=measurement.metric(values,targets,
                 'float64' if args.variant=='scale_conditioned_nf' and readout=='fixed_likelihood' else 'float32')
@@ -306,7 +321,7 @@ def run(args):
     final=dict(receipt,status='complete',measurement_status=status,selection_receipt_sha256=selection_hash,
         test_n=len(queries),test_labels_sha256=v1._array_sha(labels),metrics=metrics,diagnostic_metrics=diagnostics,
         automatic_metrics=diagnostics[plan['primary_automatic_metric']] if known else {},
-        test_files_sha256={p.name:file_sha(p) for p in test.source_paths.values()},
+        test_files_sha256=test_hashes,
         test_predictions_sha256=file_sha(out/'test_predictions.npz'),
         test_scale_curves_sha256=file_sha(out/'test_scale_curves.npz') if known else None,
         total_seconds=time.monotonic()-start,test_loaded=True,reload_exact=True)

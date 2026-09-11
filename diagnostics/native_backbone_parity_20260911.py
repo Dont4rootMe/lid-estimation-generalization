@@ -49,7 +49,8 @@ def audit_routes():
                 assert core_signature==field_signature,(cell.key,variant)
                 assert cfg.image_width==8 if geo['kind']=='image' else cfg.field_residual_width==512
             elif geo['kind']=='image':
-                assert cfg.image_width==9 and len(model.couplings)==8
+                assert cfg.image_width==4 and len(model.couplings)==2
+                assert abs(resolved['nf_relative_gap'])<=.1
             rows.append(dict(cell_key=cell.key,variant=variant,resolved=resolved,
                 core_class=type(core).__module__+'.'+type(core).__name__,
                 core_state_shapes_sha256=core_signature,configuration=cfg.to_dict()))

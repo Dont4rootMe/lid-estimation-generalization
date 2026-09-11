@@ -4,6 +4,9 @@ import pytest
 
 from experiments import fair_outputs as out, fair_measurements as m
 from experiments.fair_campaign import inventory, dataset_spec
+from experiments import fair_data
+
+pytestmark=pytest.mark.usefixtures('fixture_input_manifest')
 
 
 def entry(tmp_path, dataset, *, policy='paired_delta', reference='base',
@@ -18,6 +21,11 @@ def entry(tmp_path, dataset, *, policy='paired_delta', reference='base',
         selection=dict(failure_reason='no_knee' if failed else None),
         checkpoint_sha256='fixture', protocol_sha256='fixture',
         test_files_sha256={'dataset.npy':'same_fixture'}, reference_metrics={})
+    pinned=fair_data.manifest()
+    pinned['cells'][row['cell_key']]=dict(cell)
+    pinned['datasets'][dataset]={'files':{dataset+'/test/dataset.npy':
+        dict(sha256='same_fixture',size_bytes=0)}}
+    row.update(input_manifest_sha256=fair_data.contract_sha(),query_order_contract='pinned_input_rows_v1')
     arrays = dict(query_ids=np.arange(2, dtype=np.int64), labels=np.array(labels, dtype=np.int64), target=np.array([]))
     if not failed:
         arrays.update({r: np.array(values) for r in out.readouts(variant)})
@@ -44,7 +52,7 @@ def test_paired_mae_cannot_be_replaced_by_error_of_means(tmp_path):
         # Deltas 6 and 2 average to the expected 4, but each misses by 2.
         assert row['mae'] == 2. and row['bias'] == 0.
         assert row['selected_coordinate'] == 2.
-        assert row['pairing_status'] == 'canonical_row_order_and_labels_checked'
+        assert row['pairing_status'] == 'pinned_canonical_files_row_order_and_labels_checked'
     assert [r['is_primary_readout'] for r in rows] == [True, False]
 
 
@@ -137,19 +145,21 @@ def test_known_export_keeps_primary_automatic_legacy_and_secondary_scales_separa
     plan = m.known_plan(curve, scales, target)
     row['selected_lambda'] = 1.
     arrays.update(target=target, full=target.copy(), response=target + .25)
-    row['diagnostic_metrics'], curves = m.known_results(curve, np.ones((2, 22)), target, plan, 30)
+    row['diagnostic_metrics'], curves = m.known_results(curve, np.ones((2, 22)), target, plan, 30,
+        response_curves=(curve+.25,np.ones((2,22))+.25))
     np.savez_compressed(path / 'test_predictions.npz', **arrays)
     np.savez_compressed(path / 'test_scale_curves.npz', **curves)
     records = out.result_records([(row, path)])
-    assert len(records) == 4
+    assert len(records) == 6
     supervised = [r for r in records if r['selection_protocol'] == out.SUPERVISED]
     assert {r['readout'] for r in supervised} == {'full', 'response'}
     assert all(r['selected_coordinate'] == 1. and r['true_lid_mean'] == 2. for r in supervised)
     automatic = [r for r in records if r['selection_protocol'] == out.POINTWISE]
-    assert len(automatic) == 1 and automatic[0]['selected_coordinate'] is None
-    assert all(r['readout'] == 'full' for r in records if r not in supervised)
+    assert len(automatic) == 2 and all(r['selected_coordinate'] is None for r in automatic)
+    assert {r['readout'] for r in automatic}=={'full','response'}
+    assert automatic[0]['selected_lambda_counts']==automatic[1]['selected_lambda_counts']
     out.write_csv(tmp_path / 'results.csv', records)
-    assert (tmp_path / 'results.csv').read_text().count(out.POINTWISE) == 1
+    assert (tmp_path / 'results.csv').read_text().count(out.POINTWISE) == 2
 
 
 def test_full_table_tracks_do_not_pool_generated_cells_or_historical_kneedle():
@@ -164,7 +174,7 @@ def test_full_table_tracks_do_not_pool_generated_cells_or_historical_kneedle():
         selectors = (out.SUPERVISED, out.POINTWISE, out.LEGACY) if cell.target_policy == 'known_lid' else (out.REFERENCE,)
         records.extend(dict(row, selection_protocol=s, mae=999. if s == out.LEGACY else row['mae']) for s in selectors)
     scores = out.table_scores(records, [vars(c) for c in inventory_cells])
-    scores = [r for r in scores if r['model_variant'] == 've_diffusion']
+    scores = [r for r in scores if r['model_variant'] == 've_diffusion' and r['readout']=='full']
     assert len(scores) == 12 and all(r['status'] == 'available' for r in scores)
     expected = dict(zip(out.SCORES, (.25, .25, .5, 0., .5, .5)))
     counts = dict(zip(out.SCORES, (7, 7, 1, 13, 4, 2)))

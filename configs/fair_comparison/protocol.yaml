@@ -1,5 +1,5 @@
-schema_version: 7
-id: full_ambient_shared_stock8_retained_nf_v7
+schema_version: 8
+id: full_primary_shared_selection_matched_nf_v8
 scope: all 39 campaign representations and 13 native interfaces
 architecture_rule: full supplied coordinates or full images; no fitted support projection
 vector_data:
@@ -14,12 +14,12 @@ image_data:
   residual_scaling: gaussian_tail_v1
 nf:
   architecture: invertible RealNVP; spatial U-Net conditioners on images
-  capacity_target: actual common vector backbone for coefficients; retained image NF is exempt
+  capacity_target: actual common field backbone for each representation
   maximum_relative_parameter_gap: 0.1
-  width_selection: closest parameter count for vectors; fixed retained width for images
-  image_capacity_policy: retained_image_nf_d296210
-  image_conditioner_width: 9
-  image_coupling_layers: 8
+  width_selection: closest parameter count; no validation or test quality enters architecture selection
+  image_capacity_policy: matched_to_shared_image_field
+  image_width_candidates: [4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 24, 32, 48, 64]
+  image_coupling_layer_candidates: [2, 4, 6, 8]
   max_condition_frequency: 1.0
 training:
   seed: 0
@@ -40,8 +40,9 @@ training:
     method definitions
 selection:
   weights: lowest native holdout loss, same raw/EMA candidates and validation intervals
-  known_lid_scale: minimum source-train holdout MAE on all 29 half-octaves from 1/256 through 64
-  unknown_lid_scale: source-train reference mean Kneedle; freeze and transfer to dependent
+  primary_quantity: full density LID for every family; NF estimates it by OLS5
+  known_lid_scale: minimum Full source-train holdout MAE on all 29 half-octaves from 1/256 through 64
+  unknown_lid_scale: Full source-train reference mean Kneedle; freeze and transfer to dependent
     cells
   image_trace_probes: 64
   vector_trace: exact full-ambient Jacobian for every vector interface
@@ -59,13 +60,14 @@ measurement:
   automatic_coverage: report every fallback and boundary choice; retain all queries in MAE
   unknown_failure: propagate reference failure reason and report missing measurement coverage
   verification: replay selection and all metrics from hashed query-level artifacts
-  secondary_readouts: FM and bridge response at the frozen primary scale; no separate tuning
+  inputs: validate loaded file bytes against configs/fair_comparison/input_manifest.json before using each split
+  secondary_readouts: response for every field at Full-selected supervised and pointwise Kneedle scales; no separate tuning
   e1: mean drift on identical test data; retain original source-train sample count
   e5: pointwise transformed-minus-reference MAE against the declared LID delta
-  pairing: canonical archive row order, checked query IDs and saved class-label order
+  pairing: pinned input-file hashes establish canonical row order; additionally check query IDs and class-label order
   export: separate canonical/generated and supervised/common-Kneedle/historical tracks
   score_coverage: never omit failed cells; zero E1 reference mean has no relative score
-  non_gaussian: native response only; no Gaussian full or score conversion
+  non_gaussian: native radial-Student Full including the posterior log-scale derivative; Response is secondary
   scale_units: per-coordinate RMS noise; equals beta/alpha for unit-variance Gaussian sources
 non_gaussian:
   models: t_flowmatching nu5 and pfgmpp augmented dimension128
@@ -78,4 +80,4 @@ non_gaussian:
   image_routing: common U-Net with all ambient coordinates retained
 budget_interpretation: equal updates and network examples; parameters matched within
   10 percent for NF, measured elapsed time recorded; FLOPs are not claimed equal
-old_results: projected runs excluded from paper including ablations; aggregation requires fresh matching protocol receipts
+old_results: projected, response-primary and unmatched-image-NF runs excluded; aggregation requires fresh matching protocol receipts

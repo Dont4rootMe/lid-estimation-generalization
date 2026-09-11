@@ -1,4 +1,4 @@
-"""Prevent a separate backbone for new native families or accidental NF shrinkage."""
+"""Prevent separate field backbones and enforce the revised NF capacity match."""
 import copy
 
 import pytest
@@ -10,10 +10,10 @@ from models.spectral_residual_field import SpectralResidualCore
 
 
 @pytest.mark.parametrize('shape,dimension,field_count,nf_count',[
-    ([1,28,28],784,97905,905008),
-    ([32,32,3],3072,98195,908928),
+    ([1,28,28],784,97905,106012),
+    ([32,32,3],3072,98195,106452),
 ])
-def test_every_image_field_uses_the_same_stock8_core_and_retained_nf(shape,dimension,field_count,nf_count):
+def test_every_image_field_uses_the_same_stock8_core_and_matched_nf(shape,dimension,field_count,nf_count):
     geo=fair.geometry('full_image_fixture','dataset',shape)
     reference=None;rows=[]
     for variant in fair.native_contracts():
@@ -23,10 +23,11 @@ def test_every_image_field_uses_the_same_stock8_core_and_retained_nf(shape,dimen
         assert cfg.field_projection_rank is None
         assert fair.parameter_count(model)==receipt['actual_parameters']
         if variant=='scale_conditioned_nf':
-            assert cfg.image_width==9 and len(model.couplings)==8
+            assert cfg.image_width==4 and len(model.couplings)==2
             assert fair.parameter_count(model)==nf_count
-            assert not receipt['nf_capacity_match_required']
-            assert receipt['nf_capacity_policy']=='retained_image_nf_d296210'
+            assert receipt['nf_capacity_match_required']
+            assert abs(receipt['nf_relative_gap'])<=.1
+            assert receipt['nf_capacity_policy']=='matched_to_shared_image_field'
         else:
             assert type(model.core) is ImageUNet and cfg.image_width==8
             assert model.core.input.out_channels==8
@@ -76,12 +77,12 @@ def test_declared_width_changes_the_model_and_capacity_cache_together(monkeypatc
         assert fair.parameter_count(model)==after['actual_parameters']!=before['actual_parameters']
         assert (cfg.image_width if kind=='image' else cfg.field_residual_width)==new_width
         if kind=='image':
-            assert after['nf_width']==before['nf_width']==9
-            assert after['nf_parameters']==before['nf_parameters']
+            assert after['nf_parameters']!=before['nf_parameters']
+            assert abs(after['nf_relative_gap'])<=.1
 
 
-def test_retained_nf_policy_rejects_an_implicit_width_change(monkeypatch):
-    rules=copy.deepcopy(fair.protocol());rules['nf']['image_conditioner_width']=8
+def test_nf_policy_rejects_candidates_without_a_capacity_match(monkeypatch):
+    rules=copy.deepcopy(fair.protocol());rules['nf']['image_width_candidates']=[32]
     monkeypatch.setattr(fair,'protocol',lambda:rules)
-    with pytest.raises(ValueError,match='retained image NF policy'):
+    with pytest.raises(ValueError,match='no NF capacity match'):
         fair.resolve('t_flowmatching',fair.geometry('fixture','dataset',[1,28,28]))

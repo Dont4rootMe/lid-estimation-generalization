@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 
 from experiments.fair_protocol import native_contracts
+from experiments import fair_data
 from experiments.metrics import known_lid_metrics, prediction_summary, paired_delta_metrics
 
 
@@ -27,11 +28,9 @@ SCORES = ('strict_coefficients', 'strict_dataset', 'arrows_mae',
 def readouts(variant):
     if variant == 'scale_conditioned_nf':
         return ('ols5', 'fixed_likelihood')
-    family = native_contracts()[variant]['family']
-    if family in ('student_t_flow','pfgmpp'):
-        return ('response',)
-    return ('full', 'response') if family in (
-        'independent_affine_flow', 'rectified_flow', 'schrodinger_bridge') else ('full',)
+    if variant not in native_contracts():
+        raise ValueError('unknown native interface')
+    return ('full', 'response')
 
 
 def finite_vector(value, name):
@@ -77,6 +76,8 @@ def reference_metrics(row, arrays, reference, reference_arrays):
     if row['selected_lambda'] != reference['selected_lambda']:
         raise ValueError('dependent result did not reuse frozen reference lambda')
     paired = cell['target_policy'] == 'paired_delta'
+    if paired:
+        fair_data.validate_pair(row,reference)
     check_alignment(arrays, reference_arrays, paired=paired)
     if not paired and row['test_files_sha256'] != reference['test_files_sha256']:
         raise ValueError('E1 must use the same reference test data')
@@ -135,6 +136,15 @@ def result_records(entries):
                         fallback_n=diagnostic['fallback_n'], boundary_n=diagnostic['boundary_n'],
                         detected_n=diagnostic['detected_n'],
                         selected_lambda_counts=diagnostic['selected_lambda_counts']))
+                    if 'response' in readouts(row['variant']):
+                        values=finite_vector(z[name+'_response_prediction'],name+' response')
+                        records.append(dict(common, **known_lid_metrics(values,target), **target_stats,
+                            analysis='known_lid',selection_protocol=selector,readout='response',
+                            is_primary_readout=False,readout_scale_rule='reuse_full_pointwise_indices_and_fallback',
+                            selected_coordinate=None,selection_status='selected',failure_reason=None,
+                            fallback_n=diagnostic['fallback_n'],boundary_n=diagnostic['boundary_n'],
+                            detected_n=diagnostic['detected_n'],
+                            selected_lambda_counts=diagnostic['selected_lambda_counts']))
             continue
         reference_key = (f"{cell['suite_id']}/{cell['reference_dataset']}/{cell['representation']}", row['variant'])
         if reference_key not in indexed:
@@ -152,7 +162,7 @@ def result_records(entries):
                 is_primary_readout=readout == row['primary_readout'],
                 readout_scale_rule='reuse_reference_primary_holdout_scale',
                 expected_lid_delta=cell['expected_lid_delta'],
-                pairing_status='canonical_row_order_and_labels_checked' if paired else 'identical_test_files_checked'))
+                pairing_status='pinned_canonical_files_row_order_and_labels_checked' if paired else 'identical_test_files_checked'))
     return records
 
 
@@ -223,7 +233,7 @@ def table_scores(records, cells):
     for variant in native_contracts():
         for readout in readouts(variant):
             primary = readout == readouts(variant)[0]
-            for selector in (SUPERVISED, POINTWISE) if primary else (SUPERVISED,):
+            for selector in (SUPERVISED, POINTWISE) if primary or readout=='response' else (SUPERVISED,):
                 selected = [r for r in records if r['model_variant'] == variant and r['readout'] == readout
                     and r['inventory_origin'] == 'canonical_35'
                     and r['selection_protocol'] in (selector, REFERENCE)]

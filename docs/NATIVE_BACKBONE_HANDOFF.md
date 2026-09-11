@@ -1,4 +1,9 @@
-# Shared native backbones: upstream handoff
+# Shared native backbones: historical v7 handoff
+
+This document records commit48f719f. The subsequent author decision changes
+image NF capacity and makes Full primary for every field. The current contract
+is documented in [BENCHMARK_FULL_CONTRACT.md](BENCHMARK_FULL_CONTRACT.md)
+and `configs/fair_comparison/README.md`; v7 results are not v8 results.
 
 The common runner now applies the author-selected stock image width8 to all
 twelve field interfaces, including t-Flow and PFGM++. Previously its resolver

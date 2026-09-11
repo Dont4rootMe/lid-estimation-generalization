@@ -120,13 +120,13 @@ def test_actual_field_native_trace_and_finite_difference_agree(variant,image):
 
 
 @pytest.mark.parametrize('variant',['t_flowmatching','pfgmpp'])
-@pytest.mark.parametrize('readout',['full','fm_to_score','fixed_likelihood'])
+@pytest.mark.parametrize('readout',['fm_to_score','fixed_likelihood'])
 def test_gaussian_lid_conversions_are_rejected(variant,readout):
     model,_=initialized(variant)
-    with pytest.raises(ValueError,match='response only'):
+    with pytest.raises(ValueError,match='not Gaussian score conversion'):
         training.predict_lid(model,np.ones((2,7)),.5,family=native_contracts()[variant]['family'],
             readout=readout,divergence_backend='active_exact',trace_probes=0)
-    assert readouts(variant)==('response',)
+    assert readouts(variant)==('full','response')
 
 
 @pytest.mark.parametrize('variant',['t_flowmatching','pfgmpp'])
@@ -170,6 +170,7 @@ def test_training_and_reload_use_common_budget_selection_and_exact_parameter_cou
     assert result.metrics['steps_completed']==8
     assert parameter_count(result.model)==expected['reference_parameters']
     assert not hasattr(result.model,'basis')
-    a=training.predict_lid(result,raw[:5],.5,readout='response',divergence_backend='exact',trace_probes=0)
-    b=training.predict_lid(loaded,raw[:5],.5,readout='response',divergence_backend='exact',trace_probes=0)
-    np.testing.assert_allclose(a,b,atol=2e-5,rtol=2e-5)
+    for readout in ('full','response'):
+        a=training.predict_lid(result,raw[:5],.5,readout=readout,divergence_backend='exact',trace_probes=0)
+        b=training.predict_lid(loaded,raw[:5],.5,readout=readout,divergence_backend='exact',trace_probes=0)
+        np.testing.assert_allclose(a,b,atol=2e-5,rtol=2e-5)

@@ -10,6 +10,9 @@ from experiments import fair_measurements as m,global_campaign_v2 as v2
 from experiments.fair_campaign import (select_scale,validate_reference,verify_measurements,
     write_json,file_sha)
 from experiments.global_campaign import _array_sha
+from experiments import fair_data
+
+pytestmark=pytest.mark.usefixtures('fixture_input_manifest')
 
 
 def test_legacy_pointwise_matches_pinned_flipd():
@@ -102,6 +105,12 @@ def make_receipt(root,known=True,reference=None):
         holdout_curve_sha256=file_sha(root/'holdout_curve.npz'),primary_readout='full',
         measurement_plan=plan,test_loaded=False)
     if reference:receipt['reference_receipt_sha256']=file_sha(reference)
+    pinned=fair_data.manifest()
+    pinned['cells'][receipt['cell_key']]=dict(receipt['cell'])
+    pinned['datasets'][cell.dataset]={'files':{
+        cell.dataset+'/'+s+'/dataset.npy':dict(sha256='fixture',size_bytes=0) for s in ('train','test')}}
+    receipt.update(input_manifest_sha256=fair_data.contract_sha(),query_order_contract='pinned_input_rows_v1',
+        train_files_sha256={'dataset.npy':'fixture'})
     write_json(root/'selection.json',receipt)
     pred=dict(query_ids=np.arange(4,dtype=np.int64),labels=np.asarray([],dtype=np.int64),
         target=np.asarray([] if target is None else target))
@@ -109,8 +118,11 @@ def make_receipt(root,known=True,reference=None):
     if selected is not None:
         pred['full']=curve[:,int(np.argmin(abs(grid-selected)))]
         metrics['full']=m.metric(pred['full'],target)
+        pred['response']=pred['full']+.25
+        metrics['response']=m.metric(pred['response'],target)
     if known:
-        diagnostics,arrays=m.known_results(curve,np.ones((4,22)),target,plan,30)
+        diagnostics,arrays=m.known_results(curve,np.ones((4,22)),target,plan,30,
+            response_curves=(curve+.25,np.ones((4,22))+.25))
         np.savez_compressed(root/'test_scale_curves.npz',**arrays)
     np.savez_compressed(root/'test_predictions.npz',**pred)
     final=dict(receipt,status='complete',measurement_status=selection['status'],test_loaded=True,

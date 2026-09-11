@@ -88,6 +88,7 @@ def supervised_common_selection(curve,scales,target):
     index=int(np.flatnonzero(errors<=errors.min()+1e-12)[0])
     unresolved=index in (0,len(grid)-1)
     return dict(protocol='held_out_source_train_supervised_mae_common_grid_v3',
+        selection_quantity='full_density_lid',
         selected_index=index,selected_lambda=float(grid[index]),
         criterion='minimum_source_train_holdout_mae_on_all_29_candidates',
         candidate_lambdas=grid.tolist(),candidate_mae=errors.tolist(),
@@ -98,6 +99,7 @@ def supervised_common_selection(curve,scales,target):
 def known_plan(curve,scales,target):
     selection=supervised_common_selection(curve,scales,target)
     return dict(protocol='known_lid_measurements_v3',kneed_version=v2.PINNED_KNEED_VERSION,
+        selection_quantity='full_density_lid',secondary_scale_rule='reuse_full_indices',
         coordinate='reference_vp_time',S=1.0,curve='convex',direction='decreasing',
         online=False,interp_method='interp1d',fallback='ambient_dimension',
         common_scales=selection['candidate_lambdas'],legacy_scales=legacy_scales().tolist(),
@@ -126,7 +128,7 @@ def pointwise(curve,scales,ambient_dim):
     return prediction,index,index<0
 
 
-def known_results(common_curve,legacy_curve,target,plan,ambient_dim):
+def known_results(common_curve,legacy_curve,target,plan,ambient_dim,*,response_curves=None):
     if plan['primary_automatic_metric']!=PRIMARY_AUTOMATIC_METRIC:
         raise ValueError('primary automatic selection must use the common grid')
     common,grid=validate_curve(common_curve,plan['common_scales'],target)
@@ -141,6 +143,13 @@ def known_results(common_curve,legacy_curve,target,plan,ambient_dim):
         selected_lambda=float(grid[index]),selection_partition='source_train_holdout'))
     arrays=dict(common_scales=grid,common_prediction=common,
         legacy_scales=old_grid,legacy_prediction=legacy)
+    if response_curves is not None:
+        response_common,_=validate_curve(response_curves[0],grid,target)
+        response_legacy,_=validate_curve(response_curves[1],old_grid,target)
+        if response_common.shape!=common.shape or response_legacy.shape!=legacy.shape:
+            raise ValueError('response and Full query sets differ')
+        arrays.update(common_response=response_common,legacy_response=response_legacy)
+        results['supervised_common_grid']['response']=metric(response_common[:,index],target)
     for name,values,scales in [('kneedle_legacy',legacy,old_grid),('kneedle_common_grid',common,grid)]:
         prediction,indices,fallback=pointwise(values,scales,ambient_dim)
         results[name]=dict(metric(prediction,target),fallback_n=int(fallback.sum()),
@@ -151,4 +160,13 @@ def known_results(common_curve,legacy_curve,target,plan,ambient_dim):
         arrays[name+'_prediction']=prediction
         arrays[name+'_index']=indices
         arrays[name+'_fallback']=fallback
+        if response_curves is not None:
+            response_curve=response_legacy if name=='kneedle_legacy' else response_common
+            # A missing Full knee means no lambda exists for either readout.
+            # Keep the identical ambient fallback and all queries in both MAEs.
+            response=np.full(len(values),float(ambient_dim))
+            valid=np.flatnonzero(~fallback)
+            response[valid]=response_curve[valid,indices[valid]]
+            arrays[name+'_response_prediction']=response
+            results[name]['response']=metric(response,target)
     return results,arrays

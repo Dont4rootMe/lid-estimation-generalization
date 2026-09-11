@@ -38,7 +38,7 @@ def native_contracts():
     for variant,settings in additions['models'].items():
         base=copy.deepcopy(result['ve_diffusion'])
         base.update(id=variant,name=settings['name'],family=settings['family'],
-            readout='response',primary_readout='response',native_coordinate='lambda',
+            readout='full',primary_readout='full',native_coordinate='lambda',
             kernel_df=settings['kernel_df'],scale_units='per_coordinate_rms_noise')
         base['training'].update(kernel_df=settings['kernel_df'],
             kernel_log_scale_mean=additions['pfgm_log_sigma_mean'],
@@ -72,30 +72,36 @@ def capacities(kind,dimension):
     """dimension is the complete vector dimension or the image channel count."""
     rules=protocol()
     field_width=rules[kind+'_data']['width']
-    image_nf_width=rules['nf']['image_conditioner_width']
-    for name,value in [('field width',field_width),('image NF width',image_nf_width)]:
+    widths=tuple(rules['nf']['image_width_candidates'])
+    layers=tuple(rules['nf']['image_coupling_layer_candidates'])
+    for name,value in [('field width',field_width)]+[('image NF width',w) for w in widths]:
         if isinstance(value,bool) or not isinstance(value,int) or value<4:
             raise ValueError(name+' must be an integer at least four')
-    if (rules['nf']['image_capacity_policy']!='retained_image_nf_d296210'
-            or image_nf_width!=9
-            or rules['nf']['image_coupling_layers']!=8):
-        raise ValueError('unsupported retained image NF policy')
+    if (rules['nf']['image_capacity_policy']!='matched_to_shared_image_field'
+            or not widths or not layers
+            or any(isinstance(n,bool) or not isinstance(n,int) or n<2 or n%2 for n in layers)):
+        raise ValueError('invalid image NF capacity policy; both checkerboard parities are required')
     # All policy values enter the cache key: changing a declared width must
     # update parameter counts and the instantiated model in the same process.
-    return dict(_capacities(kind,dimension,field_width,image_nf_width,
+    return dict(_capacities(kind,dimension,field_width,widths,layers,
         rules['nf']['maximum_relative_parameter_gap']))
 
 
 @lru_cache(maxsize=None)
-def _capacities(kind,dimension,field_width,image_nf_width,maximum_gap):
+def _capacities(kind,dimension,field_width,image_nf_widths,image_nf_layers,maximum_gap):
     with torch.device('meta'):
         target=parameter_count(SpectralResidualCore(dimension,width=field_width)
             if kind=='vector' else ImageUNet(dimension,field_width))
         if kind=='image':
-            actual=8*parameter_count(ImageUNet(dimension,image_nf_width,output_channels=2*dimension))
-            return dict(reference_parameters=target,nf_parameters=actual,nf_width=image_nf_width,
-                nf_relative_gap=(actual-target)/target,nf_capacity_match_required=False,
-                nf_capacity_policy='retained_image_nf_d296210',nf_maximum_relative_parameter_gap=maximum_gap)
+            candidates=[(abs(n*parameter_count(ImageUNet(dimension,w,output_channels=2*dimension))-target)/target,w,n)
+                for w in image_nf_widths for n in image_nf_layers]
+            gap,width,layers=min(candidates)
+            if gap>maximum_gap:
+                raise ValueError('no NF capacity match within the declared tolerance')
+            actual=layers*parameter_count(ImageUNet(dimension,width,output_channels=2*dimension))
+            return dict(reference_parameters=target,nf_parameters=actual,nf_width=width,nf_coupling_layers=layers,
+                nf_relative_gap=(actual-target)/target,nf_capacity_match_required=True,
+                nf_capacity_policy='matched_to_shared_image_field',nf_maximum_relative_parameter_gap=maximum_gap)
         if kind!='vector':
             raise ValueError('unknown geometry kind')
         candidates=[]
@@ -108,7 +114,7 @@ def _capacities(kind,dimension,field_width,image_nf_width,maximum_gap):
     gap,width,actual=min(candidates)
     if gap>maximum_gap:
         raise ValueError('no NF capacity match within the declared tolerance')
-    return dict(reference_parameters=target,nf_parameters=actual,nf_width=width,
+    return dict(reference_parameters=target,nf_parameters=actual,nf_width=width,nf_coupling_layers=8,
         nf_relative_gap=(actual-target)/target,nf_capacity_match_required=True,
         nf_capacity_policy='matched_to_full_vector_field',nf_maximum_relative_parameter_gap=maximum_gap)
 
@@ -143,7 +149,7 @@ def resolve(variant,geo,*,rank=None,device='cuda',steps=None,preflight=False):
         image_width=(cap['nf_width'] if nf else field_rule['width']) if image else
             training.TrainingConfig.__dataclass_fields__['image_width'].default)
     if nf:
-        keys.update(hidden_dim=cap['nf_width'],max_condition_frequency=1.,num_coupling_layers=8,
+        keys.update(hidden_dim=cap['nf_width'],max_condition_frequency=1.,num_coupling_layers=cap['nf_coupling_layers'],
                     conditioner_depth=2,time_embedding_dim=128)
     config=replace(training.TrainingConfig.from_mapping(base['training']),**keys)
     return config,dict(**cap,actual_parameters=cap['nf_parameters'] if nf else cap['reference_parameters'],
@@ -166,7 +172,7 @@ def build_model(variant,config,ambient_dim):
 
 def source_identity():
     paths=[p for folder in ('models','experiments','datasets','utils')
-           for p in sorted((ROOT/folder).glob('*.py'))]+sorted((ROOT/'configs').rglob('*.yaml'))
+           for p in sorted((ROOT/folder).glob('*.py'))]+sorted((ROOT/'configs').rglob('*.yaml'))+sorted((ROOT/'configs').rglob('*.json'))
     return {str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
 
 
@@ -179,16 +185,13 @@ def audit_group(rows):
     for row in rows:
         item=row['resolved']
         for key in ('protocol_sha256','common_training','geometry','rank','kind','reference_parameters',
-                    'common_field_backbone','nf_parameters','nf_width','nf_relative_gap',
+                    'common_field_backbone','nf_parameters','nf_width','nf_coupling_layers','nf_relative_gap',
                     'nf_capacity_policy','nf_capacity_match_required','nf_maximum_relative_parameter_gap'):
             if item[key]!=first[key]:raise ValueError('mixed comparison policy: '+key)
         if row['variant']=='scale_conditioned_nf':
             if item['actual_parameters']!=item['nf_parameters']:
                 raise ValueError('NF parameters differ from its resolved architecture')
-            if item['geometry']['kind']=='image':
-                if item['nf_capacity_policy']!='retained_image_nf_d296210' or item['nf_capacity_match_required']:
-                    raise ValueError('image NF must preserve the retained architecture')
-            elif (not item['nf_capacity_match_required'] or
+            if (not item['nf_capacity_match_required'] or
                   abs(item['actual_parameters']/item['reference_parameters']-1)>item['nf_maximum_relative_parameter_gap']):
                 raise ValueError('NF capacity outside tolerance')
         elif item['actual_parameters']!=item['reference_parameters']:

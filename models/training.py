@@ -869,6 +869,20 @@ def _model_contract(family: Family, config: TrainingConfig) -> dict[str, Any]:
     return contract
 
 
+def _compatible_model_contract(stored, expected):
+    """Accept old Student weights, never old benchmark selection receipts.
+
+    v2 adds a density readout without changing any training or kernel setting.
+    Every other field must still match exactly, including the architecture.
+    """
+    if (expected.get('family') in {'student_t_flow','pfgmpp'}
+            and stored.get('schema_version') == 1
+            and stored.get('primary_readout') == 'response'):
+        stored = dict(stored, schema_version=2, primary_readout='full',
+            full_readout='student_posterior_density_dilation_v1')
+    return stored == expected
+
+
 def _native_model_contract(family: Family, config: TrainingConfig) -> dict[str, Any]:
     """Return the checkpointed scientific identity for one canonical family."""
 
@@ -1915,7 +1929,7 @@ def _load_training_progress(
         raise ValueError("training progress config mismatch") from exc
     if stored_config != config:
         raise ValueError("training progress config mismatch")
-    if payload["model_contract"] != _model_contract(family, config):
+    if not _compatible_model_contract(payload["model_contract"], _model_contract(family, config)):
         raise ValueError("training progress model contract mismatch")
     if payload["architecture"] != model.config.to_dict():
         raise ValueError("training progress architecture mismatch")
@@ -2153,7 +2167,7 @@ def _load_fixed_training_progress(
         raise ValueError("fixed-step training progress config mismatch") from exc
     if stored_config != config:
         raise ValueError("fixed-step training progress config mismatch")
-    if payload["model_contract"] != _model_contract(family, config):
+    if not _compatible_model_contract(payload["model_contract"], _model_contract(family, config)):
         raise ValueError("fixed-step training progress model contract mismatch")
     stored_architecture = payload["architecture"]
     if isinstance(model, NativeGaussianImageField):
@@ -3024,7 +3038,7 @@ def load_checkpoint(
     if (
         schema_version
         in {CHECKPOINT_SCHEMA_VERSION, FIXED_STEP_CHECKPOINT_SCHEMA_VERSION}
-        and payload["model_contract"] != expected_contract
+        and not _compatible_model_contract(payload["model_contract"], expected_contract)
     ):
         raise ValueError("checkpoint model_contract mismatch")
     if family == "scale_conditioned_normalizing_flow":
@@ -4058,15 +4072,13 @@ def predict_lid(
     model, canonical_family, mean, normalization_scale = _model_and_context(
         model_or_result, family
     )
-    if canonical_family in {'student_t_flow','pfgmpp'} and readout!='response':
-        raise ValueError('Student-t kernels support response only; Gaussian full/score conversion is invalid')
+    if canonical_family in {'student_t_flow','pfgmpp'} and readout not in {'full','response'}:
+        raise ValueError('Student-t kernels support native full and response, not Gaussian score conversion')
     if divergence_backend == 'active_exact':
         from models.preconditioned_field import covariance_span_value_and_trace,CovariancePreconditionedField
         if not isinstance(model,CovariancePreconditionedField):
             raise TypeError('active_exact requires the checkpointed covariance-span field')
         allowed={'full','response','fm_to_score'} if canonical_family=='independent_affine_flow' else {'full','response'}
-        if canonical_family in {'student_t_flow','pfgmpp'}:allowed={'response'}
-        if canonical_family in {'vp_diffusion','gaussian_diffusion'}:allowed={'full'}
         if readout not in allowed:raise ValueError('unsupported native-family readout')
         if not math.isfinite(scale) or scale<=0 or batch_size<=0:raise ValueError('positive scale and batch_size required')
         noise_ratio=float(scale)
@@ -4083,12 +4095,17 @@ def predict_lid(
             batch=normalized[start:start+batch_size].to(device=parameter.device,dtype=parameter.dtype)
             value,response=covariance_span_value_and_trace(model,batch,noise_ratio)
             value,response=value.double(),response.double()
-            prediction=response if readout=='response' else response+((value-batch.double())/noise_ratio).square().sum(1)
+            if canonical_family in {'student_t_flow','pfgmpp'} and readout=='full':
+                from models.student_density import density_dilation
+                prediction=density_dilation(model,batch,noise_ratio,response,
+                    model.training_config.kernel_df)[0]
+            else:
+                prediction=response if readout=='response' else response+((value-batch.double())/noise_ratio).square().sum(1)
             predictions.append(prediction.cpu())
         return np.asarray(torch.cat(predictions).numpy(),dtype=np.float64)
     if canonical_family in {'student_t_flow','pfgmpp'}:
         if divergence_backend not in {'exact','hutchinson'} or not math.isfinite(scale) or scale<=0 or batch_size<=0:
-            raise ValueError('invalid response derivative backend, scale or batch size')
+            raise ValueError('invalid Student derivative backend, scale or batch size')
         query_cpu=_flat_finite_data(query,name='query')
         if query_cpu.shape[1]!=model.config.ambient_dim:raise ValueError('query ambient dimension differs')
         normalized=(query_cpu-mean.reshape(1,-1))/normalization_scale
@@ -4098,6 +4115,10 @@ def predict_lid(
             batch=normalized[start:start+batch_size].to(device=parameter.device,dtype=parameter.dtype)
             response=(exact_divergence(model,batch,scale) if divergence_backend=='exact' else
                 hutchinson_divergence(model,batch,scale,num_probes=trace_probes,seed=None,generator=generator))
+            if readout=='full':
+                from models.student_density import density_dilation
+                response=density_dilation(model,batch,scale,response,
+                    model.training_config.kernel_df)[0]
             predictions.append(response.detach().double().cpu())
         return np.asarray(torch.cat(predictions).numpy(),dtype=np.float64)
     if canonical_family == "scale_conditioned_normalizing_flow":
@@ -4192,8 +4213,11 @@ def predict_lid(
     )
     ambient_dim = model.config.ambient_dim
     if canonical_family in {"gaussian_diffusion", "vp_diffusion"}:
+        if readout == 'response':
+            return np.asarray(ambient_dim + prediction.condition**2 * prediction.divergence,
+                dtype=np.float64)
         if readout != "full":
-            raise ValueError("diffusion supports only the full readout")
+            raise ValueError("diffusion supports full or response")
         return np.asarray(
             diffusion_flipd(
                 prediction.field,

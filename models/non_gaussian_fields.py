@@ -1,4 +1,4 @@
-"""t-Flow and PFGM++ with unit-RMS evaluation scales and native response LID.
+"""t-Flow and PFGM++ with unit-RMS evaluation scales and native density LID.
 
 t-Flow: Pandey et al., arXiv:2410.14171v2, Appendix B (164--166).
 PFGM++: Xu et al., PMLR 202 (2023), equations 4--6 and the EDM loss.
@@ -42,10 +42,11 @@ def validate_config(family, config):
 
 def contract(family, config):
     validate_config(family, config)
-    return dict(schema_version=1, family=family, kernel='radial_multivariate_student_t',
+    return dict(schema_version=2, family=family, kernel='radial_multivariate_student_t',
         kernel_df=config.kernel_df, evaluation_scale='per_coordinate_rms_noise',
         rms_to_student_scale=math.sqrt((config.kernel_df-2)/config.kernel_df),
-        rms_support=[config.sigma_min, config.sigma_max], primary_readout='response',
+        rms_support=[config.sigma_min, config.sigma_max], primary_readout='full',
+        full_readout='student_posterior_density_dilation_v1',
         native_field='dataward_rectified_velocity' if family=='student_t_flow' else 'radial_poisson_field',
         objective='native_student_noise_mse' if family=='student_t_flow' else 'edm_weighted_posterior_mse',
         scale_sampling='uniform_native_time' if family=='student_t_flow' else 'truncated_native_sigma_lognormal',

@@ -59,9 +59,10 @@ def test_image_capacity_and_training_policy_are_common(channels):
         assert cfg.noise_pairing=='antithetic_v1' and not cfg.image_training_bf16
         rows.append(dict(variant=variant,resolved=receipt))
     assert audit_group(rows)
-    assert rows[0]['resolved']['nf_width']==9
-    assert not rows[0]['resolved']['nf_capacity_match_required']
-    assert rows[0]['resolved']['nf_relative_gap']>1
+    assert rows[0]['resolved']['nf_width']==4
+    assert rows[0]['resolved']['nf_coupling_layers']==2
+    assert rows[0]['resolved']['nf_capacity_match_required']
+    assert abs(rows[0]['resolved']['nf_relative_gap'])<=.1
 
 
 def test_every_image_native_adapter_recovers_same_nonlinear_posterior_and_jacobian():
