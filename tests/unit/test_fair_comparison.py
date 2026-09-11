@@ -59,7 +59,9 @@ def test_image_capacity_and_training_policy_are_common(channels):
         assert cfg.noise_pairing=='antithetic_v1' and not cfg.image_training_bf16
         rows.append(dict(variant=variant,resolved=receipt))
     assert audit_group(rows)
-    assert abs(rows[0]['resolved']['nf_relative_gap'])<.02
+    assert rows[0]['resolved']['nf_width']==9
+    assert not rows[0]['resolved']['nf_capacity_match_required']
+    assert rows[0]['resolved']['nf_relative_gap']>1
 
 
 def test_every_image_native_adapter_recovers_same_nonlinear_posterior_and_jacobian():
@@ -92,7 +94,7 @@ def test_every_image_native_adapter_recovers_same_nonlinear_posterior_and_jacobi
 def test_shared_image_wrapper_preserves_arrows_tail_field_and_native_loss(variant,family):
     cfg,_=resolve(variant,image_geo(),device='cpu',steps=8,preflight=True)
     new=build_model(variant,cfg,16).double()
-    old=NativeGaussianImageField(ImageFieldConfig(16,(4,4,1),32,False,'unit_gaussian',2),native_family=family).double()
+    old=NativeGaussianImageField(ImageFieldConfig(16,(4,4,1),cfg.image_width,False,'unit_gaussian',2),native_family=family).double()
     with torch.no_grad():new.core.output.weight.normal_(std=.01)
     old.field.load_state_dict(new.core.state_dict())
     x=torch.randn(8,16,dtype=torch.float64)

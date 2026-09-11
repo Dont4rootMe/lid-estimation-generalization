@@ -68,26 +68,49 @@ def parameter_count(module):
     return sum(p.numel() for p in module.parameters())
 
 
-@lru_cache(maxsize=None)
 def capacities(kind,dimension):
     """dimension is the complete vector dimension or the image channel count."""
+    rules=protocol()
+    field_width=rules[kind+'_data']['width']
+    image_nf_width=rules['nf']['image_conditioner_width']
+    for name,value in [('field width',field_width),('image NF width',image_nf_width)]:
+        if isinstance(value,bool) or not isinstance(value,int) or value<4:
+            raise ValueError(name+' must be an integer at least four')
+    if (rules['nf']['image_capacity_policy']!='retained_image_nf_d296210'
+            or image_nf_width!=9
+            or rules['nf']['image_coupling_layers']!=8):
+        raise ValueError('unsupported retained image NF policy')
+    # All policy values enter the cache key: changing a declared width must
+    # update parameter counts and the instantiated model in the same process.
+    return dict(_capacities(kind,dimension,field_width,image_nf_width,
+        rules['nf']['maximum_relative_parameter_gap']))
+
+
+@lru_cache(maxsize=None)
+def _capacities(kind,dimension,field_width,image_nf_width,maximum_gap):
     with torch.device('meta'):
-        target=parameter_count(SpectralResidualCore(dimension,width=512) if kind=='vector' else ImageUNet(dimension,32))
+        target=parameter_count(SpectralResidualCore(dimension,width=field_width)
+            if kind=='vector' else ImageUNet(dimension,field_width))
+        if kind=='image':
+            actual=8*parameter_count(ImageUNet(dimension,image_nf_width,output_channels=2*dimension))
+            return dict(reference_parameters=target,nf_parameters=actual,nf_width=image_nf_width,
+                nf_relative_gap=(actual-target)/target,nf_capacity_match_required=False,
+                nf_capacity_policy='retained_image_nf_d296210',nf_maximum_relative_parameter_gap=maximum_gap)
+        if kind!='vector':
+            raise ValueError('unknown geometry kind')
         candidates=[]
-        widths=range(32,2049,32) if kind=='vector' else range(4,65)
-        for width in widths:
-            if kind=='vector':
-                model=ScaleConditionedRealNVP(ConditionalFlowConfig(ambient_dim=dimension,
-                    hidden_dim=width,num_coupling_layers=8,conditioner_depth=2,condition_dim=128,
-                    fourier_features=32,max_condition_frequency=1.,dropout=0.,log_scale_limit=2.))
-                actual=parameter_count(model)
-            else:
-                actual=8*parameter_count(ImageUNet(dimension,width,output_channels=2*dimension))
+        for width in range(32,2049,32):
+            model=ScaleConditionedRealNVP(ConditionalFlowConfig(ambient_dim=dimension,
+                hidden_dim=width,num_coupling_layers=8,conditioner_depth=2,condition_dim=128,
+                fourier_features=32,max_condition_frequency=1.,dropout=0.,log_scale_limit=2.))
+            actual=parameter_count(model)
             candidates.append((abs(actual-target)/target,width,actual))
     gap,width,actual=min(candidates)
-    if gap>protocol()['nf']['maximum_relative_parameter_gap']:
+    if gap>maximum_gap:
         raise ValueError('no NF capacity match within the declared tolerance')
-    return dict(reference_parameters=target,nf_parameters=actual,nf_width=width,nf_relative_gap=(actual-target)/target)
+    return dict(reference_parameters=target,nf_parameters=actual,nf_width=width,
+        nf_relative_gap=(actual-target)/target,nf_capacity_match_required=True,
+        nf_capacity_policy='matched_to_full_vector_field',nf_maximum_relative_parameter_gap=maximum_gap)
 
 
 def resolve(variant,geo,*,rank=None,device='cuda',steps=None,preflight=False):
@@ -98,6 +121,10 @@ def resolve(variant,geo,*,rank=None,device='cuda',steps=None,preflight=False):
     if isinstance(budget,bool) or not isinstance(budget,int) or budget<2:
         raise ValueError('invalid training budget')
     nf=variant=='scale_conditioned_nf';image=geo['kind']=='image'
+    field_rule=rules[geo['kind']+'_data']
+    expected=('image_unet_v1','image_gaussian_v1') if image else ('spectral_residual_v1','ambient_isotropic_v1')
+    if (field_rule['backbone'],field_rule['preconditioning'])!=expected:
+        raise ValueError('unsupported common field architecture rule')
     if not image:
         if rank is not None and rank != geo['ambient_dim']:
             raise ValueError('the common vector protocol forbids reduced-rank projections')
@@ -108,18 +135,20 @@ def resolve(variant,geo,*,rank=None,device='cuda',steps=None,preflight=False):
     keys.update(device=device,steps=budget,terminal_decay_steps=terminal,ema_start_step=budget-terminal,
         validation_interval_steps=min(500,budget),num_workers=0,training_target='sample_v1',
         field_projection_rank=None,
-        field_preconditioning='image_gaussian_v1' if image else 'ambient_isotropic_v1',
-        field_backbone='image_unet_v1' if image else ('bottleneck_v1' if nf else 'spectral_residual_v1'),
-        field_residual_scaling='noise_v1' if nf or not image else 'gaussian_tail_v1',
-        field_residual_width=512,image_training_bf16=False,
+        field_preconditioning=field_rule['preconditioning'],
+        field_backbone='bottleneck_v1' if nf and not image else field_rule['backbone'],
+        field_residual_scaling='noise_v1' if nf else field_rule['residual_scaling'],
+        field_residual_width=rules['vector_data']['width'],image_training_bf16=False,
         image_shape=tuple(geo['image_shape']) if image else None,image_layout=geo['image_layout'],
-        image_width=(cap['nf_width'] if nf else 32) if image else 32)
+        image_width=(cap['nf_width'] if nf else field_rule['width']) if image else
+            training.TrainingConfig.__dataclass_fields__['image_width'].default)
     if nf:
         keys.update(hidden_dim=cap['nf_width'],max_condition_frequency=1.,num_coupling_layers=8,
                     conditioner_depth=2,time_embedding_dim=128)
     config=replace(training.TrainingConfig.from_mapping(base['training']),**keys)
     return config,dict(**cap,actual_parameters=cap['nf_parameters'] if nf else cap['reference_parameters'],
         geometry=geo,rank=rank,kind='preflight' if preflight else 'benchmark',
+        common_field_backbone=dict(field_rule),
         protocol_id=rules['id'],protocol_sha256=digest(rules),
         common_training={k:getattr(config,k) for k in COMMON_TRAINING_KEYS})
 
@@ -149,11 +178,19 @@ def audit_group(rows):
     first=rows[0]['resolved']
     for row in rows:
         item=row['resolved']
-        for key in ('protocol_sha256','common_training','geometry','rank','kind','reference_parameters'):
+        for key in ('protocol_sha256','common_training','geometry','rank','kind','reference_parameters',
+                    'common_field_backbone','nf_parameters','nf_width','nf_relative_gap',
+                    'nf_capacity_policy','nf_capacity_match_required','nf_maximum_relative_parameter_gap'):
             if item[key]!=first[key]:raise ValueError('mixed comparison policy: '+key)
         if row['variant']=='scale_conditioned_nf':
-            if abs(item['actual_parameters']/item['reference_parameters']-1)>.10:
+            if item['actual_parameters']!=item['nf_parameters']:
+                raise ValueError('NF parameters differ from its resolved architecture')
+            if item['geometry']['kind']=='image':
+                if item['nf_capacity_policy']!='retained_image_nf_d296210' or item['nf_capacity_match_required']:
+                    raise ValueError('image NF must preserve the retained architecture')
+            elif (not item['nf_capacity_match_required'] or
+                  abs(item['actual_parameters']/item['reference_parameters']-1)>item['nf_maximum_relative_parameter_gap']):
                 raise ValueError('NF capacity outside tolerance')
         elif item['actual_parameters']!=item['reference_parameters']:
-            raise ValueError('vector backbones do not match')
+            raise ValueError('field backbones do not match')
     return True

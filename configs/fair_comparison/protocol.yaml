@@ -1,5 +1,5 @@
-schema_version: 6
-id: full_ambient_native_comparison_non_gaussian_v6
+schema_version: 7
+id: full_ambient_shared_stock8_retained_nf_v7
 scope: all 39 campaign representations and 13 native interfaces
 architecture_rule: full supplied coordinates or full images; no fitted support projection
 vector_data:
@@ -10,13 +10,16 @@ vector_data:
 image_data:
   preconditioning: image_gaussian_v1
   backbone: image_unet_v1
-  width: 32
+  width: 8
   residual_scaling: gaussian_tail_v1
 nf:
   architecture: invertible RealNVP; spatial U-Net conditioners on images
-  capacity_target: actual common vector backbone on the same representation
+  capacity_target: actual common vector backbone for coefficients; retained image NF is exempt
   maximum_relative_parameter_gap: 0.1
-  width_selection: closest parameter count; no data labels or validation score
+  width_selection: closest parameter count for vectors; fixed retained width for images
+  image_capacity_policy: retained_image_nf_d296210
+  image_conditioner_width: 9
+  image_coupling_layers: 8
   max_condition_frequency: 1.0
 training:
   seed: 0

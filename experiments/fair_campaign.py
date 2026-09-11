@@ -20,7 +20,7 @@ from experiments import global_campaign as v1,global_campaign_v2 as v2
 from experiments import fair_measurements as measurement
 from experiments import fair_outputs as outputs
 from experiments.fair_protocol import (ROOT,protocol,native_contracts,geometry,resolve,
-    parameter_count,source_identity,digest,audit_group)
+    parameter_count,source_identity,digest,audit_group,capacities)
 from models import training
 
 
@@ -51,16 +51,20 @@ def dataset_spec(cell):
 
 
 def matrix():
-    _,cells=inventory();rows=[]
+    _,cells=inventory();rows=[];rules=protocol()
     for cell in cells:
         spec=dataset_spec(cell)
         geo=geometry(cell.dataset,cell.representation,spec.expected_shapes[cell.representation])
+        cap=capacities(geo['kind'],geo['image_shape'][-1] if geo['kind']=='image' else geo['ambient_dim'])
         for variant in native_contracts():
+            nf=variant=='scale_conditioned_nf'
             rows.append(dict(cell_key=cell.key,cell=asdict(cell),variant=variant,
                 geometry=geo,architecture=('spatial RealNVP with U-Net conditioners' if geo['kind']=='image' else 'full-ambient RealNVP')
                     if variant=='scale_conditioned_nf' else ('shared U-Net' if geo['kind']=='image' else 'shared spectral residual'),
-                capacity_resolution='exact image parameter count' if geo['kind']=='image' else 'full supplied vector dimension; no fitted projection',
-                protocol_sha256=digest(protocol())))
+                backbone_width=cap['nf_width'] if nf else rules[geo['kind']+'_data']['width'],
+                parameters=cap['nf_parameters'] if nf else cap['reference_parameters'],
+                capacity_resolution=cap['nf_capacity_policy'] if nf else 'identical shared field core for every native family',
+                protocol_sha256=digest(rules)))
     assert len(rows)==len(native_contracts())*len(v2.APPROVED_GLOBAL_CELL_KEYS)
     return dict(status='routing_audited',protocol=protocol(),rows=rows,
         cells=len(cells),native_interfaces=len(native_contracts()),trainings=len(rows),
