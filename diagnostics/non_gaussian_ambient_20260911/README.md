@@ -50,6 +50,9 @@ python diagnostics/non_gaussian_ambient_20260911/run.py
 python diagnostics/non_gaussian_ambient_20260911/evaluate_quality.py --watch
 python diagnostics/non_gaussian_ambient_20260911/check_sampler.py
 python diagnostics/non_gaussian_ambient_20260911/generation_quality.py --watch
+python diagnostics/non_gaussian_ambient_20260911/check_student_full.py \
+  --output artifacts/non_gaussian_ambient_20260911/student_full_math_gate.json
+python diagnostics/non_gaussian_ambient_20260911/evaluate_student_full.py --watch
 python diagnostics/non_gaussian_ambient_20260911/make_results.py
 ```
 
@@ -72,6 +75,14 @@ The [supplemental generation check](generation_control.md) uses512 native ODE
 samples per final model, checks Heun step refinement and measures full-ambient
 distribution/normal errors. It can run as a separate watcher on GPU1. A good
 denoising loss does not replace this distribution check.
+
+The [supplementary native density readout](student_full_protocol.md) reconstructs
+Student density dilation from the same posterior and one extra scale derivative.
+It is verified against exact mixture kernels and a homogeneous boundary, not a
+Gaussian correction substitution. Its separate holdout selection is persisted
+before its own test inference. The original response campaign is unchanged.
+This extension was derived after training-prefix diagnostics; its timing and
+the distinction between exact identities and learned fit are explicit.
 
 Read [the supplemental selection control](selection_control.md) before treating
 MAE<.5 as evidence of manifold learning: the zero residual head can pass that

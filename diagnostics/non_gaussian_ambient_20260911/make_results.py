@@ -93,6 +93,47 @@ def report_tables(out,tables):
         'Эти числа описывают конечную шкалу и данный бюджет. '
         'Точность при малом шуме оценивается следующей проверкой; '
         'она не следует из прохождения этого порога.\n')
+
+
+def student_full_tables(out,records):
+    rows=[];table=[];hashes={}
+    for cell in CELLS:
+        for method in MODELS:
+            record=records[cell,method];path=record['path']/'student_full'
+            receipt=json.loads((path/'summary.json').read_text())
+            assert receipt['status']=='complete'
+            assert receipt['checkpoint_sha256']==record['done']['checkpoint_sha256']
+            assert receipt['selection_sha256']==file_sha(path/'selection.json')
+            assert receipt['curve_sha256']==file_sha(path/'curves.npz')
+            assert receipt['source_primary_complete_sha256']==file_sha(record['path']/'complete.json')
+            for name,expected in receipt['source_sha256'].items():assert file_sha(path/name)==expected
+            with np.load(path/'curves.npz') as z:
+                assert np.array_equal(z['test_response'],record['curve']['test'])
+                assert np.array_equal(z['holdout_response'],record['curve']['holdout'])
+                assert np.array_equal(z['test_target'],record['curve']['test_target'])
+                idx=receipt['selection']['selected_index']
+                error=abs(z['test'][:,idx]-z['test_target'])
+                assert np.isclose(error.mean(),receipt['metrics']['mae'],rtol=0,atol=1e-12)
+            row=dict(cell_key=cell,model=method,true_lid=float(record['curve']['test_target'][0]),
+                test_n=1000,student_full_selected_lambda=receipt['selection']['selected_lambda'],
+                student_full_test_mae=receipt['metrics']['mae'],student_full_test_mean=receipt['metrics']['mean'],
+                response_selected_lambda=record['quality']['response_selection']['selected_lambda'],
+                response_test_mae=record['quality']['response_metrics']['mae'],
+                student_full_kneedle_mae=receipt['automatic_metrics']['mae'],
+                checkpoint_sha256=receipt['checkpoint_sha256'])
+            rows.append(row)
+            title=('Exp' if '/e6_' in cell else 'Spiral')+' / '+('коэфф.' if cell.endswith('/coefficients') else 'рендер')
+            table.append([title,'t-Flow' if method=='t_flowmatching' else 'PFGM++',int(row['true_lid']),
+                f"{row['student_full_selected_lambda']:.5g}",f"{row['student_full_test_mae']:.3f}",
+                f"{row['response_test_mae']:.3f}",f"{row['student_full_kneedle_mae']:.3f}"])
+            hashes[str(path.relative_to(ROOT))+'/summary.json']=file_sha(path/'summary.json')
+    with (out/'student_full_metrics.csv').open('w',newline='') as stream:
+        writer=csv.DictWriter(stream,fieldnames=list(rows[0]));writer.writeheader();writer.writerows(rows)
+    (out/'student_full_table.tex').write_text(latex_table(
+        ['Данные','Модель','$d$',r'$\lambda_F$','MAE $F$','MAE $R$','Kneedle MAE $F$'],table,'llrrrrr'))
+    return hashes
+
+
 def main():
     out=HERE/'results';out.mkdir(parents=True,exist_ok=True)
     records={};tables=[];selection_rows=[];source=source_identity();rules=digest(protocol())
@@ -189,6 +230,7 @@ def main():
         writer=csv.DictWriter(stream,fieldnames=list(tables[0]));writer.writeheader();writer.writerows(tables)
     write_json(out/'selection_bootstrap.json',selection_rows)
     report_tables(out,tables)
+    student_full_hashes=student_full_tables(out,records)
     zero_rows=[]
     for cell in CELLS:
         row=next(r for r in tables if r['cell_key']==cell)
@@ -282,6 +324,8 @@ def main():
         float32_trace_max_gap=max(c['float32_vs_float64_trace_gap'] for r in records.values() for c in r['quality']['trained_derivative_checks']),
         finite_difference_max_gap=max(c['finite_difference_gap'] for r in records.values() for c in r['quality']['trained_derivative_checks']),
         generation_refinement_all_passed=all(r['generation_refinement_passed'] for r in tables),
+        supplementary_student_full_receipts_replayed=True,
+        supplementary_student_full_sha256=student_full_hashes,
         generation_quality_sha256={str(r['path'].relative_to(ROOT))+'/generation_quality/summary.json':file_sha(r['path']/'generation_quality/summary.json') for r in records.values()},
         quality_artifact_sha256={str(r['path'].relative_to(ROOT))+'/quality/summary.json':file_sha(r['path']/'quality/summary.json') for r in records.values()},
         artifacts_sha256={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in out.iterdir() if p.is_file() and p.name!='verification.json'})
