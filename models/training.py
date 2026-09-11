@@ -104,6 +104,8 @@ Family = Literal[
     "independent_affine_flow",
     "brownian_schrodinger_bridge",
     "scale_conditioned_normalizing_flow",
+    "student_t_flow",
+    "pfgmpp",
 ]
 LogCallback = Callable[[Mapping[str, float | int | bool | str]], None]
 CHECKPOINT_SCHEMA_VERSION = 2
@@ -207,6 +209,9 @@ class TrainingConfig:
     vp_hidden_sizes: tuple[int, ...] | None = None
     vp_beta_min: float | None = None
     vp_beta_max: float | None = None
+    kernel_df: int | None = None
+    kernel_log_scale_mean: float | None = None
+    kernel_log_scale_std: float | None = None
 
     def __post_init__(self) -> None:
         if self.optimizer_schedule_policy not in {'native_v1', 'shared_terminal_v1'}:
@@ -902,6 +907,9 @@ def _native_model_contract(family: Family, config: TrainingConfig) -> dict[str, 
         if config.posterior_preconditioning is not None:
             contract = {**contract, "posterior_preconditioning": config.posterior_preconditioning}
         return contract
+    if family in {'student_t_flow','pfgmpp'}:
+        from models.non_gaussian_fields import contract
+        return contract(family,config)
     return {"schema_version": 1, "family": family}
 
 
@@ -1070,6 +1078,9 @@ def _canonical_family(family: str) -> Family:
         "brownian_schrodinger_bridge": "brownian_schrodinger_bridge",
         "scale_conditioned_nf": "scale_conditioned_normalizing_flow",
         "scale_conditioned_normalizing_flow": "scale_conditioned_normalizing_flow",
+        "student_t_flow": "student_t_flow",
+        "t_flowmatching": "student_t_flow",
+        "pfgmpp": "pfgmpp",
     }
     try:
         return aliases[str(family)]
@@ -1334,6 +1345,9 @@ def _objective(
     config: TrainingConfig,
     generator: torch.Generator,
 ) -> Tensor:
+    if family in {'student_t_flow','pfgmpp'}:
+        from models.non_gaussian_fields import loss
+        return loss(family,model,batch,config,generator)
     if config.native_noise_pairing == "antithetic_v1" and model.training:
         # Same marginal native objective and the same number of network
         # examples: half as many independent clean points, each with Z and -Z.
@@ -2310,6 +2324,11 @@ def train_model(
 
     canonical_family = _canonical_family(family)
     resolved_config = _coerce_config(config)
+    if canonical_family in {'student_t_flow','pfgmpp'}:
+        from models.non_gaussian_fields import validate_config
+        validate_config(canonical_family,resolved_config)
+    elif any(getattr(resolved_config,k) is not None for k in ('kernel_df','kernel_log_scale_mean','kernel_log_scale_std')):
+        raise ValueError('non-Gaussian kernel settings are inactive for this family')
     if canonical_family == "independent_affine_flow":
         _affine_spec_from_training_config(resolved_config)
     elif _has_affine_settings(resolved_config):
@@ -4039,11 +4058,14 @@ def predict_lid(
     model, canonical_family, mean, normalization_scale = _model_and_context(
         model_or_result, family
     )
+    if canonical_family in {'student_t_flow','pfgmpp'} and readout!='response':
+        raise ValueError('Student-t kernels support response only; Gaussian full/score conversion is invalid')
     if divergence_backend == 'active_exact':
         from models.preconditioned_field import covariance_span_value_and_trace,CovariancePreconditionedField
         if not isinstance(model,CovariancePreconditionedField):
             raise TypeError('active_exact requires the checkpointed covariance-span field')
         allowed={'full','response','fm_to_score'} if canonical_family=='independent_affine_flow' else {'full','response'}
+        if canonical_family in {'student_t_flow','pfgmpp'}:allowed={'response'}
         if canonical_family in {'vp_diffusion','gaussian_diffusion'}:allowed={'full'}
         if readout not in allowed:raise ValueError('unsupported native-family readout')
         if not math.isfinite(scale) or scale<=0 or batch_size<=0:raise ValueError('positive scale and batch_size required')
@@ -4061,8 +4083,22 @@ def predict_lid(
             batch=normalized[start:start+batch_size].to(device=parameter.device,dtype=parameter.dtype)
             value,response=covariance_span_value_and_trace(model,batch,noise_ratio)
             value,response=value.double(),response.double()
-            full=response+((value-batch.double())/noise_ratio).square().sum(1)
-            predictions.append((response if readout=='response' else full).cpu())
+            prediction=response if readout=='response' else response+((value-batch.double())/noise_ratio).square().sum(1)
+            predictions.append(prediction.cpu())
+        return np.asarray(torch.cat(predictions).numpy(),dtype=np.float64)
+    if canonical_family in {'student_t_flow','pfgmpp'}:
+        if divergence_backend not in {'exact','hutchinson'} or not math.isfinite(scale) or scale<=0 or batch_size<=0:
+            raise ValueError('invalid response derivative backend, scale or batch size')
+        query_cpu=_flat_finite_data(query,name='query')
+        if query_cpu.shape[1]!=model.config.ambient_dim:raise ValueError('query ambient dimension differs')
+        normalized=(query_cpu-mean.reshape(1,-1))/normalization_scale
+        parameter=next(model.parameters());model.eval();predictions=[]
+        generator=torch.Generator(device=parameter.device).manual_seed(trace_seed)
+        for start in range(0,len(normalized),batch_size):
+            batch=normalized[start:start+batch_size].to(device=parameter.device,dtype=parameter.dtype)
+            response=(exact_divergence(model,batch,scale) if divergence_backend=='exact' else
+                hutchinson_divergence(model,batch,scale,num_probes=trace_probes,seed=None,generator=generator))
+            predictions.append(response.detach().double().cpu())
         return np.asarray(torch.cat(predictions).numpy(),dtype=np.float64)
     if canonical_family == "scale_conditioned_normalizing_flow":
         if not isinstance(model, ScaleConditionedRealNVP):

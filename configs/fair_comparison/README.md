@@ -2,11 +2,11 @@
 
 Этот запуск объединяет исправления обычных данных и Arrows. Правило архитектуры
 зависит от представления данных и применяется ко всем методам на нём.
-Полная матрица: 39 представлений × 11 нативных интерфейсов = 429 обучений.
+Полная матрица: 39 представлений × 13 нативных интерфейсов = 507 обучений.
 Команды выполняются из исходного checkout с установленными upstream/train
 зависимостями. Новый протокол не меняет воспроизводимые старые defaults.
 
-| Данные | Десять векторных интерфейсов | NF |
+| Данные | Двенадцать векторных интерфейсов | NF |
 |---|---|---|
 | Коэффициенты и линейно отрендеренные PCA-наборы | Один spectral residual core, width512, одинаковая fit-only covariance нормировка | Обратимый RealNVP в той же covariance-оболочке; ширина по фактической ёмкости общего core |
 | Пространственные изображения: Arrows и Fashion-MNIST/преобразования | Один U-Net width32 и общая Gaussian-tail параметризация | Обратимый image RealNVP с восемью U-Net conditioners; ширина выбирается по общему числу параметров |
@@ -137,7 +137,7 @@ checkpoint и выбранном для `full` масштабе. Это зави
 common-grid Kneedle разделены явными protocol ID; E1/E5 в обеих таблицах используют
 одни и те же reference-измерения. Старый narrow Kneedle есть только в подробном
 историческом треке. Generated E3/E4 не смешиваются с35 каноническими ячейками.
-Таблицы содержат все11 основных интерфейсов и дополнительные зависимые readout;
+Таблицы содержат все13 основных интерфейсов и дополнительные зависимые readout;
 выбор восьми строк для человеческой редакции рукописи не выполняется автоматически.
 
 Отказ выбора не выбрасывает ячейку из среднего: весь соответствующий показатель
@@ -163,7 +163,7 @@ CUDA_VISIBLE_DEVICES=0 python -m experiments.fair_campaign run \
   --output artifacts/fair/runs/vp_diffusion/e2_arrows_dataset
 ```
 
-Синтаксис одинаков для всех 11 вариантов, перечисленных в `matrix.json`.
+Синтаксис одинаков для всех 13 вариантов, перечисленных в `matrix.json`.
 Для E3/E4 укажите `--generated-root data/generated_benchmarks`. Запускайте
 независимые ячейки на разных GPU; reference-ячейки должны закончиться раньше
 зависимых. Например, для E1 шага2 добавляется
@@ -198,9 +198,49 @@ python -m experiments.fair_campaign verify --receipt artifacts/fair/runs/example
 Проверки нового кода:
 
 ```bash
-python -m pytest -q tests/unit/test_fair_comparison.py tests/unit/test_fair_measurements.py tests/unit/test_fair_outputs.py
+python -m pytest -q tests/unit/test_fair_comparison.py tests/unit/test_fair_measurements.py tests/unit/test_fair_outputs.py tests/unit/test_non_gaussian_fields.py
 ```
 
 Они проверяют все маршруты, сопоставление параметров, одинаковые нативные
 posterior/Jacobian после преобразований, сохранение Arrows VE/RF формул и
 градиентов, обратимость NF и соответствие полного determinant автодифференцированию.
+
+## t-Flow и PFGM++
+
+Протокол `dataset_routed_native_comparison_non_gaussian_v5` добавляет варианты
+`t_flowmatching` и `pfgmpp` из `non_gaussian.yaml`. Старые11 методов сохраняют
+свои targets, обучение, архитектуры и шкалы. Для новых вариантов синтаксис
+`fair_campaign run` тот же, например `--variant t_flowmatching`.
+
+Оба ядра — **радиальные многомерные Student-t**, с одним общим chi-square
+знаменателем на объект. У t-Flow фиксировано nu5, у PFGM++ augmented dimension128
+(эквивалентно Student-t nu128). Это два нативных метода одной семьи ядер.
+Параметры хвостов не подбираются по датасету или LID.
+
+[t-Flow, Appendix B, Eq.164–166](https://arxiv.org/html/2410.14171v2) использует
+равномерное нативное время и noise MSE.
+[PFGM++, Eq.4–6](https://proceedings.mlr.press/v202/xu23m/xu23m.pdf) использует
+радиальное поле Пуассона и
+[EDM objective](https://github.com/Newbeeer/pfgmpp/blob/main/training/loss.py).
+Lognormal sigma переводится из sigma_data=.5 в общие fit-RMS единицы sigma_data=1:
+mean=-1.2+log(2), std=1.2. Распределение условно ограничено общей поддержкой через
+inverse CDF; радиусы шума и хвосты не обрезаются. Нативные sampling/loss являются
+явными различиями методов; сравнение не изолирует только форму ядра.
+
+Общий физический lambda означает RMS шума **на одну ambient координату**.
+Student scale sigma=lambda*sqrt((nu-2)/nu), PFGM radius r=lambda*sqrt(nu-2).
+Нативное время t-Flow равно k/(k+lambda), где k=sqrt(nu/(nu-2)). У прежних
+Gaussian моделей lambda и обе29-точечные сетки не меняются.
+
+При covariance-оболочке учитывается наблюдаемая нормальная компонента n:
+условный активный Student имеет df=nu+N-rank и RMS scale squared
+`((nu-2)*lambda^2 + ||n||^2)/(nu+N-rank-2)`. Это точное условное ядро, а не
+проекция, отбрасывающая информацию Student-t шума. Спектральный core и число
+параметров совпадают с общим Gaussian core; U-Net получает весь ambient input.
+
+Основной readout новых моделей — только `response=trace(Db)`, где b — posterior
+mean. Он равен `N*t+t*(1-t)*div(v)` для t-Flow и `N-r*div(u)` для PFGM++.
+Gaussian `full`, `fm_to_score` и likelihood-подстановка явно отклоняются.
+Holdout MAE и Kneedle выбирают масштаб по этому нативному response; результат
+хранится в `metrics.response`. Малый MAE при выбранном масштабе сам по себе
+не доказывает точность в пределе lambda к нулю.

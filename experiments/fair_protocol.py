@@ -1,5 +1,6 @@
 """Resolve and audit a common comparison independently of observed LID scores."""
 import yaml
+import copy
 from dataclasses import asdict,replace
 from functools import lru_cache
 import hashlib
@@ -32,7 +33,18 @@ def protocol():
 
 
 def native_contracts():
-    return {c['variant_id']:c['model'] for c in yaml.safe_load(CONTRACTS_PATH.read_text())['model_contracts']}
+    result={c['variant_id']:c['model'] for c in yaml.safe_load(CONTRACTS_PATH.read_text())['model_contracts']}
+    additions=yaml.safe_load((ROOT/'configs/fair_comparison/non_gaussian.yaml').read_text())
+    for variant,settings in additions['models'].items():
+        base=copy.deepcopy(result['ve_diffusion'])
+        base.update(id=variant,name=settings['name'],family=settings['family'],
+            readout='response',primary_readout='response',native_coordinate='lambda',
+            kernel_df=settings['kernel_df'],scale_units='per_coordinate_rms_noise')
+        base['training'].update(kernel_df=settings['kernel_df'],
+            kernel_log_scale_mean=additions['pfgm_log_sigma_mean'],
+            kernel_log_scale_std=additions['pfgm_log_sigma_std'])
+        result[variant]=base
+    return result
 
 
 def geometry(dataset,representation,feature_shape):

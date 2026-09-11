@@ -1,6 +1,6 @@
-schema_version: 4
-id: dataset_routed_native_comparison_outputs_v4
-scope: all 39 campaign representations and 11 native interfaces
+schema_version: 5
+id: dataset_routed_native_comparison_non_gaussian_v5
+scope: all 39 campaign representations and 13 native interfaces
 architecture_rule: dataset representation only; never selected from LID scores
 vector_data:
   preconditioning: covariance_span_v1
@@ -62,6 +62,17 @@ measurement:
   pairing: canonical archive row order, checked query IDs and saved class-label order
   export: separate canonical/generated and supervised/common-Kneedle/historical tracks
   score_coverage: never omit failed cells; zero E1 reference mean has no relative score
+  non_gaussian: native response only; no Gaussian full or score conversion
+  scale_units: per-coordinate RMS noise; equals beta/alpha for unit-variance Gaussian sources
+non_gaussian:
+  models: t_flowmatching nu5 and pfgmpp augmented dimension128
+  parameters: fixed across datasets; no tail-parameter selection
+  kernel: multivariate Student-t with one chi-square denominator per sample
+  sampling: native uniform t for t-Flow; truncated EDM lognormal sigma for PFGM++
+  loss: native Student noise MSE; native EDM weighted denoising MSE, respectively
+  vector_conditioning: exact active Student conditional RMS scale given observed normal norm
+  backbone: same parameter count and core as Gaussian fields on each dataset
+  image_routing: common U-Net with all ambient coordinates retained
 budget_interpretation: equal updates and network examples; parameters matched within
   10 percent for NF, measured elapsed time recorded; FLOPs are not claimed equal
 old_results: diagnostics only; aggregation requires fresh matching protocol receipts

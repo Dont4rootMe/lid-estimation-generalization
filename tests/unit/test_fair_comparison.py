@@ -23,7 +23,7 @@ def image_geo(channels=1):
 
 def test_complete_matrix_has_no_family_specific_architecture_fallback():
     result=matrix()
-    assert result['cells']==39 and result['trainings']==429
+    assert result['cells']==39 and result['trainings']==507
     for key in {r['cell_key'] for r in result['rows']}:
         rows=[r for r in result['rows'] if r['cell_key']==key]
         assert {r['variant'] for r in rows}==set(native_contracts())

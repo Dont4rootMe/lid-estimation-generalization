@@ -28,6 +28,8 @@ def readouts(variant):
     if variant == 'scale_conditioned_nf':
         return ('ols5', 'fixed_likelihood')
     family = native_contracts()[variant]['family']
+    if family in ('student_t_flow','pfgmpp'):
+        return ('response',)
     return ('full', 'response') if family in (
         'independent_affine_flow', 'rectified_flow', 'schrodinger_bridge') else ('full',)
 

@@ -81,6 +81,9 @@ class PreconditionedField(VPBottleneckMLP):
 
 
 def build_bottleneck(architecture, family, config):
+    if family in {'student_t_flow','pfgmpp'}:
+        from models.non_gaussian_fields import build_field
+        return build_field(architecture,family,config)
     if config.field_preconditioning == 'image_gaussian_v1':
         from models.shared_image_field import SharedImagePosteriorField
         return SharedImagePosteriorField(architecture,family,config)

@@ -61,7 +61,7 @@ def matrix():
                     if variant=='scale_conditioned_nf' else ('shared U-Net' if geo['kind']=='image' else 'shared spectral residual'),
                 capacity_resolution='exact image parameter count' if geo['kind']=='image' else 'resolve from optimizer-fit covariance before training',
                 protocol_sha256=digest(protocol())))
-    assert len(rows)==len(v2.APPROVED_MODEL_VARIANTS)*len(v2.APPROVED_GLOBAL_CELL_KEYS)
+    assert len(rows)==len(native_contracts())*len(v2.APPROVED_GLOBAL_CELL_KEYS)
     return dict(status='routing_audited',protocol=protocol(),rows=rows,
         cells=len(cells),native_interfaces=len(native_contracts()),trainings=len(rows),
         scope='configuration coverage; not completed benchmark training')
@@ -262,7 +262,7 @@ def run(args):
     for key,value in result.model.state_dict().items():torch.testing.assert_close(value,reloaded.model.state_dict()[key],rtol=0,atol=0)
     if sources!=source_identity():raise ValueError('source changed during this cell')
     model_spec=prediction_spec(args.variant,geo)
-    primary='ols5' if args.variant=='scale_conditioned_nf' else 'full'
+    primary=outputs.readouts(args.variant)[0]
     known=cell.target_policy=='known_lid'
     scales=measurement.common_scales() if known else v2.unknown_reference_lambdas()
     def predict(query,grid,readout=primary):

@@ -1,0 +1,16 @@
+schema_version: 1
+scale_units: per-coordinate RMS noise in fit-normalized coordinates
+# Original EDM lognormal mean -1.2 at sigma_data .5, transferred to sigma_data 1.
+pfgm_log_sigma_mean: -0.5068528194400547
+pfgm_log_sigma_std: 1.2
+models:
+  t_flowmatching:
+    family: student_t_flow
+    name: Student-t flow matching, nu5, native noise MSE
+    kernel_df: 5
+    reference: https://arxiv.org/html/2410.14171v2#A2
+  pfgmpp:
+    family: pfgmpp
+    name: PFGM++ augmented dimension128, EDM posterior objective
+    kernel_df: 128
+    reference: https://proceedings.mlr.press/v202/xu23m/xu23m.pdf

@@ -32,6 +32,8 @@ class CanonicalPosterior(nn.Module):
 
     def forward(self,x):
         cfg,family,s=self.cfg,self.family,self.scale
+        if family in {'student_t_flow','pfgmpp'}:
+            return self.model.canonical_posterior(x,s)
         if family=='vp_diffusion':
             schedule=VPSchedule(cfg.vp_beta_min,cfg.vp_beta_max)
             condition=x.new_full((len(x),),schedule.time_for_lambda(s));alpha,_=schedule.coefficients(condition)
@@ -48,6 +50,8 @@ class CanonicalPosterior(nn.Module):
 
 
 def curves(result,raw,scales,probes=16,batch_size=128):
+    if result.family in {'student_t_flow','pfgmpp'}:
+        raise ValueError('Gaussian R+C diagnostics are invalid for Student-t kernels; use native response')
     device=next(result.model.parameters()).device;dtype=next(result.model.parameters()).dtype
     x=(torch.as_tensor(np.asarray(raw).copy(),dtype=torch.float32)-result.normalization_mean)/result.normalization_scale
     rows=[]
