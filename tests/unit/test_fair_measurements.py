@@ -82,11 +82,12 @@ def make_receipt(root,known=True,reference=None):
     curve=(target[:,None]+np.log2(grid)[None,:]**2) if known else np.ones((4,50))
     cell=SimpleNamespace(target_policy='known_lid' if known else 'sample_size',
         suite_id='e6' if known else 'e1',dataset='fixture' if known else ('step2' if reference else 'step1'),
-        representation='coefficients',reference_dataset=None if known else 'step1')
+        representation='coefficients',reference_dataset=None if known else 'step1',expected_lid_delta=0.)
     ref=None
     if reference:
         (root/'reference_complete.json').write_bytes(reference.read_bytes())
         ref=json.loads(reference.read_text())
+        (root/'reference_test_predictions.npz').write_bytes((reference.parent/'test_predictions.npz').read_bytes())
     selected,selection=select_scale(curve,grid,target,cell,ref)
     plan=m.known_plan(curve,grid,target) if known else None
     np.savez_compressed(root/'holdout_curve.npz',prediction=curve,scales=grid,
@@ -95,13 +96,15 @@ def make_receipt(root,known=True,reference=None):
     receipt=dict(status='selected',variant='ve_diffusion',cell_key=f'{cell.suite_id}/{cell.dataset}/coefficients',
         cell=vars(cell),kind='preflight',protocol_sha256='fixture',source_sha256={'fixture':'fixture'},
         resolved=dict(geometry=dict(ambient_dim=30)),config=dict(steps=2),steps_completed=2,
+        n_source_train=20,partition=dict(n_source_train=20),fit_n=16,
         checkpoint_sha256=file_sha(root/'model.pt'),selected_lambda=selected,selection=selection,
         holdout_n=4,effective_holdout_indices_sha256=_array_sha(np.arange(4,dtype=np.int64)),
         holdout_curve_sha256=file_sha(root/'holdout_curve.npz'),primary_readout='full',
         measurement_plan=plan,test_loaded=False)
     if reference:receipt['reference_receipt_sha256']=file_sha(reference)
     write_json(root/'selection.json',receipt)
-    pred=dict(query_ids=np.arange(4,dtype=np.int64),target=np.asarray([] if target is None else target))
+    pred=dict(query_ids=np.arange(4,dtype=np.int64),labels=np.asarray([],dtype=np.int64),
+        target=np.asarray([] if target is None else target))
     metrics={};diagnostics={}
     if selected is not None:
         pred['full']=curve[:,int(np.argmin(abs(grid-selected)))]
@@ -111,7 +114,9 @@ def make_receipt(root,known=True,reference=None):
         np.savez_compressed(root/'test_scale_curves.npz',**arrays)
     np.savez_compressed(root/'test_predictions.npz',**pred)
     final=dict(receipt,status='complete',measurement_status=selection['status'],test_loaded=True,
-        selection_receipt_sha256=file_sha(root/'selection.json'),test_n=4,metrics=metrics,
+        selection_receipt_sha256=file_sha(root/'selection.json'),test_n=4,
+        test_labels_sha256=_array_sha(pred['labels']),metrics=metrics,reference_metrics={},
+        test_files_sha256={'dataset.npy':'fixture'},
         automatic_metrics=diagnostics[m.PRIMARY_AUTOMATIC_METRIC] if known else {},
         diagnostic_metrics=diagnostics,test_predictions_sha256=file_sha(root/'test_predictions.npz'),
         test_scale_curves_sha256=file_sha(root/'test_scale_curves.npz') if known else None)

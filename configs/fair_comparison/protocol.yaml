@@ -1,5 +1,5 @@
-schema_version: 3
-id: dataset_routed_native_comparison_common_grid_v3
+schema_version: 4
+id: dataset_routed_native_comparison_outputs_v4
 scope: all 39 campaign representations and 11 native interfaces
 architecture_rule: dataset representation only; never selected from LID scores
 vector_data:
@@ -56,6 +56,12 @@ measurement:
   automatic_coverage: report every fallback and boundary choice; retain all queries in MAE
   unknown_failure: propagate reference failure reason and report missing measurement coverage
   verification: replay selection and all metrics from hashed query-level artifacts
+  secondary_readouts: FM and bridge response at the frozen primary scale; no separate tuning
+  e1: mean drift on identical test data; retain original source-train sample count
+  e5: pointwise transformed-minus-reference MAE against the declared LID delta
+  pairing: canonical archive row order, checked query IDs and saved class-label order
+  export: separate canonical/generated and supervised/common-Kneedle/historical tracks
+  score_coverage: never omit failed cells; zero E1 reference mean has no relative score
 budget_interpretation: equal updates and network examples; parameters matched within
   10 percent for NF, measured elapsed time recorded; FLOPs are not claimed equal
 old_results: diagnostics only; aggregation requires fresh matching protocol receipts

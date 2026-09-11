@@ -18,6 +18,7 @@ import torch
 from datasets.registry import load_registry,apply_registry_overlay,load_split
 from experiments import global_campaign as v1,global_campaign_v2 as v2
 from experiments import fair_measurements as measurement
+from experiments import fair_outputs as outputs
 from experiments.fair_protocol import (ROOT,protocol,native_contracts,geometry,resolve,
     parameter_count,source_identity,digest,audit_group)
 from models import training
@@ -120,11 +121,15 @@ def verify_measurements(path,row=None):
     if receipt['status']!='selected' or receipt['test_loaded'] is not False:
         raise ValueError('scale receipt was not frozen before test access')
     cell=SimpleNamespace(**receipt['cell']);known=cell.target_policy=='known_lid'
+    if receipt['n_source_train']!=receipt['partition']['n_source_train'] or receipt['n_source_train']<receipt['fit_n']+receipt['holdout_n']:
+        raise ValueError('source-train sample count differs from the partition')
     reference=None
     if not known and cell.reference_dataset not in (None,cell.dataset):
         ref_path=root/'reference_complete.json'
         if file_sha(ref_path)!=receipt['reference_receipt_sha256']:raise ValueError('reference receipt changed')
         reference=json.loads(ref_path.read_text());validate_reference(reference,receipt,cell)
+        if file_sha(root/'reference_test_predictions.npz')!=reference['test_predictions_sha256']:
+            raise ValueError('reference test predictions changed')
     with np.load(root/'holdout_curve.npz',allow_pickle=False) as z:
         curve,scales=z['prediction'],z['scales'];target=z['target'] if known else None
         if len(curve)!=receipt['holdout_n'] or v1._array_sha(z['query_ids'])!=receipt['effective_holdout_indices_sha256']:
@@ -137,11 +142,18 @@ def verify_measurements(path,row=None):
     status=measurement.validate_selection(selected,selection,reference=not known)
     if row['measurement_status']!=status:raise ValueError('measurement coverage differs')
     primary=receipt['primary_readout']
-    readouts=([primary,'fixed_likelihood'] if receipt['variant']=='scale_conditioned_nf' else ['full']) if selected is not None else []
+    if primary!=outputs.readouts(receipt['variant'])[0]:raise ValueError('incorrect primary readout')
+    readouts=list(outputs.readouts(receipt['variant'])) if selected is not None else []
     with np.load(root/'test_predictions.npz',allow_pickle=False) as z:
-        if set(z.files)!=set(readouts+['query_ids','target']):raise ValueError('missing or extra test readouts')
+        if set(z.files)!=set(readouts+['query_ids','target','labels']):raise ValueError('missing or extra test readouts')
         if not np.array_equal(z['query_ids'],np.arange(row['test_n'],dtype=np.int64)):
             raise ValueError('test query identity differs')
+        if v1._array_sha(z['labels'])!=row['test_labels_sha256']:
+            raise ValueError('test class labels differ')
+        if z['labels'].size and (z['labels'].shape!=(row['test_n'],) or z['labels'].dtype.kind not in 'iu'):
+            raise ValueError('invalid test class labels')
+        if cell.target_policy=='paired_delta' and z['labels'].shape!=(row['test_n'],):
+            raise ValueError('paired-delta class labels are missing')
         target=z['target'] if known else None
         if known and target.shape!=(row['test_n'],):raise ValueError('test targets differ')
         expected={}
@@ -151,6 +163,15 @@ def verify_measurements(path,row=None):
                 'float64' if readout=='fixed_likelihood' else 'float32')
         if row['metrics']!=expected:raise ValueError('reported metrics differ from saved predictions')
         primary_values=z[primary] if selected is not None else None
+        if not known:
+            if reference is None:
+                relative=outputs.reference_metrics(row,z,row,z)
+            else:
+                with np.load(root/'reference_test_predictions.npz',allow_pickle=False) as base:
+                    relative=outputs.reference_metrics(row,z,reference,base)
+            if row['reference_metrics']!=relative:raise ValueError('reference metrics differ from saved predictions')
+        elif row['reference_metrics']:
+            raise ValueError('unexpected relative metrics on known-LID data')
     if known:
         curve_path=root/'test_scale_curves.npz'
         if file_sha(curve_path)!=row['test_scale_curves_sha256']:raise ValueError('test scale curves changed')
@@ -211,6 +232,7 @@ def run(args):
         fit_indices_sha256=v1._array_sha(part.fit_indices),holdout_indices_sha256=v1._array_sha(part.selection_indices),
         effective_fit_indices_sha256=v1._array_sha(part.fit_indices[:len(fit)]),
         effective_holdout_indices_sha256=v1._array_sha(part.selection_indices[:len(holdout)]),
+        n_source_train=len(raw),partition=part.record,
         fit_n=len(fit),holdout_n=len(holdout),created_unix=time.time())
     reference=None
     if cell.target_policy!='known_lid' and cell.reference_dataset not in (None,cell.dataset):
@@ -222,6 +244,9 @@ def run(args):
         (out/'reference_complete.json').write_bytes(args.reference.read_bytes())
         if file_sha(out/'reference_complete.json')!=manifest['reference_receipt_sha256']:
             raise ValueError('reference changed during preparation')
+        (out/'reference_test_predictions.npz').write_bytes((args.reference.parent/'test_predictions.npz').read_bytes())
+        if file_sha(out/'reference_test_predictions.npz')!=reference['test_predictions_sha256']:
+            raise ValueError('reference predictions changed during preparation')
     write_json(out/'manifest.json',manifest)
     for name in sources:
         destination=out/'source'/name;destination.parent.mkdir(parents=True,exist_ok=True)
@@ -261,7 +286,8 @@ def run(args):
     queries=test.features.reshape(len(test.features),-1)
     if args.preflight:queries=queries[:min(16,len(queries))]
     targets=np.asarray(test.lid).reshape(-1)[:len(queries)] if known and test.lid is not None else None
-    metrics={};predictions=dict(query_ids=np.arange(len(queries),dtype=np.int64),
+    labels=np.asarray([],dtype=np.int64) if test.labels is None else np.asarray(test.labels).reshape(-1)[:len(queries)]
+    metrics={};predictions=dict(query_ids=np.arange(len(queries),dtype=np.int64),labels=labels,
         target=np.asarray([] if targets is None else targets));diagnostics={}
     if known:
         common_curve=predict(queries,scales)
@@ -269,7 +295,7 @@ def run(args):
         diagnostics,arrays=measurement.known_results(common_curve,legacy_curve,targets,plan,geo['ambient_dim'])
         np.savez_compressed(out/'test_scale_curves.npz',**arrays)
     if selected is not None:
-        readouts=[primary,'fixed_likelihood'] if args.variant=='scale_conditioned_nf' else ['full']
+        readouts=outputs.readouts(args.variant)
         for readout in readouts:
             if args.variant=='scale_conditioned_nf' and readout=='fixed_likelihood':result.model.double()
             values=common_curve[:,int(np.argmin(abs(scales-selected)))] if known and readout==primary else predict(queries,[selected],readout)[:,0]
@@ -279,12 +305,19 @@ def run(args):
     np.savez_compressed(out/'test_predictions.npz',**predictions)
     if file_sha(out/'selection.json')!=selection_hash:raise ValueError('selection changed during test inference')
     final=dict(receipt,status='complete',measurement_status=status,selection_receipt_sha256=selection_hash,
-        test_n=len(queries),metrics=metrics,diagnostic_metrics=diagnostics,
+        test_n=len(queries),test_labels_sha256=v1._array_sha(labels),metrics=metrics,diagnostic_metrics=diagnostics,
         automatic_metrics=diagnostics[plan['primary_automatic_metric']] if known else {},
         test_files_sha256={p.name:file_sha(p) for p in test.source_paths.values()},
         test_predictions_sha256=file_sha(out/'test_predictions.npz'),
         test_scale_curves_sha256=file_sha(out/'test_scale_curves.npz') if known else None,
         total_seconds=time.monotonic()-start,test_loaded=True,reload_exact=True)
+    final['reference_metrics']={}
+    if not known:
+        if reference is None:
+            final['reference_metrics']=outputs.reference_metrics(final,predictions,final,predictions)
+        else:
+            with np.load(out/'reference_test_predictions.npz',allow_pickle=False) as base:
+                final['reference_metrics']=outputs.reference_metrics(final,predictions,reference,base)
     write_json(out/'complete.pending.json',final)
     verify_measurements(out/'complete.pending.json')
     (out/'complete.pending.json').replace(out/'complete.json')
@@ -295,7 +328,8 @@ def run(args):
 def aggregate(root,scope='all'):
     plan=matrix();expected={(r['cell_key'],r['variant']) for r in plan['rows']
         if scope=='all' or r['cell']['target_policy']=='known_lid'}
-    rows=[];seen=set();receipt_hashes={}
+    declared={(r['cell_key'],r['variant']):r for r in plan['rows']}
+    rows=[];entries=[];seen=set();receipt_hashes={}
     for path in root.rglob('complete.json'):
         row=json.loads(path.read_text())
         if 'protocol_sha256' not in row:raise ValueError('unrecognized historical result in aggregate root')
@@ -304,6 +338,10 @@ def aggregate(root,scope='all'):
         if key in seen:raise ValueError('duplicate trained result for a comparison cell')
         if row['kind']!='benchmark' or row['steps_completed']!=protocol()['training']['steps']:
             raise ValueError('preflight or incomplete budget cannot enter the benchmark')
+        if row['cell']!=declared[key]['cell'] or row['resolved']['geometry']!=declared[key]['geometry']:
+            raise ValueError('cell identity or geometry differs from the declared inventory')
+        if row['n_source_train']!=dataset_spec(SimpleNamespace(**row['cell'])).expected_samples['train']:
+            raise ValueError('source-train count differs from the declared inventory')
         if row['protocol_sha256']!=digest(protocol()) or row['source_sha256']!=source_identity():
             raise ValueError('result belongs to a different protocol/source revision')
         expected_config,expected_resolution=resolve(row['variant'],row['resolved']['geometry'],
@@ -321,7 +359,7 @@ def aggregate(root,scope='all'):
                 raise ValueError('test predictions changed')
         verify_measurements(path,row)
         receipt_hashes[key]=file_sha(path)
-        seen.add(key);rows.append(row)
+        seen.add(key);rows.append(row);entries.append((row,path.parent))
     if seen!=expected:raise ValueError(f'incomplete fair matrix: {len(seen)}/{len(expected)} trained cells')
     for row in rows:
         if 'reference_receipt_sha256' in row:
@@ -331,12 +369,17 @@ def aggregate(root,scope='all'):
     for key in {key for key,_ in expected}:
         group=[r for r in rows if r['cell_key']==key];audit_group(group)
         for field in ('train_files_sha256','test_files_sha256','fit_indices_sha256','holdout_indices_sha256',
-                      'normalization_sha256','fit_n','holdout_n','test_n'):
+                      'normalization_sha256','fit_n','holdout_n','test_n','n_source_train','test_labels_sha256'):
             if any(r[field]!=group[0][field] for r in group):raise ValueError('data/query mismatch: '+field)
     coverage={s:sum(r['measurement_status']==s for r in rows)
         for s in ('selected','scale_unresolved','selection_failed')}
+    records=outputs.result_records(entries)
+    cells={r['cell_key']:r['cell'] for r in plan['rows'] if (r['cell_key'],r['variant']) in expected}
+    scores=outputs.table_scores(records,list(cells.values()))
     return dict(status='complete' if coverage['selected']==len(rows) else 'complete_with_selection_issues',
-        coverage=coverage,scope=scope,protocol_sha256=digest(protocol()),trainings=len(rows),rows=rows)
+        coverage=coverage,scope=scope,protocol_sha256=digest(protocol()),trainings=len(rows),rows=rows,
+        result_records=records,table_scores=scores,
+        score_coverage={s:sum(r['status']==s for r in scores) for s in sorted({r['status'] for r in scores})})
 
 
 def main():
@@ -353,7 +396,11 @@ def main():
     args=p.parse_args()
     if args.command=='matrix':
         value=matrix();write_json(args.output,value);print(json.dumps({k:v for k,v in value.items() if k not in ('rows','protocol')}))
-    elif args.command=='aggregate':write_json(args.output,aggregate(args.root,args.scope))
+    elif args.command=='aggregate':
+        value=aggregate(args.root,args.scope)
+        write_json(args.output,value)
+        outputs.write_csv(args.output.with_name(args.output.stem+'.results.csv'),value['result_records'])
+        outputs.write_csv(args.output.with_name(args.output.stem+'.scores.csv'),value['table_scores'])
     elif args.command=='verify':
         row=verify_measurements(args.receipt)
         print(json.dumps(dict(status='verified',kind=row['kind'],measurement_status=row['measurement_status'])))
