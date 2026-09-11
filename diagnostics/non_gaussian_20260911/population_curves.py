@@ -1,5 +1,6 @@
 """Blind continuous-law curves on fixed source-train holdout queries."""
 from concurrent.futures import ProcessPoolExecutor
+import argparse
 import hashlib
 import json
 import os
@@ -95,6 +96,11 @@ def compute(item):
 
 
 def main():
+    global DATA,OUT
+    parser=argparse.ArgumentParser()
+    parser.add_argument('--data',type=Path,default=DATA)
+    parser.add_argument('--output',type=Path,default=OUT)
+    args=parser.parse_args();DATA=args.data;OUT=args.output
     OUT.mkdir(parents=True,exist_ok=True)
     jobs=prepare()
     with ProcessPoolExecutor(max_workers=6) as executor:

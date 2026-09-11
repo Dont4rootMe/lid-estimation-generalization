@@ -1,5 +1,6 @@
 """Bound oracle changes from the exact float32 query preprocessing path."""
 from concurrent.futures import ProcessPoolExecutor
+import argparse
 import json
 from pathlib import Path
 import numpy as np
@@ -34,6 +35,9 @@ def check(job):
 
 
 def main():
+    global ROOT
+    parser=argparse.ArgumentParser();parser.add_argument('--population',type=Path,default=ROOT)
+    ROOT=parser.parse_args().population
     torch.set_num_threads(1)
     jobs=[(str(p),kernel,df) for p in ROOT.iterdir() if p.is_dir()
         for kernel,df in [('t_flowmatching',5),('pfgmpp',128),('gaussian',None)]]
