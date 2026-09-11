@@ -85,6 +85,12 @@ adopted: changing the scalar coefficient worsened the minimum-scale normal
 error, and the linear shortcut still left a response25.77 on a clean plane
 of dimension2 after4000 steps. These are limited negative diagnostics, not
 claims that a larger budget could never improve either alternative.
+The additional `flat_no_skip_control.py` keeps the same core/draw sequence and
+removes the analytic noisy-input copy. At4000 steps its response at lambda1/32
+is1.983, but denoising risk35.977 exceeds the retained baseline's15.928; at
+lambda1/256 its risk is3986.17 versus32.272. It therefore also fails to justify
+adoption, despite a better trace. All three checks are isolated from the frozen
+eight-run architecture.
 
 ## Report
 
