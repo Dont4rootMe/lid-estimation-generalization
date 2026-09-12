@@ -1,0 +1,82 @@
+schema_version: 1
+contract: native_tasks_v1
+retired_variants:
+  direct_rectified_flow: duplicate of independent Gaussian RF with native velocity MSE
+common:
+  noise_pairing: iid
+  field_preconditioning: native_task_v1
+  field_backbone: point_residual_v1
+  field_residual_scaling: noise_v1
+  training_target: sample_v1
+models:
+  vp_diffusion:
+    name: VP FLIPD negative-noise regression
+    training: {}
+  ve_diffusion:
+    name: VE FLIPD negative-noise regression with corrected forward corruption
+    training:
+      sigma_min: 0.01
+      sigma_max: 50.0
+      ve_forward_policy: corrected_flipd_ve
+  rectified_flow:
+    name: Gaussian Rectified Flow
+    training:
+      time_min: 0.001
+      time_max: 1.0
+  scale_conditioned_nf:
+    name: One sigma-conditioned RealNVP
+    training:
+      field_preconditioning: null
+      fourier_features: 0
+  schrodinger_bridge:
+    name: Brownian Diffusion Schrodinger Bridge with independent Gaussian prior
+    training:
+      bridge_construction: dsb_ipf_brownian_v1
+      bridge_reference_process: brownian-motion
+      bridge_initial_marginal: independent-standard-gaussian
+      bridge_terminal_marginal: dataset-terminal-law
+      bridge_factor_f: learned-entropic-factor
+      bridge_factor_g: learned-entropic-factor
+      bridge_conditioning: native-elapsed-time
+      bridge_diffusivity: 2.0
+      bridge_terminal_time: 0.2
+      bridge_tau_min: 0.01
+      bridge_tau_max: 0.2
+      dsb_num_steps: 20
+      dsb_step_size: 0.01
+      dsb_ipf_rounds: 20
+      ema_decay: null
+  posterior_rectified_flow:
+    name: Author control - native-input linear-path posterior regression
+    training: {}
+  direct_log_noise_affine_flow:
+    name: Author control - direct log-noise velocity regression
+    training: {}
+  posterior_log_noise_affine_flow:
+    name: Author control - direct clean-data regression on log-noise path
+    training: {}
+  direct_vp_trigonometric_flow:
+    name: Trigonometric InterFlow - uniform-time theoretical objective
+    training:
+      flow_conditioning: native_time
+      flow_scale_sampling: uniform_native_time
+      flow_loss_weighting: native_velocity_mse
+  posterior_vp_trigonometric_flow:
+    name: Author control - native-input trigonometric-path posterior regression
+    training: {}
+  t_flowmatching:
+    name: t-Flow Student-noise regression
+    training:
+      sigma_min: null
+      sigma_max: null
+      kernel_log_scale_mean: null
+      kernel_log_scale_std: null
+  pfgmpp:
+    name: PFGM++ author-clipped Beta sampler and EDM denoiser
+    training:
+      sigma_min: null
+      sigma_max: null
+      kernel_log_scale_mean: -1.2
+      kernel_log_scale_std: 1.2
+      pfgm_sigma_data: 0.5
+      pfgm_beta_clip: 0.001

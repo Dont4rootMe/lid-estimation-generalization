@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from experiments.fair_protocol import (geometry,native_contracts,resolve,build_model,
+from experiments.fair_protocol import (geometry,native_contracts,active_native_contracts,resolve,build_model,
     parameter_count,audit_group,protocol,digest)
 from experiments.fair_campaign import matrix,select_scale,validate_reference,prediction_spec,aggregate
 from experiments import global_campaign_v2 as v2
@@ -23,10 +23,10 @@ def image_geo(channels=1):
 
 def test_complete_matrix_has_no_family_specific_architecture_fallback():
     result=matrix()
-    assert result['cells']==39 and result['trainings']==507
+    assert result['cells']==39 and result['trainings']==429
     for key in {r['cell_key'] for r in result['rows']}:
         rows=[r for r in result['rows'] if r['cell_key']==key]
-        assert {r['variant'] for r in rows}==set(native_contracts())
+        assert {r['variant'] for r in rows}==set(active_native_contracts())
         assert len({r['architecture'] for r in rows if r['variant']!='scale_conditioned_nf'})==1
     arrows=[r for r in result['rows'] if r['cell_key']=='e2/e2_arrows/dataset']
     assert all('U-Net' in r['architecture'] for r in arrows)
@@ -35,7 +35,7 @@ def test_complete_matrix_has_no_family_specific_architecture_fallback():
 @pytest.mark.parametrize('dimension',[2,3,6,20,30])
 def test_full_ambient_nf_matches_actual_shared_vector_capacity(dimension):
     geo=geometry('fixture','coefficients',[dimension]);rows=[]
-    for variant in native_contracts():
+    for variant in active_native_contracts():
         cfg,receipt=resolve(variant,geo,device='cpu',steps=8,preflight=True)
         with torch.device('meta'):model=build_model(variant,cfg,dimension)
         assert cfg.field_projection_rank is None and not hasattr(model,'basis')
@@ -51,39 +51,37 @@ def test_full_ambient_nf_matches_actual_shared_vector_capacity(dimension):
 @pytest.mark.parametrize('channels',[1,3])
 def test_image_capacity_and_training_policy_are_common(channels):
     rows=[]
-    for variant in native_contracts():
+    for variant in active_native_contracts():
         cfg,receipt=resolve(variant,image_geo(channels),device='cpu',steps=8,preflight=True)
         with torch.device('meta'):model=build_model(variant,cfg,16*channels)
         assert parameter_count(model)==receipt['actual_parameters']
         assert cfg.optimizer_schedule_policy=='shared_terminal_v1'
-        assert cfg.noise_pairing=='antithetic_v1' and not cfg.image_training_bf16
+        assert cfg.noise_pairing=='iid' and not cfg.image_training_bf16
         rows.append(dict(variant=variant,resolved=receipt))
     assert audit_group(rows)
-    assert rows[0]['resolved']['nf_width']==4
+    assert rows[0]['resolved']['nf_width']==5
     assert rows[0]['resolved']['nf_coupling_layers']==2
     assert rows[0]['resolved']['nf_capacity_match_required']
     assert abs(rows[0]['resolved']['nf_relative_gap'])<=.1
 
 
-def test_every_image_native_adapter_recovers_same_nonlinear_posterior_and_jacobian():
+def test_image_native_heads_expose_raw_core_without_posterior_wrapper():
     torch.manual_seed(9);x=torch.randn(2,16,dtype=torch.float64)
     reference=None
     for variant,contract in native_contracts().items():
-        if variant=='scale_conditioned_nf':continue
+        if variant in ('scale_conditioned_nf','pfgmpp'):continue
         cfg,_=resolve(variant,image_geo(),device='cpu',steps=8,preflight=True)
         model=build_model(variant,cfg,16).double().eval()
         if reference is None:
             with torch.no_grad():model.core.output.weight.normal_(std=.01)
             reference=copy.deepcopy(model.core.state_dict())
         else:model.core.load_state_dict(reference)
-        family=training._canonical_family(contract['family'])
-        for scale in [.0625,1.,32.]:
-            adapter=CanonicalPosterior(SimpleNamespace(model=model,config=cfg,family=family),scale)
+        for condition in [.1,.2,.3]:
             z=x.clone().requires_grad_(True)
-            expected=z/(1+scale*scale)+scale/(1+scale*scale)*model.core(
-                (z/np.sqrt(1+scale*scale)).reshape(-1,4,4,1).permute(0,3,1,2),
-                z.new_full((len(z),),np.log(scale))).permute(0,2,3,1).reshape_as(z)
-            actual=adapter(z)
+            expected=model.core(z.reshape(-1,4,4,1).permute(0,3,1,2),
+                z.new_full((len(z),),condition)).permute(0,2,3,1).reshape_as(z)
+            if variant=='schrodinger_bridge':expected=expected/cfg.dsb_step_size
+            actual=model(z,condition)
             torch.testing.assert_close(actual,expected,rtol=2e-10,atol=2e-10)
             direction=torch.arange(16,dtype=z.dtype).expand_as(z)/16
             g1=torch.autograd.grad(actual,z,direction,retain_graph=True)[0]
@@ -92,21 +90,16 @@ def test_every_image_native_adapter_recovers_same_nonlinear_posterior_and_jacobi
 
 
 @pytest.mark.parametrize('variant,family',[('ve_diffusion','gaussian_diffusion'),('rectified_flow','rectified_flow')])
-def test_shared_image_wrapper_preserves_arrows_tail_field_and_native_loss(variant,family):
+def test_native_image_objective_has_no_common_posterior_call(variant,family):
     cfg,_=resolve(variant,image_geo(),device='cpu',steps=8,preflight=True)
     new=build_model(variant,cfg,16).double()
-    old=NativeGaussianImageField(ImageFieldConfig(16,(4,4,1),cfg.image_width,False,'unit_gaussian',2),native_family=family).double()
     with torch.no_grad():new.core.output.weight.normal_(std=.01)
-    old.field.load_state_dict(new.core.state_dict())
     x=torch.randn(8,16,dtype=torch.float64)
-    condition=torch.linspace(.1,.9,8,dtype=x.dtype)
-    torch.testing.assert_close(new(x,condition),old(x,condition),rtol=1e-10,atol=1e-10)
+    def forbidden(*args,**kwargs):raise AssertionError('training accessed the evaluation-only posterior adapter')
+    new.canonical_posterior=forbidden
     a=training._objective(family,new,x,cfg,torch.Generator().manual_seed(31))
-    b=training._objective(family,old,x,cfg,torch.Generator().manual_seed(31))
-    torch.testing.assert_close(a,b,rtol=1e-10,atol=1e-10)
     ga=torch.autograd.grad(a,tuple(new.parameters()))
-    gb=torch.autograd.grad(b,tuple(old.parameters()))
-    for aa,bb in zip(ga,gb):torch.testing.assert_close(aa,bb,rtol=1e-9,atol=1e-10)
+    assert torch.isfinite(a) and all(torch.isfinite(g).all() for g in ga)
 
 
 def test_spatial_nf_nontrivial_inverse_and_full_jacobian_determinant():

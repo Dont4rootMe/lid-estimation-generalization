@@ -15,12 +15,12 @@ from models.shared_image_field import to_image,from_image
 
 
 class ImageCoupling(nn.Module):
-    def __init__(self,shape,width,parity,limit):
+    def __init__(self,shape,width,parity,limit,*,scalar_condition=False):
         super().__init__()
         h,w,c=shape
         mask=((torch.arange(h)[:,None]+torch.arange(w)[None,:]+parity)%2).float()
         self.register_buffer('mask',mask[None,None])
-        self.conditioner=ImageUNet(c,width,output_channels=2*c)
+        self.conditioner=ImageUNet(c,width,output_channels=2*c,scalar_condition=scalar_condition)
         self.limit=limit
 
     def parameters_at(self,image,log_scale):
@@ -45,7 +45,8 @@ class ImageConditionedRealNVP(ScaleConditionedRealNVP):
         if training_config.image_training_bf16:
             raise ValueError('common image NF uses float32 training')
         self.couplings=nn.ModuleList([
-            ImageCoupling(training_config.image_shape,training_config.image_width,j%2,architecture.log_scale_limit)
+            ImageCoupling(training_config.image_shape,training_config.image_width,j%2,architecture.log_scale_limit,
+                          scalar_condition=architecture.fourier_features == 0)
             for j in range(architecture.num_coupling_layers)])
 
     def scale(self,epsilon,reference):

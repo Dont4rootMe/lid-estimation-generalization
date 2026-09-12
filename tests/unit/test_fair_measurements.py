@@ -77,12 +77,19 @@ def test_common_grid_supervised_comparator_is_frozen_before_test_labels():
     assert a['supervised_common_grid']['mae']!=b['supervised_common_grid']['mae']
 
 
-def make_receipt(root,known=True,reference=None):
+def make_receipt(root,known=True,reference=None,*,native=False,variant='vp_diffusion',unknown_success=False):
     """Small synthetic artifacts exercise accounting, not model-quality claims."""
     root.mkdir()
-    grid=m.common_scales() if known else v2.unknown_reference_lambdas()
+    from experiments.fair_protocol import resolve,geometry
+    from experiments.fair_campaign import supported_grid
+    cfg,_=resolve(variant,geometry('fixture','coefficients',(30,)),device='cpu',steps=2,preflight=True)
+    grid=m.model_scales(cfg) if native else (m.common_scales() if known else v2.unknown_reference_lambdas())
+    legacy=supported_grid(cfg,m.legacy_scales()) if native else m.legacy_scales()
+    expected=grid if native else None
     target=np.arange(4,dtype=float) if known else None
-    curve=(target[:,None]+np.log2(grid)[None,:]**2) if known else np.ones((4,50))
+    curve=(target[:,None]+np.log2(grid)[None,:]**2) if known else np.ones((4,len(grid)))
+    if not known and unknown_success:
+        curve=curve+np.exp(-6*np.linspace(0,1,len(grid)))[None,:]
     cell=SimpleNamespace(target_policy='known_lid' if known else 'sample_size',
         suite_id='e6' if known else 'e1',dataset='fixture' if known else ('step2' if reference else 'step1'),
         representation='coefficients',reference_dataset=None if known else 'step1',expected_lid_delta=0.)
@@ -91,19 +98,20 @@ def make_receipt(root,known=True,reference=None):
         (root/'reference_complete.json').write_bytes(reference.read_bytes())
         ref=json.loads(reference.read_text())
         (root/'reference_test_predictions.npz').write_bytes((reference.parent/'test_predictions.npz').read_bytes())
-    selected,selection=select_scale(curve,grid,target,cell,ref)
-    plan=m.known_plan(curve,grid,target) if known else None
+    selected,selection=select_scale(curve,grid,target,cell,ref,config=cfg if native else None)
+    plan=m.known_plan(curve,grid,target,legacy_grid=legacy,expected_grid=expected) if known else None
     np.savez_compressed(root/'holdout_curve.npz',prediction=curve,scales=grid,
         target=np.asarray([] if target is None else target),query_ids=np.arange(4,dtype=np.int64))
     (root/'model.pt').write_bytes(b'test fixture checkpoint')
-    receipt=dict(status='selected',variant='ve_diffusion',cell_key=f'{cell.suite_id}/{cell.dataset}/coefficients',
+    receipt=dict(status='selected',variant=variant,cell_key=f'{cell.suite_id}/{cell.dataset}/coefficients',
         cell=vars(cell),kind='preflight',protocol_sha256='fixture',source_sha256={'fixture':'fixture'},
-        resolved=dict(geometry=dict(ambient_dim=30)),config=dict(steps=2),steps_completed=2,
+        resolved=dict(geometry=dict(ambient_dim=30)),config=dict(steps=2),actual_config=cfg.to_dict(),steps_completed=2,
         n_source_train=20,partition=dict(n_source_train=20),fit_n=16,
         checkpoint_sha256=file_sha(root/'model.pt'),selected_lambda=selected,selection=selection,
         holdout_n=4,effective_holdout_indices_sha256=_array_sha(np.arange(4,dtype=np.int64)),
         holdout_curve_sha256=file_sha(root/'holdout_curve.npz'),primary_readout='full',
         measurement_plan=plan,test_loaded=False)
+    if native:receipt['scale_protocol']=m.SCALE_PROTOCOL
     if reference:receipt['reference_receipt_sha256']=file_sha(reference)
     pinned=fair_data.manifest()
     pinned['cells'][receipt['cell_key']]=dict(receipt['cell'])
@@ -121,8 +129,8 @@ def make_receipt(root,known=True,reference=None):
         pred['response']=pred['full']+.25
         metrics['response']=m.metric(pred['response'],target)
     if known:
-        diagnostics,arrays=m.known_results(curve,np.ones((4,22)),target,plan,30,
-            response_curves=(curve+.25,np.ones((4,22))+.25))
+        diagnostics,arrays=m.known_results(curve,np.ones((4,len(legacy))),target,plan,30,
+            response_curves=(curve+.25,np.ones((4,len(legacy)))+.25))
         np.savez_compressed(root/'test_scale_curves.npz',**arrays)
     np.savez_compressed(root/'test_predictions.npz',**pred)
     final=dict(receipt,status='complete',measurement_status=selection['status'],test_loaded=True,
@@ -132,6 +140,12 @@ def make_receipt(root,known=True,reference=None):
         automatic_metrics=diagnostics[m.PRIMARY_AUTOMATIC_METRIC] if known else {},
         diagnostic_metrics=diagnostics,test_predictions_sha256=file_sha(root/'test_predictions.npz'),
         test_scale_curves_sha256=file_sha(root/'test_scale_curves.npz') if known else None)
+    if not known:
+        from experiments.fair_outputs import reference_metrics
+        if ref is None:final['reference_metrics']=reference_metrics(final,pred,final,pred)
+        else:
+            with np.load(root/'reference_test_predictions.npz') as base:
+                final['reference_metrics']=reference_metrics(final,pred,ref,base)
     path=root/'complete.json';write_json(path,final)
     verify_measurements(path)
     return path,final

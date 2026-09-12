@@ -20,9 +20,10 @@ from experiments import global_campaign as v1,global_campaign_v2 as v2
 from experiments import fair_measurements as measurement
 from experiments import fair_outputs as outputs
 from experiments import fair_data
-from experiments.fair_protocol import (ROOT,protocol,native_contracts,geometry,resolve,
+from experiments.fair_protocol import (ROOT,protocol,native_contracts,active_native_contracts,geometry,resolve,
     parameter_count,source_identity,digest,audit_group,capacities)
 from models import training
+from models.native_tasks import valid_scales
 
 
 def write_json(path,value):
@@ -57,55 +58,73 @@ def matrix():
         spec=dataset_spec(cell)
         geo=geometry(cell.dataset,cell.representation,spec.expected_shapes[cell.representation])
         cap=capacities(geo['kind'],geo['image_shape'][-1] if geo['kind']=='image' else geo['ambient_dim'])
-        for variant in native_contracts():
+        for variant in active_native_contracts():
             nf=variant=='scale_conditioned_nf'
             rows.append(dict(cell_key=cell.key,cell=asdict(cell),variant=variant,
                 geometry=geo,architecture=('spatial RealNVP with U-Net conditioners' if geo['kind']=='image' else 'full-ambient RealNVP')
-                    if variant=='scale_conditioned_nf' else ('shared U-Net' if geo['kind']=='image' else 'shared spectral residual'),
+                    if variant=='scale_conditioned_nf' else ('shared U-Net' if geo['kind']=='image' else 'shared point residual'),
                 backbone_width=cap['nf_width'] if nf else rules[geo['kind']+'_data']['width'],
-                parameters=cap['nf_parameters'] if nf else cap['reference_parameters'],
+                parameters=cap['nf_parameters'] if nf else cap['reference_parameters']*(2 if variant=='schrodinger_bridge' else 1),
                 capacity_resolution=cap['nf_capacity_policy'] if nf else 'identical shared field core for every native family',
                 protocol_sha256=digest(rules)))
-    assert len(rows)==len(native_contracts())*len(v2.APPROVED_GLOBAL_CELL_KEYS)
+    assert len(rows)==len(active_native_contracts())*len(v2.APPROVED_GLOBAL_CELL_KEYS)
     return dict(status='routing_audited',protocol=protocol(),rows=rows,
-        cells=len(cells),native_interfaces=len(native_contracts()),trainings=len(rows),
+        cells=len(cells),native_interfaces=len(active_native_contracts()),trainings=len(rows),
+        implemented_interfaces=len(native_contracts()),disabled_variants=rules.get('disabled_variants',{}),
         scope='configuration coverage; not completed benchmark training')
 
 
-def prediction_spec(variant,geo):
+def prediction_spec(variant,geo,config=None):
     spec=dict(native_contracts()[variant])
+    config=config or SimpleNamespace(**spec['training'])
+    spec['lambda_support']=list(measurement.model_scale_bounds(config))
     if variant=='scale_conditioned_nf':return spec
     spec['derivative_backend']='exact' if geo['kind']=='vector' else 'hutchinson'
     spec['trace_probes']=0 if geo['kind']=='vector' else protocol()['selection']['image_trace_probes']
     return spec
 
 
-def select_scale(curve,scales,target,cell,reference=None):
+def supported_grid(config,grid):
+    values=np.asarray(grid)
+    return values[valid_scales(config,values,nf_stencil=config.native_variant=='scale_conditioned_nf')]
+
+
+def select_scale(curve,scales,target,cell,reference=None,*,config=None):
     curve,scales=measurement.validate_curve(curve,scales,target)
+    expected=measurement.model_scales(config) if config is not None else None
+    if expected is not None:measurement.require_grid(scales,expected)
     if cell.target_policy=='known_lid':
-        receipt=measurement.supervised_common_selection(curve,scales,target)
+        receipt=measurement.supervised_common_selection(curve,scales,target,expected_grid=expected)
         return receipt['selected_lambda'],receipt
     if cell.reference_dataset not in (None,cell.dataset):
         if reference is None:raise ValueError('dependent cell requires its completed same-method reference')
-        status=measurement.validate_selection(reference['selected_lambda'],reference['selection'],reference=True)
+        status=measurement.validate_selection(reference['selected_lambda'],reference['selection'],reference=True,scales=expected)
         receipt=dict(status=status,
             criterion='reuse_reference_mean_kneedle',reference_dataset=cell.reference_dataset)
+        if expected is not None:
+            receipt.update(protocol=measurement.REFERENCE_PROTOCOL,coordinate='log_lambda',
+                candidate_lambdas=expected.tolist())
         if status=='selection_failed':
             receipt.update(failure_reason='reference_selection_failed',
                 reference_failure_reason=reference['selection']['failure_reason'])
         return reference['selected_lambda'],receipt
-    measurement.require_grid(scales,v2.unknown_reference_lambdas())
-    index,receipt=v2.select_unknown_reference_kneedle(scales,curve)
+    if expected is None:
+        measurement.require_subgrid(scales,v2.unknown_reference_lambdas())
+        index,receipt=v2.select_unknown_reference_kneedle(scales,curve)
+    else:index,receipt=measurement.reference_selection(curve,scales)
     return (None if index is None else float(scales[index])),receipt
 
 
-def validate_reference(reference,manifest,cell):
+def validate_reference(reference,manifest,cell,*,scales=None):
     expected_key=f'{cell.suite_id}/{cell.reference_dataset}/{cell.representation}'
     for key in ('variant','protocol_sha256','source_sha256','kind'):
         if reference[key]!=manifest[key]:raise ValueError('reference has mismatched '+key)
+    if reference.get('scale_protocol')!=manifest.get('scale_protocol'):
+        raise ValueError('reference has mismatched scale protocol')
     if reference['cell_key']!=expected_key:raise ValueError('wrong reference dataset/representation')
     if reference['status']!='complete':raise ValueError('reference is not complete')
-    measurement.validate_selection(reference['selected_lambda'],reference['selection'],reference=True)
+    measurement.validate_selection(reference['selected_lambda'],reference['selection'],reference=True,scales=scales)
+    if scales is not None:measurement.require_grid(reference['selection']['candidate_lambdas'],scales)
     if 'config' in manifest and reference['steps_completed']!=manifest['config']['steps']:
         raise ValueError('reference has mismatched training budget')
 
@@ -127,25 +146,35 @@ def verify_measurements(path,row=None):
     if receipt['status']!='selected' or receipt['test_loaded'] is not False:
         raise ValueError('scale receipt was not frozen before test access')
     cell=SimpleNamespace(**receipt['cell']);known=cell.target_policy=='known_lid'
+    native_cfg=training.TrainingConfig.from_mapping(receipt['actual_config'])
+    scale_protocol=receipt.get('scale_protocol')
+    if scale_protocol not in (None,measurement.SCALE_PROTOCOL):raise ValueError('unknown scale protocol')
+    current=scale_protocol==measurement.SCALE_PROTOCOL
+    expected_grid=(measurement.model_scales(native_cfg) if current else
+                   supported_grid(native_cfg,measurement.common_scales() if known else v2.unknown_reference_lambdas()))
     if receipt['n_source_train']!=receipt['partition']['n_source_train'] or receipt['n_source_train']<receipt['fit_n']+receipt['holdout_n']:
         raise ValueError('source-train sample count differs from the partition')
     reference=None
     if not known and cell.reference_dataset not in (None,cell.dataset):
         ref_path=root/'reference_complete.json'
         if file_sha(ref_path)!=receipt['reference_receipt_sha256']:raise ValueError('reference receipt changed')
-        reference=json.loads(ref_path.read_text());validate_reference(reference,receipt,cell)
+        reference=json.loads(ref_path.read_text());validate_reference(reference,receipt,cell,
+            scales=expected_grid if current else None)
         if file_sha(root/'reference_test_predictions.npz')!=reference['test_predictions_sha256']:
             raise ValueError('reference test predictions changed')
     with np.load(root/'holdout_curve.npz',allow_pickle=False) as z:
         curve,scales=z['prediction'],z['scales'];target=z['target'] if known else None
         if len(curve)!=receipt['holdout_n'] or v1._array_sha(z['query_ids'])!=receipt['effective_holdout_indices_sha256']:
             raise ValueError('holdout query identity differs')
-        selected,selection=select_scale(curve,scales,target,cell,reference)
+        selected,selection=select_scale(curve,scales,target,cell,reference,config=native_cfg if current else None)
         if selected!=receipt['selected_lambda'] or selection!=receipt['selection']:
             raise ValueError('selection does not replay from the saved holdout')
-        plan=measurement.known_plan(curve,scales,target) if known else None
+        measurement.require_grid(scales,expected_grid)
+        plan=measurement.known_plan(curve,scales,target,
+            legacy_grid=supported_grid(native_cfg,measurement.legacy_scales()),
+            expected_grid=expected_grid if current else None) if known else None
         if plan!=receipt['measurement_plan']:raise ValueError('measurement plan differs from the saved holdout')
-    status=measurement.validate_selection(selected,selection,reference=not known)
+    status=measurement.validate_selection(selected,selection,reference=not known,scales=expected_grid if current else None)
     if row['measurement_status']!=status:raise ValueError('measurement coverage differs')
     primary=receipt['primary_readout']
     if primary!=outputs.readouts(receipt['variant'])[0]:raise ValueError('incorrect primary readout')
@@ -209,6 +238,10 @@ def run(args):
     cell=next((c for c in cells if c.key==args.cell),None)
     if cell is None:raise ValueError('cell is not in the fixed full campaign inventory')
     if args.variant not in native_contracts():raise ValueError('unknown native interface')
+    if args.variant not in active_native_contracts():
+        raise ValueError(f"{args.variant} is disabled in the experiment: {protocol()['disabled_variants'][args.variant]}")
+    if args.variant=='pfgmpp':
+        raise NotImplementedError('PFGM++ training is implemented with author clipping, but the primary Full benchmark is blocked pending the clipped-kernel readout. Use training.train_model for a separately authorized training-only canary.')
     out=args.output
     if out.exists():raise FileExistsError('choose a fresh cell output directory')
     spec=dataset_spec(cell)
@@ -230,8 +263,13 @@ def run(args):
     rank=geo['ambient_dim'] if geo['kind']=='vector' else None
     config,resolved=resolve(args.variant,geo,rank=rank,device=args.device,
         steps=args.steps,preflight=args.preflight)
+    known=cell.target_policy=='known_lid'
+    scales=measurement.model_scales(config)
+    legacy_grid=supported_grid(config,measurement.legacy_scales())
+    if known:measurement.require_subgrid(legacy_grid,measurement.legacy_scales())
     sources=source_identity()
     manifest=dict(variant=args.variant,cell_key=cell.key,cell=asdict(cell),resolved=resolved,
+        scale_protocol=measurement.SCALE_PROTOCOL,
         config=config.to_dict(),kind=resolved['kind'],protocol_sha256=digest(protocol()),
         source_sha256=sources,train_files_sha256=train_hashes,
         input_manifest_sha256=fair_data.contract_sha(),query_order_contract='pinned_input_rows_v1',
@@ -244,7 +282,7 @@ def run(args):
     reference=None
     if cell.target_policy!='known_lid' and cell.reference_dataset not in (None,cell.dataset):
         if args.reference is None:raise ValueError('provide --reference before training a dependent cell')
-        reference=verify_measurements(args.reference);validate_reference(reference,manifest,cell)
+        reference=verify_measurements(args.reference);validate_reference(reference,manifest,cell,scales=scales)
         manifest['reference_receipt_sha256']=file_sha(args.reference)
     out.mkdir(parents=True)
     if reference is not None:
@@ -268,17 +306,15 @@ def run(args):
     reloaded=training.load_checkpoint(out/'model.pt',device=args.device)
     for key,value in result.model.state_dict().items():torch.testing.assert_close(value,reloaded.model.state_dict()[key],rtol=0,atol=0)
     if sources!=source_identity():raise ValueError('source changed during this cell')
-    model_spec=prediction_spec(args.variant,geo)
+    model_spec=prediction_spec(args.variant,geo,config)
     primary=outputs.readouts(args.variant)[0]
-    known=cell.target_policy=='known_lid'
-    scales=measurement.common_scales() if known else v2.unknown_reference_lambdas()
     def predict(query,grid,readout=primary):
         return v2._prediction_curve(training.predict_lid,result,query,np.asarray(grid),model=model_spec,
             seed=0,batch_size=128,readout=readout)
     curve=predict(holdout,scales)
-    selected,selection=select_scale(curve,scales,target,cell,reference)
-    status=measurement.validate_selection(selected,selection,reference=not known)
-    plan=measurement.known_plan(curve,scales,target) if known else None
+    selected,selection=select_scale(curve,scales,target,cell,reference,config=config)
+    status=measurement.validate_selection(selected,selection,reference=not known,scales=scales)
+    plan=measurement.known_plan(curve,scales,target,legacy_grid=legacy_grid,expected_grid=scales) if known else None
     np.savez_compressed(out/'holdout_curve.npz',scales=scales,prediction=curve,
         target=np.asarray([] if target is None else target),query_ids=part.selection_indices[:len(holdout)])
     receipt=dict(manifest,status='selected',selection=selection,selected_lambda=selected,
@@ -299,8 +335,8 @@ def run(args):
         target=np.asarray([] if targets is None else targets));diagnostics={}
     if known:
         common_curve=predict(queries,scales)
-        legacy_curve=predict(queries,measurement.legacy_scales())
-        response_curves=(predict(queries,scales,'response'),predict(queries,measurement.legacy_scales(),'response')) \
+        legacy_curve=predict(queries,legacy_grid)
+        response_curves=(predict(queries,scales,'response'),predict(queries,legacy_grid,'response')) \
             if 'response' in outputs.readouts(args.variant) else None
         diagnostics,arrays=measurement.known_results(common_curve,legacy_curve,targets,plan,geo['ambient_dim'],
             response_curves=response_curves)

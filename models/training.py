@@ -212,6 +212,13 @@ class TrainingConfig:
     kernel_df: int | None = None
     kernel_log_scale_mean: float | None = None
     kernel_log_scale_std: float | None = None
+    native_variant: str | None = None
+    ve_forward_policy: str = 'corrected_flipd_ve'
+    pfgm_sigma_data: float = 0.5
+    pfgm_beta_clip: float = 0.001
+    dsb_num_steps: int = 20
+    dsb_step_size: float = 0.01
+    dsb_ipf_rounds: int = 20
 
     def __post_init__(self) -> None:
         if self.optimizer_schedule_policy not in {'native_v1', 'shared_terminal_v1'}:
@@ -232,8 +239,8 @@ class TrainingConfig:
             raise ValueError('training target must start before the budget ends')
         if isinstance(self.field_residual_width, bool) or not isinstance(self.field_residual_width, int) or self.field_residual_width <= 0:
             raise ValueError('field_residual_width must be a positive integer')
-        if self.field_residual_width != 512 and self.field_backbone != 'spectral_residual_v1':
-            raise ValueError('residual width applies only to the spectral residual backbone')
+        if self.field_residual_width != 512 and self.field_backbone not in {'spectral_residual_v1', 'point_residual_v1'}:
+            raise ValueError('residual width applies only to a residual vector backbone')
         if self.field_residual_scaling not in {'noise_v1', 'data_v1', 'gaussian_tail_v1'}:
             raise ValueError('unknown residual scaling')
         if self.field_residual_scaling != 'noise_v1' and self.field_preconditioning not in {'covariance_span_v1','ambient_isotropic_v1','image_gaussian_v1'}:
@@ -259,17 +266,19 @@ class TrainingConfig:
             raise ValueError('unknown noise pairing')
         if self.noise_pairing == 'antithetic_v1' and self.batch_size % 2:
             raise ValueError('antithetic training requires even batch_size')
-        if self.field_backbone not in {'bottleneck_v1','spectral_residual_v1','image_unet_v1'}:
+        if self.field_backbone not in {'bottleneck_v1','spectral_residual_v1','point_residual_v1','image_unet_v1'}:
             raise ValueError('unknown field backbone')
-        if self.field_backbone == 'spectral_residual_v1' and self.field_preconditioning not in {'covariance_span_v1','ambient_isotropic_v1'}:
+        if self.field_backbone == 'point_residual_v1' and (self.field_preconditioning != 'native_task_v1' or self.native_variant is None):
+            raise ValueError('point residual backbone requires an explicit native vector task')
+        if self.field_backbone == 'spectral_residual_v1' and self.field_preconditioning not in {'covariance_span_v1','ambient_isotropic_v1','native_task_v1'}:
             raise ValueError('spectral residual backbone requires an explicit vector field route')
-        if self.field_backbone == 'image_unet_v1' and self.field_preconditioning != 'image_gaussian_v1':
+        if self.field_backbone == 'image_unet_v1' and self.field_preconditioning not in {'image_gaussian_v1','native_task_v1'}:
             raise ValueError('image backbone requires image_gaussian_v1')
         if self.field_projection_rank is not None:
             if self.field_preconditioning != 'covariance_span_v1' or isinstance(self.field_projection_rank, bool) or not isinstance(self.field_projection_rank, int) or self.field_projection_rank <= 0:
                 raise ValueError('projection rank requires covariance_span_v1 and a positive integer')
         if self.field_preconditioning is not None:
-            if self.field_preconditioning not in {'gaussian_v1', 'gaussian_no_input_skip_v1', 'covariance_span_v1','ambient_isotropic_v1','image_gaussian_v1'}:
+            if self.field_preconditioning not in {'gaussian_v1', 'gaussian_no_input_skip_v1', 'covariance_span_v1','ambient_isotropic_v1','image_gaussian_v1','native_task_v1'}:
                 raise ValueError('unknown field_preconditioning')
             is_covariance_nf = self.field_preconditioning in {'covariance_span_v1','ambient_isotropic_v1','image_gaussian_v1'} and self.num_coupling_layers is not None
             if not self.normalize or (self.field_hidden_sizes is None and self.vp_hidden_sizes is None and not is_covariance_nf):
@@ -288,7 +297,7 @@ class TrainingConfig:
                 raise ValueError("native bottleneck preconditioning requires field_hidden_sizes")
         if self.image_layout not in {'nhwc','nchw'}:
             raise ValueError('unknown image layout')
-        if self.field_preconditioning == 'image_gaussian_v1':
+        if self.field_preconditioning == 'image_gaussian_v1' or (self.native_variant and self.image_shape is not None and self.num_coupling_layers is None):
             if self.image_shape is None or self.field_backbone != 'image_unet_v1' or self.field_projection_rank is not None:
                 raise ValueError('shared image fields require shape, image backbone, and no covariance projection')
             ImageFieldConfig(math.prod(self.image_shape),tuple(self.image_shape),self.image_width,self.image_training_bf16)
@@ -318,11 +327,13 @@ class TrainingConfig:
             "hidden_dim": self.hidden_dim,
             "time_embedding_dim": self.time_embedding_dim,
             "validation_interval": self.validation_interval,
-            "fourier_features": self.fourier_features,
         }
         for name, value in integer_positive.items():
             if isinstance(value, bool) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if (isinstance(self.fourier_features, bool) or not isinstance(self.fourier_features, int)
+                or self.fourier_features < 0 or (self.fourier_features == 0 and self.num_coupling_layers is None)):
+            raise ValueError('fourier_features must be positive for fields or nonnegative for a conditional NF')
         if self.training_mode not in {"epochs_v1", "fixed_steps_v1"}:
             raise ValueError("training_mode must be epochs_v1 or fixed_steps_v1")
         fixed_step_values = (
@@ -446,7 +457,7 @@ class TrainingConfig:
             self.bridge_tau_min,
             self.bridge_tau_max,
         )
-        if any(value is not None for value in bridge_values):
+        if any(value is not None for value in bridge_values) and not self.native_variant:
             if any(value is None for value in bridge_values):
                 raise ValueError(
                     "Schrodinger-bridge settings must be provided as one complete block"
@@ -475,7 +486,8 @@ class TrainingConfig:
                     "independent affine-flow settings must be provided as one "
                     "complete block"
                 )
-            _affine_spec_from_training_config(self)
+            if not self.native_variant:
+                _affine_spec_from_training_config(self)
         vp_values = (self.vp_hidden_sizes, self.vp_beta_min, self.vp_beta_max)
         if any(value is not None for value in vp_values):
             if any(value is None for value in vp_values):
@@ -491,6 +503,9 @@ class TrainingConfig:
             _bottleneck_architecture_from_training_config(
                 self, family="rectified_flow", ambient_dim=2
             )
+        if self.native_variant is not None:
+            from models.native_tasks import validate_config
+            validate_config(self)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -850,6 +865,9 @@ def _nf_architecture_from_training_config(
 
 
 def _model_contract(family: Family, config: TrainingConfig) -> dict[str, Any]:
+    if config.native_variant is not None:
+        from models.native_tasks import contract
+        return contract(config, family)
     contract = _native_model_contract(family, config)
     if config.field_preconditioning is not None:
         contract = {**contract, 'field_preconditioning': config.field_preconditioning}
@@ -1359,6 +1377,9 @@ def _objective(
     config: TrainingConfig,
     generator: torch.Generator,
 ) -> Tensor:
+    if config.native_variant is not None and family != 'scale_conditioned_normalizing_flow':
+        from models.native_tasks import objective
+        return objective(model, batch, config, generator)
     if family in {'student_t_flow','pfgmpp'}:
         from models.non_gaussian_fields import loss
         return loss(family,model,batch,config,generator)
@@ -2247,9 +2268,8 @@ def _load_fixed_training_progress(
         raise ValueError("fixed-step progress best-state metadata is invalid")
     if initial_validation_loss != expected_initial_validation_loss:
         raise ValueError("fixed-step progress initial validation loss mismatch")
-    expected_best = min(
-        history, key=lambda metric: (metric.validation_loss, metric.step)
-    )
+    expected_best = (history[-1] if config.native_variant == 'schrodinger_bridge' else
+        min(history, key=lambda metric: (metric.validation_loss, metric.step)))
     if (
         best_step != expected_best.step
         or best_validation_loss != expected_best.validation_loss
@@ -2338,14 +2358,20 @@ def train_model(
 
     canonical_family = _canonical_family(family)
     resolved_config = _coerce_config(config)
-    if canonical_family in {'student_t_flow','pfgmpp'}:
+    if resolved_config.native_variant == 'scale_conditioned_nf' and resolved_config.fourier_features != 0:
+        raise ValueError('new native NF training requires scalar log-sigma conditioning without Fourier features; old checkpoints are load-only')
+    if (resolved_config.native_variant not in {None, 'scale_conditioned_nf'}
+            and resolved_config.image_shape is None
+            and resolved_config.field_backbone != 'point_residual_v1'):
+        raise ValueError('new native vector training requires raw point inputs; spectral checkpoints are load-only')
+    if canonical_family in {'student_t_flow','pfgmpp'} and not resolved_config.native_variant:
         from models.non_gaussian_fields import validate_config
         validate_config(canonical_family,resolved_config)
-    elif any(getattr(resolved_config,k) is not None for k in ('kernel_df','kernel_log_scale_mean','kernel_log_scale_std')):
+    elif canonical_family not in {'student_t_flow','pfgmpp'} and any(getattr(resolved_config,k) is not None for k in ('kernel_df','kernel_log_scale_mean','kernel_log_scale_std')):
         raise ValueError('non-Gaussian kernel settings are inactive for this family')
-    if canonical_family == "independent_affine_flow":
+    if canonical_family == "independent_affine_flow" and not resolved_config.native_variant:
         _affine_spec_from_training_config(resolved_config)
-    elif _has_affine_settings(resolved_config):
+    elif canonical_family != 'independent_affine_flow' and _has_affine_settings(resolved_config):
         raise ValueError(
             f"{canonical_family} cannot carry inactive independent affine-flow settings"
         )
@@ -2373,7 +2399,7 @@ def train_model(
         and resolved_config.warmup_steps != 0
     ):
         raise ValueError("non-VP fixed-step training requires warmup_steps=0")
-    if canonical_family == "brownian_schrodinger_bridge":
+    if canonical_family == "brownian_schrodinger_bridge" and not resolved_config.native_variant:
         bridge_spec = _bridge_spec_from_training_config(resolved_config)
         if (
             resolved_config.bridge_tau_min is None
@@ -2504,7 +2530,7 @@ def train_model(
         model._lid_noise_pairing = resolved_config.noise_pairing
         if canonical_family == "vp_diffusion":
             model._lid_vp_schedule = _vp_schedule_from_training_config(resolved_config)
-        if canonical_family == "independent_affine_flow":
+        if canonical_family == "independent_affine_flow" and not resolved_config.native_variant:
             model._lid_affine_spec = _affine_spec_from_training_config(resolved_config)
         train_tensor = train_cpu.to(device)
         validation_tensor = validation_cpu.to(device)
@@ -2592,6 +2618,9 @@ def train_model(
             interval_examples = 0
             parameter_count = sum(parameter.numel() for parameter in model.parameters())
             for step in range(start_step, resolved_config.steps + 1):
+                if resolved_config.native_variant == 'schrodinger_bridge':
+                    if model.set_training_step(step):
+                        optimizer.state.clear()
                 model._lid_use_empirical_target=(resolved_config.training_target=='empirical_posterior_v1'
                                                 and step>resolved_config.training_target_start_step)
                 if resolved_config.ema_decay is not None and ema_model is None and step > resolved_config.ema_start_step:
@@ -2671,7 +2700,7 @@ def train_model(
                     learning_rate=learning_rate,
                 )
                 step_history.append(metric)
-                if validation_loss < best_validation_loss:
+                if validation_loss < best_validation_loss or resolved_config.native_variant == 'schrodinger_bridge':
                     best_validation_loss = validation_loss
                     best_step = step
                     best_state = _cpu_state_dict(candidate_model)
@@ -3106,7 +3135,7 @@ def load_checkpoint(
     model._lid_noise_pairing = config.noise_pairing
     if family == "vp_diffusion":
         model._lid_vp_schedule = _vp_schedule_from_training_config(config)
-    if family == "independent_affine_flow":
+    if family == "independent_affine_flow" and not config.native_variant:
         model._lid_affine_spec = _affine_spec_from_training_config(config)
     model.eval()
 
@@ -3169,10 +3198,9 @@ def load_checkpoint(
             not math.isfinite(best_validation_loss)
             or best_validation_loss != selected_metric.validation_loss
             or best_epoch
-            != min(
-                typed_step_history,
-                key=lambda metric: (metric.validation_loss, metric.step),
-            ).step
+            != (typed_step_history[-1] if config.native_variant == 'schrodinger_bridge'
+                else min(typed_step_history,
+                    key=lambda metric: (metric.validation_loss, metric.step))).step
         ):
             raise ValueError("fixed-step checkpoint best selection is invalid")
         raw_final_state = payload["final_model_state"]
@@ -3290,7 +3318,9 @@ def _model_and_context(
         model, ScaleConditionedRealNVP
     ):
         raise TypeError("scale-conditioned NF family requires ScaleConditionedRealNVP")
-    if canonical == "vp_diffusion" and not isinstance(model, VPBottleneckMLP):
+    if (canonical == "vp_diffusion" and not isinstance(model, VPBottleneckMLP)
+            and getattr(getattr(model, "training_config", None), "native_variant", None)
+            != "vp_diffusion"):
         raise TypeError("vp_diffusion family requires VPBottleneckMLP")
     mean = torch.zeros(model.config.ambient_dim, dtype=torch.float32)
     return model, canonical, mean, 1.0
@@ -4072,6 +4102,10 @@ def predict_lid(
     model, canonical_family, mean, normalization_scale = _model_and_context(
         model_or_result, family
     )
+    if getattr(getattr(model, 'training_config', None), 'native_variant', None) is not None and canonical_family != 'scale_conditioned_normalizing_flow':
+        from models.native_tasks import predict
+        return predict(model, query, scale, mean, normalization_scale, readout,
+                       divergence_backend, trace_probes, trace_seed, batch_size)
     if canonical_family in {'student_t_flow','pfgmpp'} and readout not in {'full','response'}:
         raise ValueError('Student-t kernels support native full and response, not Gaussian score conversion')
     if divergence_backend == 'active_exact':

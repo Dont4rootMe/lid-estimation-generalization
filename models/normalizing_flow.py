@@ -59,11 +59,12 @@ class ConditionalFlowConfig:
             "num_coupling_layers": self.num_coupling_layers,
             "conditioner_depth": self.conditioner_depth,
             "condition_dim": self.condition_dim,
-            "fourier_features": self.fourier_features,
         }
         for name, value in integer_positive.items():
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if isinstance(self.fourier_features, bool) or not isinstance(self.fourier_features, int) or self.fourier_features < 0:
+            raise ValueError("fourier_features must be a nonnegative integer; zero uses the scalar condition directly")
         if self.ambient_dim < 2:
             raise ValueError("ambient_dim must be at least two for affine coupling")
         if (
@@ -183,18 +184,31 @@ class _AffineCoupling(nn.Module):
         return inputs, -log_scale.sum(dim=-1)
 
 
+class LogScaleConditionMLP(nn.Module):
+    """Learn from the single log scale, without any frequency expansion."""
+
+    def __init__(self, output_dim):
+        super().__init__()
+        self.projection = nn.Sequential(nn.Linear(1, output_dim), nn.SiLU(),
+                                        nn.Linear(output_dim, output_dim))
+
+    def forward(self, scale):
+        return self.projection(scale.log().reshape(-1, 1))
+
+
 class ScaleConditionedRealNVP(nn.Module):
     """A shared conditional family of regular, exactly normalized densities."""
 
     def __init__(self, config: ConditionalFlowConfig) -> None:
         super().__init__()
         self.config = config
-        self.condition_embedding = ScalarConditionEmbedding(
+        self.condition_embedding = (LogScaleConditionMLP(config.condition_dim)
+            if config.fourier_features == 0 else ScalarConditionEmbedding(
             output_dim=config.condition_dim,
             fourier_features=config.fourier_features,
             max_frequency=config.max_condition_frequency,
             transform="log",
-        )
+        ))
         even = torch.arange(0, config.ambient_dim, 2, dtype=torch.long)
         odd = torch.arange(1, config.ambient_dim, 2, dtype=torch.long)
         couplings: list[_AffineCoupling] = []

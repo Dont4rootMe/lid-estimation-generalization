@@ -63,9 +63,10 @@ class ImageBlock(nn.Module):
 
 
 class ImageUNet(nn.Module):
-    def __init__(self,channels,width,output_channels=None):
+    def __init__(self,channels,width,output_channels=None,*,scalar_condition=False):
         super().__init__()
-        self.time = nn.Sequential(nn.Linear(128,128),nn.SiLU(),nn.Linear(128,128))
+        self.scalar_condition = scalar_condition
+        self.time = nn.Sequential(nn.Linear(1 if scalar_condition else 128,128),nn.SiLU(),nn.Linear(128,128))
         self.input = nn.Conv2d(channels,width,3,padding=1)
         self.high = ImageBlock(width,width)
         self.middle = ImageBlock(width,2*width)
@@ -78,9 +79,13 @@ class ImageUNet(nn.Module):
         nn.init.zeros_(self.output.bias)
 
     def forward(self,inputs,log_lambda):
-        frequencies = torch.exp(-math.log(10000)*torch.arange(64,device=inputs.device,dtype=inputs.dtype)/63)
-        angles = log_lambda[:,None]*frequencies[None]
-        condition = self.time(torch.cat((angles.sin(),angles.cos()),1))
+        if self.scalar_condition:
+            condition = self.time(log_lambda[:,None])
+        else:
+            # Historical NF and the separately declared field architectures.
+            frequencies = torch.exp(-math.log(10000)*torch.arange(64,device=inputs.device,dtype=inputs.dtype)/63)
+            angles = log_lambda[:,None]*frequencies[None]
+            condition = self.time(torch.cat((angles.sin(),angles.cos()),1))
         high = self.high(self.input(inputs),condition)
         middle = self.middle(F.avg_pool2d(high,2),condition)
         low = self.low2(self.low1(F.avg_pool2d(middle,2),condition),condition)

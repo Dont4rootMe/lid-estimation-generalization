@@ -1,17 +1,19 @@
-schema_version: 8
-id: full_primary_shared_selection_matched_nf_v8
-scope: all 39 campaign representations and 13 native interfaces
-architecture_rule: full supplied coordinates or full images; no fitted support projection
+schema_version: 13
+id: native_tasks_points_scalar_nf_pfgm_disabled_v13
+scope: all 39 campaign representations and 11 active methods; four explicitly author-defined controls
+disabled_variants:
+  pfgmpp: author-deferred pending a valid clipped-kernel Full readout; implementation retained
+architecture_rule: point coordinates or full images; no spatial feature expansion or fitted support projection
 vector_data:
-  preconditioning: ambient_isotropic_v1
-  backbone: spectral_residual_v1
+  preconditioning: native_task_v1
+  backbone: point_residual_v1
   width: 512
   residual_scaling: noise_v1
 image_data:
-  preconditioning: image_gaussian_v1
+  preconditioning: native_task_v1
   backbone: image_unet_v1
   width: 8
-  residual_scaling: gaussian_tail_v1
+  residual_scaling: noise_v1
 nf:
   architecture: invertible RealNVP; spatial U-Net conditioners on images
   capacity_target: actual common field backbone for each representation
@@ -20,7 +22,8 @@ nf:
   image_capacity_policy: matched_to_shared_image_field
   image_width_candidates: [4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 24, 32, 48, 64]
   image_coupling_layer_candidates: [2, 4, 6, 8]
-  max_condition_frequency: 1.0
+  conditioning: scalar log(sigma) through an MLP; no Fourier or sinusoidal features
+  fourier_features: 0
 training:
   seed: 0
   steps: 128000
@@ -30,7 +33,7 @@ training:
   gradient_clip_norm: 1.0
   validation_interval_steps: 500
   warmup_steps: 0
-  noise_pairing: antithetic_v1
+  noise_pairing: iid
   terminal_decay_steps: 8000
   terminal_learning_rate_ratio: 0.01
   ema_decay: 0.999
@@ -39,11 +42,13 @@ training:
   native_differences: targets, loss weights and noise/time sampling remain the declared
     method definitions
 selection:
-  weights: lowest native holdout loss, same raw/EMA candidates and validation intervals
+  weights: lowest native holdout loss except DSB, which retains the final IPF pair without EMA
   primary_quantity: full density LID for every family; NF estimates it by OLS5
-  known_lid_scale: minimum Full source-train holdout MAE on all 29 half-octaves from 1/256 through 64
-  unknown_lid_scale: Full source-train reference mean Kneedle; freeze and transfer to dependent
-    cells
+  scale_protocol: per_model_logspace_v1
+  scale_candidates: 29 geometric points including both model-specific bounds
+  scale_bounds: use native finite support; replace zero lower bound by 1/256 and infinite upper bound by 64; NF centers retain OLS5 padding
+  known_lid_scale: minimum Full source-train holdout MAE on all 29 model-specific candidates
+  unknown_lid_scale: Full source-train reference mean Kneedle on the same 29 model-specific candidates and log(lambda) axis; freeze and transfer to dependent cells
   image_trace_probes: 64
   vector_trace: exact full-ambient Jacobian for every vector interface
   nf_primary: OLS5
@@ -52,11 +57,12 @@ selection:
   test: all original test queries, only after immutable checkpoint/scale receipts
 measurement:
   kneed_version: 0.8.6
-  known_lid_automatic: primary pointwise Kneedle on the same 29 candidates as supervised selection
+  known_lid_automatic: primary pointwise Kneedle on exactly the same supported candidates as supervised selection
   primary_automatic_metric: kneedle_common_grid
-  historical_reproduction: legacy pointwise Kneedle on 22 FLIPD VP times, ambient fallback
-  candidate_matching: exactly the same fixed 29 scales for all models and both primary selectors
-  kneedle_parameters: reference VP time, convex decreasing, S=1, online=false, interp1d
+  historical_reproduction: legacy pointwise Kneedle on the supported subset of 22 FLIPD VP times, ambient fallback; filtered grids are not exact historical reproductions
+  candidate_matching: regenerate 29 candidates across each model's window; supervised and primary automatic selection use identical candidates within a method
+  kneedle_parameters: log(lambda), convex decreasing, S=1, online=false, interp1d
+  historical_kneedle_coordinate: reference VP time; unchanged for legacy diagnostics and replay of pre-v10 receipts
   automatic_coverage: report every fallback and boundary choice; retain all queries in MAE
   unknown_failure: propagate reference failure reason and report missing measurement coverage
   verification: replay selection and all metrics from hashed query-level artifacts
@@ -67,17 +73,16 @@ measurement:
   pairing: pinned input-file hashes establish canonical row order; additionally check query IDs and class-label order
   export: separate canonical/generated and supervised/common-Kneedle/historical tracks
   score_coverage: never omit failed cells; zero E1 reference mean has no relative score
-  non_gaussian: native radial-Student Full including the posterior log-scale derivative; Response is secondary
+  non_gaussian: t-Flow uses native Student Full; PFGM++ is excluded from the active matrix and score tables, with implementation retained
   scale_units: per-coordinate RMS noise; equals beta/alpha for unit-variance Gaussian sources
 non_gaussian:
   models: t_flowmatching nu5 and pfgmpp augmented dimension128
   parameters: fixed across datasets; no tail-parameter selection
-  kernel: multivariate Student-t with one chi-square denominator per sample
-  sampling: native uniform t for t-Flow; truncated EDM lognormal sigma for PFGM++
+  kernel: exact Student for t-Flow; author-clamped Beta radial sampler for PFGM++
+  sampling: uniform t for t-Flow; untruncated author EDM lognormal sigma for PFGM++
   loss: native Student noise MSE; native EDM weighted denoising MSE, respectively
-  vector_conditioning: all supplied coordinates and native RMS noise; no normal-complement substitution
+  vector_conditioning: all supplied coordinates; native 1-t condition for t-Flow and log(sigma)/4 for the PFGM++ raw network
   backbone: same parameter count and core as Gaussian fields on each dataset
   image_routing: common U-Net with all ambient coordinates retained
-budget_interpretation: equal updates and network examples; parameters matched within
-  10 percent for NF, measured elapsed time recorded; FLOPs are not claimed equal
+budget_interpretation: equal optimizer updates; DSB additionally generates trajectories and uses two cores; NF parameters matched within 10 percent of one core; FLOPs are not claimed equal
 old_results: projected, response-primary and unmatched-image-NF runs excluded; aggregation requires fresh matching protocol receipts

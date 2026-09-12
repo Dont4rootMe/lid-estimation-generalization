@@ -6,12 +6,12 @@ import torch
 
 from experiments import fair_protocol as fair
 from models.image_gaussian_fields import ImageUNet
-from models.spectral_residual_field import SpectralResidualCore
+from models.point_residual_field import PointResidualCore
 
 
 @pytest.mark.parametrize('shape,dimension,field_count,nf_count',[
-    ([1,28,28],784,97905,106012),
-    ([32,32,3],3072,98195,106452),
+    ([1,28,28],784,97905,91300),
+    ([32,32,3],3072,98195,91848),
 ])
 def test_every_image_field_uses_the_same_stock8_core_and_matched_nf(shape,dimension,field_count,nf_count):
     geo=fair.geometry('full_image_fixture','dataset',shape)
@@ -23,7 +23,7 @@ def test_every_image_field_uses_the_same_stock8_core_and_matched_nf(shape,dimens
         assert cfg.field_projection_rank is None
         assert fair.parameter_count(model)==receipt['actual_parameters']
         if variant=='scale_conditioned_nf':
-            assert cfg.image_width==4 and len(model.couplings)==2
+            assert cfg.image_width==5 and len(model.couplings)==2
             assert fair.parameter_count(model)==nf_count
             assert receipt['nf_capacity_match_required']
             assert abs(receipt['nf_relative_gap'])<=.1
@@ -31,20 +31,20 @@ def test_every_image_field_uses_the_same_stock8_core_and_matched_nf(shape,dimens
         else:
             assert type(model.core) is ImageUNet and cfg.image_width==8
             assert model.core.input.out_channels==8
-            assert fair.parameter_count(model)==field_count
+            assert fair.parameter_count(model)==field_count*(2 if variant=='schrodinger_bridge' else 1)
             signature={k:tuple(v.shape) for k,v in model.core.state_dict().items()}
             if reference is None:reference=signature
             assert signature==reference
         rows.append(dict(variant=variant,resolved=receipt))
-    assert fair.audit_group(rows)
+    assert fair.audit_group(rows,include_disabled=True)
     bad=copy.deepcopy(rows)
     next(r for r in bad if r['variant']=='t_flowmatching')['resolved']['common_field_backbone']['width']=32
     with pytest.raises(ValueError,match='mixed comparison'):
-        fair.audit_group(bad)
+        fair.audit_group(bad,include_disabled=True)
     bad=copy.deepcopy(rows)
     next(r for r in bad if r['variant']=='scale_conditioned_nf')['resolved']['actual_parameters']=field_count
     with pytest.raises(ValueError,match='NF parameters'):
-        fair.audit_group(bad)
+        fair.audit_group(bad,include_disabled=True)
 
 
 def test_full_vector_core_is_shared_with_both_new_families():
@@ -54,10 +54,12 @@ def test_full_vector_core_is_shared_with_both_new_families():
         if variant=='scale_conditioned_nf':continue
         cfg,receipt=fair.resolve(variant,geo,device='cpu',steps=4,preflight=True)
         with torch.device('meta'):model=fair.build_model(variant,cfg,30)
-        assert type(model.core) is SpectralResidualCore
+        assert type(model.core) is PointResidualCore
+        assert model.core.input.in_features==30
+        assert not any('spatial_frequencies' in key for key in model.state_dict())
         assert cfg.field_residual_width==512 and cfg.field_projection_rank is None
         assert len(model.core.blocks)==4 and model.core.output.out_features==30
-        assert fair.parameter_count(model)==receipt['actual_parameters']==3005214
+        assert fair.parameter_count(model)==receipt['actual_parameters']==2698014*(2 if variant=='schrodinger_bridge' else 1)
         signature={k:tuple(v.shape) for k,v in model.core.state_dict().items()}
         if reference is None:reference=signature
         assert signature==reference

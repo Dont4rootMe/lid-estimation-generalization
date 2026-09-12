@@ -12,15 +12,15 @@ from pathlib import Path
 
 import numpy as np
 
-from experiments.fair_protocol import native_contracts
+from experiments.fair_protocol import native_contracts,active_native_contracts
 from experiments import fair_data
+from experiments.fair_measurements import (SCALE_PROTOCOL,
+    SUPERVISED_PROTOCOL as SUPERVISED,POINTWISE_PROTOCOL as POINTWISE,
+    REFERENCE_PROTOCOL as REFERENCE)
 from experiments.metrics import known_lid_metrics, prediction_summary, paired_delta_metrics
 
 
-SUPERVISED = 'held_out_source_train_supervised_mae_common_grid_v3'
-POINTWISE = 'pointwise_kneedle_common_grid_v3'
 LEGACY = 'historical_flipd_pointwise_kneedle_v1'
-REFERENCE = 'held_out_reference_mean_kneedle_v2'
 SCORES = ('strict_coefficients', 'strict_dataset', 'arrows_mae',
           'e1_relative_drift', 'e5_invariance', 'e5_equivariance')
 
@@ -105,6 +105,10 @@ def result_records(entries):
     records = []
     for key, (row, directory, arrays) in sorted(indexed.items()):
         cell = row['cell']
+        current=row.get('scale_protocol')==SCALE_PROTOCOL
+        supervised=SUPERVISED if current else 'held_out_source_train_supervised_mae_native_support_v4'
+        pointwise=POINTWISE if current else 'pointwise_kneedle_common_grid_v3'
+        reference_protocol=REFERENCE if current else 'held_out_reference_mean_kneedle_v2'
         known = cell['target_policy'] == 'known_lid'
         common = dict(model_variant=row['variant'], cell_key=row['cell_key'],
             inventory_origin='canonical_35' if cell['exact_archive'] else 'generated_e3_e4_extension_4',
@@ -122,11 +126,11 @@ def result_records(entries):
             for readout in readouts(row['variant']):
                 values = finite_vector(arrays[readout], readout)
                 records.append(dict(common, **known_lid_metrics(values, target), **target_stats,
-                    analysis='known_lid', selection_protocol=SUPERVISED, readout=readout,
+                    analysis='known_lid', selection_protocol=supervised, readout=readout,
                     is_primary_readout=readout == row['primary_readout'],
                     readout_scale_rule='reuse_primary_holdout_scale'))
             with np.load(directory / 'test_scale_curves.npz', allow_pickle=False) as z:
-                for name, selector in (('kneedle_common_grid', POINTWISE), ('kneedle_legacy', LEGACY)):
+                for name, selector in (('kneedle_common_grid', pointwise), ('kneedle_legacy', LEGACY)):
                     values = finite_vector(z[name + '_prediction'], name)
                     diagnostic = row['diagnostic_metrics'][name]
                     records.append(dict(common, **known_lid_metrics(values, target), **target_stats,
@@ -158,7 +162,7 @@ def result_records(entries):
             stats = relative.get(readout, {})
             records.append(dict(common, **stats,
                 analysis='e5_paired_delta' if paired else 'e1_sample_size_stability',
-                selection_protocol=REFERENCE, readout=readout,
+                selection_protocol=reference_protocol, readout=readout,
                 is_primary_readout=readout == row['primary_readout'],
                 readout_scale_rule='reuse_reference_primary_holdout_scale',
                 expected_lid_delta=cell['expected_lid_delta'],
@@ -230,7 +234,7 @@ def table_scores(records, cells):
     """Long-form six-column tables; missing coverage is explicit, never averaged away."""
     cells = {f"{c['suite_id']}/{c['dataset']}/{c['representation']}": c for c in cells}
     result = []
-    for variant in native_contracts():
+    for variant in active_native_contracts():
         for readout in readouts(variant):
             primary = readout == readouts(variant)[0]
             for selector in (SUPERVISED, POINTWISE) if primary or readout=='response' else (SUPERVISED,):

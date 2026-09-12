@@ -81,6 +81,9 @@ class PreconditionedField(VPBottleneckMLP):
 
 
 def build_bottleneck(architecture, family, config):
+    if config.native_variant is not None:
+        from models.native_tasks import build_field
+        return build_field(architecture, family, config)
     if family in {'student_t_flow','pfgmpp'}:
         from models.non_gaussian_fields import build_field
         return build_field(architecture,family,config)

@@ -15,6 +15,7 @@ def entry(tmp_path, dataset, *, policy='paired_delta', reference='base',
         reference_dataset=reference, representation='dataset', target_policy=policy,
         exact_archive=True, expected_lid_delta=0. if dataset == reference else 4.)
     row = dict(cell=cell, cell_key=f"{cell['suite_id']}/{dataset}/dataset", variant=variant,
+        scale_protocol=m.SCALE_PROTOCOL,
         primary_readout=out.readouts(variant)[0], kind='preflight', test_n=2,
         n_source_train=50000 if dataset == reference else 25000,
         selected_lambda=None if failed else 2., measurement_status='selection_failed' if failed else 'selected',
@@ -142,7 +143,7 @@ def test_known_export_keeps_primary_automatic_legacy_and_secondary_scales_separa
     target = np.full(2, 2.)
     scales = m.common_scales()
     curve = target[:, None] + np.log2(scales)[None, :] ** 2
-    plan = m.known_plan(curve, scales, target)
+    plan = m.known_plan(curve, scales, target, expected_grid=scales)
     row['selected_lambda'] = 1.
     arrays.update(target=target, full=target.copy(), response=target + .25)
     row['diagnostic_metrics'], curves = m.known_results(curve, np.ones((2, 22)), target, plan, 30,
