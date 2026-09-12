@@ -277,7 +277,7 @@ def test_train_model_resumes_from_atomic_validated_epoch(
         checkpoint,
         progress_checkpoint_path=progress,
     )
-    assert not progress.exists()
+    assert progress.is_file()
     assert resumed.history == uninterrupted.history
     assert resumed.best_epoch == uninterrupted.best_epoch
     assert resumed.best_validation_loss == uninterrupted.best_validation_loss

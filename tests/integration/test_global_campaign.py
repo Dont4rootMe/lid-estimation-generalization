@@ -309,7 +309,7 @@ class _FakeTraining:
         Path(checkpoint_path).write_text(
             json.dumps(checkpoint_record, sort_keys=True), encoding="utf-8"
         )
-        progress.unlink(missing_ok=True)
+        progress.write_bytes(b"completed-progress-fixture")
         return SimpleNamespace(
             checkpoint_path=Path(checkpoint_path),
             checkpoint_sha256=sha256_path(Path(checkpoint_path)),
@@ -456,7 +456,7 @@ def test_pruning_rejects_missing_or_nonminimal_training_history(
     assert any("first strict minimum" in error for error in errors)
 
 
-def test_pruned_affine_cell_rejects_resealed_cross_checkpoint_diagnostics(
+def test_retained_affine_cell_rejects_resealed_cross_checkpoint_diagnostics(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from experiments import fm_diagnostics
@@ -560,9 +560,7 @@ def test_pruned_affine_cell_rejects_resealed_cross_checkpoint_diagnostics(
     )
     global_campaign._write_json(final_dir / "summary.json", summary)
     manifest = global_campaign._load_json(final_dir / "manifest.json")
-    manifest["outputs"] = global_campaign._output_inventory(
-        final_dir, excluded_relative_paths=frozenset({"checkpoint.pt"})
-    )
+    manifest["outputs"] = global_campaign._output_inventory(final_dir)
     global_campaign._write_json(final_dir / "manifest.json", manifest)
 
     errors = global_campaign.validate_global_cell(final_dir)
@@ -576,9 +574,7 @@ def test_pruned_affine_cell_rejects_resealed_cross_checkpoint_diagnostics(
     )
     summary["fm_diagnostics"]["outer_selection_curve_sha256"] = "e" * 64
     global_campaign._write_json(final_dir / "summary.json", summary)
-    manifest["outputs"] = global_campaign._output_inventory(
-        final_dir, excluded_relative_paths=frozenset({"checkpoint.pt"})
-    )
+    manifest["outputs"] = global_campaign._output_inventory(final_dir)
     global_campaign._write_json(final_dir / "manifest.json", manifest)
 
     errors = global_campaign.validate_global_cell(final_dir)
@@ -655,10 +651,11 @@ def test_all_models_all_cells_resume_and_deep_validate(
     assert len(manifest["cells"]) == 390
     for record in manifest["cells"]:
         cell_dir = campaign_root / record["path"]
-        assert not (cell_dir / "checkpoint.pt").exists()
+        assert (cell_dir / "checkpoint.pt").is_file()
+        assert list(cell_dir.glob("*training_progress*.pt"))
         attestation = json.loads((cell_dir / "training_attestation.json").read_text())
         summary = json.loads((cell_dir / "summary.json").read_text())
-        assert attestation["checkpoint_retention"] == ("prune_after_cell_evaluation")
+        assert attestation["checkpoint_retention"] == "retain"
         assert attestation["checkpoint_sha256"] == summary["checkpoint_sha256"]
         assert attestation["history"]["status"] == "complete"
     aggregate = json.loads((campaign_root / "aggregate.json").read_text())
@@ -776,7 +773,7 @@ def test_legacy_retained_checkpoint_contract_remains_valid(
     assert global_campaign.validate_global_cell(sealed[0]) == []
 
 
-def test_pruned_complete_staging_recovers_without_retraining(
+def test_retained_complete_staging_recovers_without_retraining(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = validate_global_campaign_config(
@@ -800,8 +797,9 @@ def test_pruned_complete_staging_recovers_without_retraining(
             and source_path.name.endswith(".incomplete")
         ):
             interrupt["armed"] = False
-            assert not (source_path / "checkpoint.pt").exists()
-            raise RuntimeError("fixture post-prune seal interruption")
+            assert (source_path / "checkpoint.pt").is_file()
+            assert list(source_path.glob("*training_progress*.pt"))
+            raise RuntimeError("fixture pre-rename seal interruption")
         return replace(source, destination)
 
     monkeypatch.setattr(global_campaign.os, "replace", interrupt_first_cell_seal)
@@ -815,12 +813,12 @@ def test_pruned_complete_staging_recovers_without_retraining(
         "load_checkpoint_fn": _load_checkpoint,
         "logger_factory": _logger_factory([], []),
     }
-    with pytest.raises(RuntimeError, match="post-prune seal interruption"):
+    with pytest.raises(RuntimeError, match="pre-rename seal interruption"):
         run_global_campaign(config, **kwargs)
     campaign_root = next(path for path in tmp_path.iterdir() if path.is_dir())
     staging = next(campaign_root.rglob(".*.incomplete"))
     assert (staging / "manifest.json").is_file()
-    assert not (staging / "checkpoint.pt").exists()
+    assert (staging / "checkpoint.pt").is_file()
     assert global_campaign.validate_global_cell(staging) == []
 
     # Cell 1 is sealed directly from its validated staging directory.  The
@@ -831,7 +829,8 @@ def test_pruned_complete_staging_recovers_without_retraining(
     ledger = json.loads((campaign_root / "state" / "ledger.json").read_text())
     assert len(ledger["completed_cells"]) == 1
     sealed = campaign_root / ledger["completed_cells"][0]["path"]
-    assert not (sealed / "checkpoint.pt").exists()
+    assert (sealed / "checkpoint.pt").is_file()
+    assert list(sealed.glob("*training_progress*.pt"))
     assert global_campaign.validate_global_cell(sealed) == []
 
 

@@ -931,6 +931,36 @@ def _manifest_outputs(
     return values
 
 
+def _retained_checkpoint_errors(directory: Path) -> list[str]:
+    """Verify retained weights against attestations; read old pruned records."""
+    errors: list[str] = []
+    records = list(directory.rglob("training_attestation.json")) + list(
+        directory.rglob("attestation.json")
+    )
+    covered: set[Path] = set()
+    for path in records:
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            checkpoint = path.parent / "checkpoint.pt"
+            covered.add(checkpoint)
+            retention = record.get("retention")
+            if retention == "retain":
+                if not checkpoint.is_file():
+                    errors.append("retained NF checkpoint is missing")
+                elif _sha256_path(checkpoint) != record.get("checkpoint_sha256"):
+                    errors.append("retained NF checkpoint SHA differs")
+            elif retention == "pruned_after_inline_evaluation":
+                if checkpoint.exists():
+                    errors.append("legacy pruned NF cell retained a checkpoint")
+            else:
+                errors.append("unknown NF checkpoint retention")
+        except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+            errors.append("invalid NF checkpoint attestation")
+    if any(path not in covered for path in directory.rglob("checkpoint.pt")):
+        errors.append("NF checkpoint lacks its training attestation")
+    return errors
+
+
 def _validate_cell(directory: Path, identity: Mapping[str, Any]) -> list[str]:
     errors: list[str] = []
     try:
@@ -1062,10 +1092,7 @@ def _validate_cell(directory: Path, identity: Mapping[str, Any]) -> list[str]:
         }
         if declared_outputs != actual_outputs:
             errors.append("manifest output coverage differs")
-    if list(directory.rglob("checkpoint.pt")) or list(
-        directory.rglob("training_progress.pt")
-    ):
-        errors.append("sealed cell retained a checkpoint")
+    errors.extend(_retained_checkpoint_errors(directory))
     return errors
 
 
@@ -1407,7 +1434,7 @@ def _training_attestation(
         "best_epoch": int(trained.best_epoch),
         "best_validation_loss": float(trained.best_validation_loss),
         "history": [_plain(row) for row in history],
-        "retention": "pruned_after_inline_evaluation",
+        "retention": "retain",
     }
 
 
@@ -1427,7 +1454,7 @@ def _run_conditional_cell(
     checkpoint = work_dir / "checkpoint.pt"
     progress = work_dir / "training_progress.pt"
     training = model["training"]
-    if not (checkpoint.is_file() and not progress.exists()):
+    if not checkpoint.is_file():
         _call_trainer(
             dependencies.train_fn,
             train=partition.fit_features,
@@ -1540,8 +1567,6 @@ def _run_conditional_cell(
             "reference_binding": binding,
             "metrics": split_metrics,
         }
-    checkpoint.unlink()
-    progress.unlink(missing_ok=True)
     return {
         "candidate_contract": candidate.contract,
         "paper_parity_status": "not_applicable_shared_conditional_density",
@@ -1605,10 +1630,7 @@ def _component_is_complete(
                 return False
         except (KeyError, OSError, TypeError):
             return False
-    return (
-        not (component_dir / "checkpoint.pt").exists()
-        and not (component_dir / "training_progress.pt").exists()
-    )
+    return not _retained_checkpoint_errors(component_dir)
 
 
 def _run_paper_parity_cell(
@@ -1657,7 +1679,7 @@ def _run_paper_parity_cell(
         ):
             checkpoint = component_dir / "checkpoint.pt"
             progress = component_dir / "training_progress.pt"
-            if not (checkpoint.is_file() and not progress.exists()):
+            if not checkpoint.is_file():
                 _call_trainer(
                     dependencies.train_fn,
                     train=partition.fit_features,
@@ -1707,12 +1729,10 @@ def _run_paper_parity_cell(
                 "likelihood_outputs": likelihood_outputs,
             }
             _write_json(component_dir / "attestation.json", component_record)
-            checkpoint.unlink()
-            progress.unlink(missing_ok=True)
             if not _component_is_complete(
                 component_dir, expected_training_sha256=training_sha
             ):
-                raise NFAblationError("P0 component failed post-prune validation")
+                raise NFAblationError("P0 component failed retained-checkpoint validation")
             del trained
             campaign._clear_accelerator_cache()
         component_record = json.loads(
@@ -1841,15 +1861,11 @@ def _run_cell_task(
         work_dir.mkdir()
         _write_json(work_dir / "identity.json", identity)
         campaign._write_yaml(work_dir / "resolved_model.yaml", model)
-    # Recover the tiny post-prune/pre-rename window without retraining.
-    if (
-        (work_dir / "manifest.json").is_file()
-        and not list(work_dir.rglob("checkpoint.pt"))
-        and not list(work_dir.rglob("training_progress.pt"))
-    ):
+    # Recover a fully evaluated cell before its atomic directory rename.
+    if (work_dir / "manifest.json").is_file():
         errors = _validate_cell(work_dir, identity)
         if errors:
-            raise NFAblationError(f"pruned incomplete cell is invalid: {errors}")
+            raise NFAblationError(f"completed incomplete cell is invalid: {errors}")
         os.replace(work_dir, final_dir)
         summary = json.loads((final_dir / "summary.json").read_text(encoding="utf-8"))
         return {
@@ -3483,8 +3499,7 @@ def validate_nf_ablation_campaign(campaign_root: str | Path) -> list[str]:
                     )
         except (KeyError, OSError, UnicodeError, json.JSONDecodeError, TypeError):
             errors.append(f"{stage} ledger is unreadable")
-    if list(root.rglob("checkpoint.pt")) or list(root.rglob("training_progress.pt")):
-        errors.append("completed NF ablation retained a checkpoint")
+    errors.extend(_retained_checkpoint_errors(root))
     return errors
 
 

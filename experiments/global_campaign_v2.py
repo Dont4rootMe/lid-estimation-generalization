@@ -541,7 +541,7 @@ def _validate_selection_config(selection: Mapping[str, Any]) -> None:
 def _validate_evaluation_config(evaluation: Mapping[str, Any]) -> None:
     expected = {
         "batch_size": 128,
-        "checkpoint_retention": CHECKPOINT_RETENTION_PRUNE_AFTER_EVALUATION,
+        "checkpoint_retention": CHECKPOINT_RETENTION_RETAIN,
         "supervised_validation_candidate_count": 1,
         "supervised_test_candidate_count": 1,
         "kneedle_uses_targets": False,
@@ -1681,7 +1681,7 @@ def _training_attestation(
         "training_config_sha256": sha256_bytes(canonical_json(training).encode()),
         "checkpoint_sha256": checkpoint_sha256,
         "checkpoint_size_bytes": checkpoint.stat().st_size,
-        "checkpoint_retention": CHECKPOINT_RETENTION_PRUNE_AFTER_EVALUATION,
+        "checkpoint_retention": CHECKPOINT_RETENTION_RETAIN,
         "capacity_alignment": _plain(model["capacity_alignment"]),
         "history": history,
     }
@@ -1706,6 +1706,13 @@ def _run_cell(
     cell_diagnostics_fn: Callable[[Mapping[str, Any], Path], Mapping[str, Any]]
     | None = None,
 ) -> tuple[Path, dict[str, Any]]:
+    if (
+        config["campaign"]["evaluation"]["checkpoint_retention"]
+        != CHECKPOINT_RETENTION_RETAIN
+    ):
+        raise GlobalCampaignError(
+            "automatic checkpoint pruning is disabled; set checkpoint_retention=retain"
+        )
     model = resolve_cell_model(model_plan, data.input_record)
     cell_plan = replace(model_plan, model=model)
     identity = _cell_identity(
@@ -1767,16 +1774,12 @@ def _run_cell(
     progress = work_dir / str(
         config["campaign"]["resume"]["training_progress_filename"]
     )
-    if (
-        (work_dir / "manifest.json").is_file()
-        and not checkpoint.exists()
-        and not progress.exists()
-    ):
+    if (work_dir / "manifest.json").is_file():
         errors = validate_global_cell(
             work_dir, expected_identity=identity, reference_summary=reference_summary
         )
         if errors:
-            raise GlobalCampaignError(f"pruned v2 recovery failed: {errors}")
+            raise GlobalCampaignError(f"completed v2 recovery failed: {errors}")
         os.replace(work_dir, final_dir)
         summary = _load_json(final_dir / "summary.json")
         summary["summary_sha256"] = sha256_path(final_dir / "summary.json")
@@ -1793,7 +1796,7 @@ def _run_cell(
             training=dict(payload),
         )
 
-    if not (checkpoint.is_file() and not progress.exists()):
+    if not checkpoint.is_file():
         _emit(
             callback,
             "cell.started",
@@ -2157,7 +2160,7 @@ def _run_cell(
         "reference_binding": reference_binding,
         "partition": partition.record,
         "checkpoint_sha256": checkpoint_sha,
-        "checkpoint_retention": CHECKPOINT_RETENTION_PRUNE_AFTER_EVALUATION,
+        "checkpoint_retention": CHECKPOINT_RETENTION_RETAIN,
         "training_attestation_sha256": sha256_path(
             work_dir / "training_attestation.json"
         ),
@@ -2176,25 +2179,16 @@ def _run_cell(
         "identity": identity,
         "selection_protocols": list(protocol_records),
         "evaluation_protocol": FROZEN_EVALUATION_PROTOCOL,
-        "outputs": _output_inventory(
-            work_dir, excluded_relative_paths=frozenset({"checkpoint.pt"})
-        ),
+        "outputs": _output_inventory(work_dir),
     }
     _write_json(work_dir / "manifest.json", manifest)
     errors = validate_global_cell(
         work_dir,
         expected_identity=identity,
         reference_summary=reference_summary,
-        allow_transient_prunable_checkpoint=True,
     )
     if errors:
         raise GlobalCampaignError(f"new v2 cell failed validation: {errors}")
-    checkpoint.unlink()
-    errors = validate_global_cell(
-        work_dir, expected_identity=identity, reference_summary=reference_summary
-    )
-    if errors:
-        raise GlobalCampaignError(f"pruned v2 cell failed validation: {errors}")
     os.replace(work_dir, final_dir)
     summary["summary_sha256"] = sha256_path(final_dir / "summary.json")
     _emit(
@@ -2340,19 +2334,31 @@ def validate_global_cell(
         errors.append("v2 summary permits benchmark-target tuning")
     if summary.get("primary_readout") != model.get("primary_readout"):
         errors.append("v2 primary readout differs from model")
+    retention = summary.get("checkpoint_retention")
+    declared_retention = identity.get("evaluation_contract", {}).get(
+        "checkpoint_retention", retention
+    )
     if (
-        summary.get("checkpoint_retention")
-        != CHECKPOINT_RETENTION_PRUNE_AFTER_EVALUATION
+        retention not in SUPPORTED_CHECKPOINT_RETENTION_POLICIES
+        or retention != declared_retention
     ):
         errors.append("v2 checkpoint retention differs")
     checkpoint = root / "checkpoint.pt"
-    if checkpoint.exists() and not allow_transient_prunable_checkpoint:
+    if retention == CHECKPOINT_RETENTION_RETAIN and not checkpoint.is_file():
+        errors.append("retained v2 checkpoint is missing")
+    if (
+        retention == CHECKPOINT_RETENTION_PRUNE_AFTER_EVALUATION
+        and checkpoint.exists()
+        and not allow_transient_prunable_checkpoint
+    ):
         errors.append("sealed v2 cell retains a checkpoint")
     if checkpoint.exists() and sha256_path(checkpoint) != summary.get(
         "checkpoint_sha256"
     ):
-        errors.append("transient v2 checkpoint SHA differs")
-    if any(root.glob("*training_progress*.pt")):
+        errors.append("v2 checkpoint SHA differs")
+    if retention == CHECKPOINT_RETENTION_PRUNE_AFTER_EVALUATION and any(
+        root.glob("*training_progress*.pt")
+    ):
         errors.append("sealed v2 cell retains training progress")
     recorded_outputs = manifest.get("outputs")
     if not isinstance(recorded_outputs, Mapping):
@@ -2360,7 +2366,12 @@ def validate_global_cell(
     else:
         try:
             actual_outputs = _output_inventory(
-                root, excluded_relative_paths=frozenset({"checkpoint.pt"})
+                root,
+                excluded_relative_paths=(
+                    frozenset({"checkpoint.pt"})
+                    if retention == CHECKPOINT_RETENTION_PRUNE_AFTER_EVALUATION
+                    else frozenset()
+                ),
             )
         except GlobalCampaignError as exc:
             errors.append(str(exc))
@@ -2440,7 +2451,7 @@ def validate_global_cell(
             or attestation.get("checkpoint_sha256") != summary.get("checkpoint_sha256")
             or attestation.get("model_family") != model.get("family")
             or attestation.get("checkpoint_retention")
-            != CHECKPOINT_RETENTION_PRUNE_AFTER_EVALUATION
+            != retention
             or type(attestation.get("checkpoint_size_bytes")) is not int
             or attestation.get("checkpoint_size_bytes", 0) <= 0
         ):

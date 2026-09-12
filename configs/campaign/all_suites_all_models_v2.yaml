@@ -69,7 +69,7 @@ selection:
 
 evaluation:
   batch_size: 128
-  checkpoint_retention: prune_after_cell_evaluation
+  checkpoint_retention: retain
   supervised_validation_candidate_count: 1
   supervised_test_candidate_count: 1
   kneedle_uses_targets: false

@@ -14,7 +14,7 @@ separate, explicitly post-hoc follow-up:
 
 Seed 2 is trained once.  Its worker evaluates both frozen test readouts from the
 same checkpoint, avoiding a scientifically pointless duplicate training run.
-Every checkpoint is pruned immediately after inline evaluation.
+Every checkpoint and available training-progress state is retained after evaluation.
 """
 
 from __future__ import annotations
@@ -615,7 +615,7 @@ def _identity_record(
             "training_tasks": EXPECTED_TRAINING_TASKS,
             "output_rows": EXPECTED_EXTENSION_ROWS,
             "expected_combined_rows": EXPECTED_COMBINED_ROWS,
-            "checkpoint_retention": "pruned_after_inline_evaluation",
+            "checkpoint_retention": "retain",
         },
     }
 

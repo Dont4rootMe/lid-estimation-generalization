@@ -2351,9 +2351,9 @@ def train_model(
     When ``progress_checkpoint_path`` is supplied, validated epochs are
     snapshotted at the declared progress interval, at the final epoch, and
     when early stopping fires.  Each snapshot includes optimizer and generator
-    state.  A subsequent invocation resumes from that exact epoch and removes
-    the progress file only after the final portable best-model checkpoint is
-    safely installed.
+    state. A subsequent invocation resumes from that exact epoch. Both the
+    progress state and the final portable checkpoint remain after completion,
+    so later evaluation and recovery do not require retraining.
     """
 
     canonical_family = _canonical_family(family)
@@ -2769,8 +2769,6 @@ def train_model(
                 preprocessing=preprocessing,
                 preprocessing_sha256=preprocessing_sha256,
             )
-            if progress_path is not None:
-                progress_path.unlink(missing_ok=True)
             return TrainingResult(
                 family=canonical_family,
                 model=model,
@@ -2955,8 +2953,6 @@ def train_model(
             preprocessing=preprocessing,
             preprocessing_sha256=preprocessing_sha256,
         )
-        if progress_path is not None:
-            progress_path.unlink(missing_ok=True)
         return TrainingResult(
             family=canonical_family,
             model=model,

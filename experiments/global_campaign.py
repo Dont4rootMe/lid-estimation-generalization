@@ -1816,7 +1816,11 @@ def validate_global_cell(
     forbidden = (
         list(root.glob("validation_curve*.npy"))
         + list(root.glob("test_curve*.npy"))
-        + list(root.glob("*training_progress*.pt"))
+        + (
+            list(root.glob("*training_progress*.pt"))
+            if checkpoint_retention == CHECKPOINT_RETENTION_PRUNE_AFTER_EVALUATION
+            else []
+        )
     )
     if forbidden:
         errors.append("retrospective curves or training progress remain in sealed cell")
@@ -2630,6 +2634,10 @@ def _run_cell(
     checkpoint_retention = _checkpoint_retention_policy(
         config["campaign"]["evaluation"]
     )
+    if checkpoint_retention != CHECKPOINT_RETENTION_RETAIN:
+        raise GlobalCampaignError(
+            "automatic checkpoint pruning is disabled; set checkpoint_retention=retain"
+        )
     identity = _cell_identity(
         campaign_id=campaign_id,
         campaign_config_sha=campaign_config_sha,
@@ -2704,15 +2712,8 @@ def _run_cell(
         config["campaign"]["resume"]["training_progress_filename"]
     )
 
-    # The post-evaluation manifest is written before pruning.  If the process
-    # dies after the atomic unlink but before the directory rename, all science
-    # outputs are already immutable and can be sealed without retraining.
-    if (
-        checkpoint_retention == CHECKPOINT_RETENTION_PRUNE_AFTER_EVALUATION
-        and (work_dir / "manifest.json").is_file()
-        and not checkpoint.exists()
-        and not progress.exists()
-    ):
+    # A verified manifest also closes the pre-rename interruption window.
+    if (work_dir / "manifest.json").is_file():
         errors = validate_global_cell(
             work_dir,
             expected_identity=identity,
@@ -2720,7 +2721,7 @@ def _run_cell(
         )
         if errors:
             raise GlobalCampaignError(
-                f"pruned incomplete global cell failed recovery: {errors}"
+                f"completed incomplete global cell failed recovery: {errors}"
             )
         os.replace(work_dir, final_dir)
         summary = _load_json(final_dir / "summary.json")
@@ -2733,7 +2734,7 @@ def _run_cell(
             cell_id=cell_id,
             selected_scale=summary["selected_scale"],
             metrics=summary["metrics"],
-            recovered_after_checkpoint_prune=True,
+            recovered_after_evaluation=True,
             shared_filesystem_cell_dir=str(final_dir),
         )
         return final_dir, summary
@@ -2749,7 +2750,7 @@ def _run_cell(
             training=dict(payload),
         )
 
-    if not (checkpoint.is_file() and not progress.exists()):
+    if not checkpoint.is_file():
         _emit(
             callback,
             "cell.started",
@@ -2769,10 +2770,8 @@ def _run_cell(
         )
     if not checkpoint.is_file() or checkpoint.stat().st_size <= 0:
         raise GlobalCampaignError(f"trainer did not write checkpoint: {checkpoint}")
-    # Evaluation and the surviving attestation must come from a round-tripped
-    # checkpoint, never only from the trainer's in-memory return value.  Once
-    # pruning unlinks the file this loaded payload is the last opportunity to
-    # prove that optimizer history/config and evaluated weights are identical.
+    # Evaluation and its attestation must come from the saved checkpoint so
+    # later metric recomputation loads the same weights and training metadata.
     trained = load_checkpoint_fn(
         checkpoint, device=str(model_plan.model["training"]["device"])
     )
@@ -2980,14 +2979,7 @@ def _run_cell(
     summary["summary_sha256"] = sha256_path(work_dir / "summary.json")
     # Store the self-hash only in the returned/aggregate record.  Embedding a
     # file's hash inside itself would create a circular identity.
-    outputs = _output_inventory(
-        work_dir,
-        excluded_relative_paths=(
-            frozenset({"checkpoint.pt"})
-            if checkpoint_retention == CHECKPOINT_RETENTION_PRUNE_AFTER_EVALUATION
-            else frozenset()
-        ),
-    )
+    outputs = _output_inventory(work_dir)
     manifest = {
         "schema_version": GLOBAL_CELL_MANIFEST_SCHEMA_VERSION,
         "identity": identity,
@@ -3002,23 +2994,9 @@ def _run_cell(
         work_dir,
         expected_identity=identity,
         reference_summary=reference_summary,
-        allow_transient_prunable_checkpoint=(
-            checkpoint_retention == CHECKPOINT_RETENTION_PRUNE_AFTER_EVALUATION
-        ),
     )
     if errors:
         raise GlobalCampaignError(f"new global cell failed validation: {errors}")
-    if checkpoint_retention == CHECKPOINT_RETENTION_PRUNE_AFTER_EVALUATION:
-        checkpoint.unlink()
-        errors = validate_global_cell(
-            work_dir,
-            expected_identity=identity,
-            reference_summary=reference_summary,
-        )
-        if errors:
-            raise GlobalCampaignError(
-                f"pruned global cell failed strict validation: {errors}"
-            )
     os.replace(work_dir, final_dir)
     summary["summary_sha256"] = sha256_path(final_dir / "summary.json")
     _emit(

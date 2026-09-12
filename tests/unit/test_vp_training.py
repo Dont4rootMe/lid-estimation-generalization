@@ -171,7 +171,7 @@ def test_vp_fixed_step_resume_is_identical_to_uninterrupted(
         checkpoint,
         progress_checkpoint_path=progress,
     )
-    assert not progress.exists()
+    assert progress.is_file()
     assert resumed.history == uninterrupted.history
     assert resumed.best_epoch == uninterrupted.best_epoch
     assert resumed.weights_metadata == uninterrupted.weights_metadata

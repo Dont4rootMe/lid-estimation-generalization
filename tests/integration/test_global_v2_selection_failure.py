@@ -81,7 +81,7 @@ def _train(
         ),
         encoding="utf-8",
     )
-    Path(progress_checkpoint_path).unlink(missing_ok=True)
+    Path(progress_checkpoint_path).write_text('completed resume-state fixture')
 
 
 def _load(path: Path, *, device: str):
@@ -211,7 +211,8 @@ def test_no_knee_is_sealed_and_propagated_without_surrogate_predictions(
     assert reference_summary["selected_index"] is None
     assert reference_summary["selected_scale"] is None
     assert not list(reference_dir.glob("*_prediction__*__reference.npy"))
-    assert not (reference_dir / "checkpoint.pt").exists()
+    assert (reference_dir / "checkpoint.pt").is_file()
+    assert (reference_dir / "training_progress.pt").is_file()
     assert campaign.validate_global_cell(reference_dir) == []
 
     dependent = replace(

@@ -307,7 +307,7 @@ def _bomb_dependencies() -> nf_ablation.NFDependencies:
     )
 
 
-def test_conditional_cell_seals_prunes_and_recovers_post_prune_window(
+def test_conditional_cell_retains_checkpoints_and_recovers_pre_rename_window(
     tmp_path: Path,
 ) -> None:
     task = _task(tmp_path)
@@ -318,8 +318,8 @@ def test_conditional_cell_seals_prunes_and_recovers_post_prune_window(
     sealed = Path(result["directory"])
     assert result["reused"] is False
     assert sealed.is_dir()
-    assert not list(sealed.rglob("checkpoint.pt"))
-    assert not list(sealed.rglob("training_progress.pt"))
+    assert len(list(sealed.rglob("checkpoint.pt"))) == 1
+    assert len(list(sealed.rglob("training_progress.pt"))) == 1
     assert len(list(sealed.glob("validation_prediction__*.npy"))) == len(
         nf_ablation.READOUTS
     )
@@ -353,7 +353,7 @@ def test_conditional_cell_seals_prunes_and_recovers_post_prune_window(
     assert reused["reused"] is True
     assert reused["directory"] == str(sealed)
 
-    # The atomic post-prune/pre-rename recovery window must also avoid all
+    # The atomic pre-rename recovery window must also avoid all
     # loading, training, and prediction calls.
     final_dir, work_dir = nf_ablation._task_paths(task, identity)
     os.replace(final_dir, work_dir)
@@ -361,6 +361,32 @@ def test_conditional_cell_seals_prunes_and_recovers_post_prune_window(
     assert recovered["reused"] is True
     assert Path(recovered["directory"]) == final_dir
     assert final_dir.is_dir() and not work_dir.exists()
+
+
+def test_metric_retry_loads_retained_weights_without_retraining(tmp_path: Path) -> None:
+    task = _task(tmp_path)
+    data = _cell_data(task.expected_input_sha256)
+    dependencies = _dependencies(data=data)
+
+    def interrupted_metrics(*args, **kwargs):
+        raise RuntimeError("fixture metric interruption after checkpoint save")
+
+    with pytest.raises(RuntimeError, match="fixture metric interruption"):
+        nf_ablation._run_cell_task(
+            task, replace(dependencies, predict_readouts_fn=interrupted_metrics)
+        )
+    checkpoint = next(tmp_path.rglob("checkpoint.pt"))
+    progress = checkpoint.parent / "training_progress.pt"
+    checkpoint_bytes = checkpoint.read_bytes()
+    progress_bytes = progress.read_bytes()
+
+    result = nf_ablation._run_cell_task(
+        task, replace(dependencies, train_fn=_bomb)
+    )
+    sealed = Path(result["directory"])
+    assert (sealed / "checkpoint.pt").read_bytes() == checkpoint_bytes
+    assert (sealed / "training_progress.pt").read_bytes() == progress_bytes
+    assert list(sealed.glob("validation_prediction__*.npy"))
 
 
 def test_conditional_cell_evaluates_multiple_frozen_test_readouts_once(
@@ -383,8 +409,8 @@ def test_conditional_cell_evaluates_multiple_frozen_test_readouts_once(
     assert len(list(sealed.glob("validation_prediction__*.npy"))) == len(
         nf_ablation.READOUTS
     )
-    assert not list(sealed.rglob("checkpoint.pt"))
-    assert not list(sealed.rglob("training_progress.pt"))
+    assert len(list(sealed.rglob("checkpoint.pt"))) == 1
+    assert len(list(sealed.rglob("training_progress.pt"))) == 1
 
     summary = json.loads((sealed / "summary.json").read_text(encoding="utf-8"))
     assert set(summary["readouts"]["autograd"]["metrics"]) == {
@@ -467,7 +493,7 @@ def test_conditional_cell_rejects_semantically_corrupt_seal_on_resume(
         nf_ablation._run_cell_task(task, _bomb_dependencies())
 
 
-def test_p0_resumes_independent_components_and_prunes_each_checkpoint(
+def test_p0_resumes_independent_components_and_retains_each_checkpoint(
     tmp_path: Path,
 ) -> None:
     task = _task(tmp_path, candidate_id="P0")
@@ -492,7 +518,7 @@ def test_p0_resumes_independent_components_and_prunes_each_checkpoint(
         )
     assert calls == 3
 
-    # Components 0 and 1 are already fully evaluated and pruned.  Resume must
+    # Components 0 and 1 are already fully evaluated and retained. Resume must
     # train only components 2..8, including replacement of component 2's
     # progress artifact.
     resumed_calls = 0
@@ -512,8 +538,8 @@ def test_p0_resumes_independent_components_and_prunes_each_checkpoint(
     components = sorted((sealed / "components").glob("epsilon-*"))
     assert len(components) == 9
     assert all((directory / "attestation.json").is_file() for directory in components)
-    assert not list(sealed.rglob("checkpoint.pt"))
-    assert not list(sealed.rglob("training_progress.pt"))
+    assert len(list(sealed.rglob("checkpoint.pt"))) == 9
+    assert len(list(sealed.rglob("training_progress.pt"))) == 9
     prediction = np.load(
         sealed / f"validation_prediction__{nf_ablation.PAPER_PARITY_READOUT}.npy",
         allow_pickle=False,
